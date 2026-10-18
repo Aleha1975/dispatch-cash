@@ -7,10 +7,13 @@ The client grants its trading executor the right to call this contract instead o
 ## Rules
 
 1. **Recipient.** All swap output, change and unsold input are swept to `msg.sender`. Output is measured as the caller's balance change and must be at least `minOut` (> 0).
-2. **Price floor.** `buy()` records ETH paid and tokens received per (account, token). `sell()` refuses to return less than 50% (`FLOOR_BPS`) of the recorded entry price for the tokens it knows.
-3. **Slow path.** A sale below the floor, or of tokens never bought through the contract, requires `announce(token)` at least 1 hour earlier (`SLOW_DELAY`). One announcement allows one such sale and emits `SlowSaleArmed`.
-4. **Rate limit.** Per account and rolling hour: at most `MAX_SELLS_PER_HOUR` sales and `MAX_BUY_ETH_PER_HOUR` of ETH spent on buys (deployment parameters; production 12 and 0.3 ETH).
-5. **Pause.** `GUARDIAN` can pause and unpause `buy`, `sell` and `announce`. It has no other power and cannot move funds. Client withdrawals never pass through this contract.
+2. **Route check.** The router calldata (`swap` or `swapSimpleMode`) is decoded on-chain: `dstReceiver` must be the caller or this contract, no fee receivers, `srcToken`/`dstToken` must be the declared pair and `amount` the declared amount. Anything else reverts `BadRoute`.
+3. **Price floor.** `buy()` records ETH paid and tokens received per (account, token). `sell()` refuses to return less than 50% (`FLOOR_BPS`) of the recorded entry price; selling more than the recorded basis takes the slow path for the whole sale.
+4. **Slow path.** A sale below the floor, or beyond the recorded basis, requires `announce(token, amount)` at least 1 hour earlier (`SLOW_DELAY`), covers up to that amount and expires 24 hours after the delay (`ANNOUNCE_TTL`). One announcement allows one such sale and emits `SlowSaleArmed`.
+5. **Rate limit.** Per account and fixed hour window: at most `MAX_SELLS_PER_HOUR` sales and `MAX_BUY_ETH_PER_HOUR` of ETH spent on buys (deployment parameters; production 12 and 0.3 ETH). A burst at the window edge can reach twice the limit across two windows.
+6. **Pause.** `GUARDIAN` can pause buys; under a pause every sale takes the announced slow path, so a pause can delay an exit by an hour but never block it. The guardian has no other power and cannot move funds. Client withdrawals never pass through this contract.
+
+Audit round 1 (18 Oct 2026) findings and their fixes: H-1 route decoding (rule 2); H-2 whole-sale floor (rule 3); M-2 per-call ETH accounting (stray ETH is neither swept nor counted); L-2 bounded, expiring announcements (rule 4); L-3 pause never blocks exits (rule 6); I-2 `token` must be a contract. M-1 (floor is relative to entry, not market) and L-1 (fixed window) are accepted and documented.
 
 No owner, no upgrade path, no funds kept between calls.
 
@@ -35,12 +38,13 @@ Fixtures in `test/fixtures.json` are Kyber `route/build` responses for ETH→USD
 
 | | |
 | --- | --- |
-| GuardedSwap | `0x91b51882805051b83efc53e7407a01894d341ca0` |
-| Deploy tx | `0xaa8b9b7c1f24d18b4a921bf8e3f3b600eb82f52aa16490ba671a6b52f2c038af` (block 52764815, 18 Oct 2026) |
+| GuardedSwap v3 (current) | `0xf563ddf97a6c9ec1d1366dde3410f5aa2c07b485` |
+| Deploy tx | `0x609d6dc28d9ab3daf2caf9597dcd5294aa148ad66a43c60c0fca7c7512eb76af` (block 52766168, 18 Oct 2026) |
+| Previous (v2, superseded after the first audit round) | `0x91b51882805051b83efc53e7407a01894d341ca0` |
 | Router | `0x6131b5fae19ea4f9d964eac0408e4408b66337b5` (KyberSwap MetaAggregationRouterV2) |
 | Guardian (pause only) | `0x5550C8E49616C15B89FdD1DaECddc493009e039B` |
 | Limits | 12 sells / hour, 0.3 ETH of buys / hour per account |
-| Source verification | Sourcify exact match: https://sourcify.dev/server/v2/contract/8453/0x91b51882805051b83efc53e7407a01894d341ca0 |
+| Source verification | Sourcify exact match: https://sourcify.dev/server/v2/contract/8453/0xf563ddf97a6c9ec1d1366dde3410f5aa2c07b485 |
 
 ## Constructor
 
