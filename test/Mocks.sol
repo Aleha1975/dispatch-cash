@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
+import "../src/GuardedSwap.sol";
 
 contract MockToken {
     string public name = "Mock"; string public symbol = "MOCK"; uint8 public decimals = 18;
@@ -14,25 +15,37 @@ contract MockToken {
     function _move(address f, address to, uint256 a) internal { require(balanceOf[f] >= a, "balance"); balanceOf[f] -= a; uint256 fee = a * feeBps / 10000; balanceOf[to] += a - fee; }
 }
 
-/// A router stand-in: on buy it mints `rate` tokens per ETH to `payTo`; on sell it pulls tokens and pays ETH at `rate`,
-/// to `payTo` (the thief case) -- plus optional reentrancy.
+/// A token whose balanceOf lies: reports `fake` for `victim` after `arm()` (H-1 proof of concept helper).
+contract LyingToken {
+    uint256 public fake; address public victim; bool public armed;
+    function arm(address v, uint256 f) external { victim = v; fake = f; armed = true; }
+    function balanceOf(address a) external view returns (uint256) { return (armed && a == victim) ? fake : 0; }
+    function transfer(address, uint256) external pure returns (bool) { return true; }
+}
+
+/// A Kyber-shaped router stand-in: decodes the same calldata the real router takes. Buy: mints tokensPerEth per ETH of
+/// desc.dstToken to desc.dstReceiver (or `payTo` when set: a dishonest executor path). Sell: pulls desc.amount of
+/// desc.srcToken from msg.sender and pays ETH at ethPerToken to desc.dstReceiver (or `payTo`). Optional re-entrancy.
 contract MockRouter {
-    MockToken public token; uint256 public ethPerToken;       // wei paid per whole token on sell
-    uint256 public tokensPerEth;                              // tokens (whole) per 1 ETH on buy
-    address public payTo; bool public reenter; address public guard; bool public reenterOk;
-    constructor(MockToken t) { token = t; }
+    address constant K_ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo; bool public reenter; address public guard; bool public reenterOk;
     receive() external payable {}
     function set(uint256 tpe, uint256 ept, address to) external { tokensPerEth = tpe; ethPerToken = ept; payTo = to; }
     function setReenter(address g) external { reenter = true; guard = g; }
-    function buy() external payable {
-        token.mint(payTo, msg.value * tokensPerEth);
-        if (reenter) { (bool ok, ) = guard.call(abi.encodeWithSignature("buy(address,uint256,bytes)", address(token), uint256(1), abi.encodeWithSelector(MockRouter.buy.selector))); reenterOk = ok; }
-    }
-    function sell(uint256 amount) external {
-        uint256 al = token.allowance(msg.sender, address(this)); if (al < amount) amount = al;   // a real router pulls what was approved
-        token.transferFrom(msg.sender, address(this), amount);
-        uint256 eth = amount * ethPerToken / 1e18;
-        (bool ok, ) = payTo.call{value: eth}(""); require(ok, "pay");
+    function swap(GuardedSwap.SwapExecutionParams calldata p) external payable returns (uint256, uint256) { return _run(p.desc); }
+    function swapSimpleMode(address, GuardedSwap.SwapDescriptionV2 calldata d, bytes calldata, bytes calldata) external payable returns (uint256, uint256) { return _run(d); }
+    function _run(GuardedSwap.SwapDescriptionV2 memory d) internal returns (uint256, uint256) {
+        address to = payTo != address(0) ? payTo : d.dstReceiver;
+        if (d.srcToken == K_ETH) {
+            require(msg.value == d.amount, "value");
+            MockToken(d.dstToken).mint(to, msg.value * tokensPerEth);
+            if (reenter) { (bool ok, ) = guard.call(abi.encodeWithSignature("announce(address,uint256)", d.dstToken, uint256(1))); reenterOk = ok; }
+            return (msg.value * tokensPerEth, 0);
+        }
+        MockToken(d.srcToken).transferFrom(msg.sender, address(this), d.amount);
+        uint256 eth = d.amount * ethPerToken / 1e18;
+        (bool ok2, ) = to.call{value: eth}(""); require(ok2, "pay");
+        return (eth, 0);
     }
 }
 

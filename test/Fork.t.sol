@@ -28,7 +28,7 @@ contract ForkTest is Test {
     }
     function test_fork_buy_paid_to_thief_reverts() public {
         (bytes memory b, uint256 bmin) = _fx("buyThief");
-        vm.prank(ACCOUNT); vm.expectRevert();
+        vm.prank(ACCOUNT); vm.expectRevert(GuardedSwap.BadRoute.selector);      // decoded on-chain: dstReceiver is not the account
         guard.buy{value: 0.0005 ether}(USDC, bmin, b);
         assertEq(ACCOUNT.balance, 1 ether);
     }
