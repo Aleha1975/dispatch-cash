@@ -69,4 +69,5 @@ contract SpyWallet {
     function set(GuardedSwap g_, address t) external { g = g_; tok = t; }
     receive() external payable { hooks += 1; (seenTokens, , , ) = g.basis(address(this), tok); }
     function buy(uint256 eth, uint256 minOut, bytes calldata data) external returns (uint256) { return g.buy{value: eth}(tok, minOut, data); }
+    function sell(uint256 amount, uint256 minOut, bytes calldata data) external returns (uint256) { MockToken(tok).approve(address(g), amount); return g.sell(tok, amount, minOut, data); }
 }

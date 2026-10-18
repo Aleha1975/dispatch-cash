@@ -11,21 +11,26 @@ contract ForkTest is Test {
     address constant THIEF = 0x1111111111111111111111111111111111111111;
     address constant EXECUTOR = 0x8F10B468b06c6FD214B65F87778827F7D113f996;   // Kyber aggregation executor on Base (callTarget of every real route)
     GuardedSwap guard;
-    function setUp() public { guard = new GuardedSwap(ROUTER, EXECUTOR, address(this), 12, 0.3 ether, 1 ether); /* production limits */ vm.deal(ACCOUNT, 1 ether); }
+    address constant GUARD_AT = 0x1000000000000000000000000000000000000001;   // fixed, so the sell fixture (built before the run) can name the gate as recipient
+    function setUp() public {
+        deployCodeTo("GuardedSwap.sol:GuardedSwap", abi.encode(ROUTER, EXECUTOR, address(this), uint256(12), uint256(0.3 ether), uint256(1 ether)), GUARD_AT);   // production limits
+        guard = GuardedSwap(payable(GUARD_AT)); vm.deal(ACCOUNT, 1 ether);
+    }
     function _fx(string memory k) internal view returns (bytes memory data, uint256 minOut) {
         string memory j = vm.readFile("test/fixtures.json");
         data = vm.parseJsonBytes(j, string.concat(".", k, ".data")); minOut = vm.parseJsonUint(j, string.concat(".", k, ".minOut")) * 99 / 100;   // just under the route's own minimum
     }
     function test_fork_buy_then_sell_usdc() public {
         (bytes memory b, uint256 bmin) = _fx("buy");
+        uint256 gTok = IERC20(USDC).balanceOf(address(guard)); uint256 gEth = address(guard).balance;   // the pinned address may hold dust on mainnet: it must stay untouched
         vm.prank(ACCOUNT); uint256 got = guard.buy{value: 0.0005 ether}(USDC, bmin, b);
-        assertGe(got, bmin); assertEq(IERC20(USDC).balanceOf(address(guard)), 0);
+        assertGe(got, bmin); assertEq(IERC20(USDC).balanceOf(address(guard)), gTok);
         (uint256 tokens, uint256 ethIn, uint256 refEth,) = guard.basis(ACCOUNT, USDC); assertEq(tokens, got); assertEq(ethIn, 0.0005 ether); assertEq(refEth, 0.0005 ether);
         (bytes memory s, uint256 smin) = _fx("sell");                 // sells exactly 1 USDC
         vm.startPrank(ACCOUNT); (bool ok, ) = USDC.call(abi.encodeWithSelector(0x095ea7b3, address(guard), 1_000_000)); require(ok);
         uint256 before = ACCOUNT.balance;
         uint256 eth = guard.sell(USDC, 1_000_000, smin, s); vm.stopPrank();
-        assertGe(eth, smin); assertEq(ACCOUNT.balance - before, eth); assertEq(address(guard).balance, 0);
+        assertGe(eth, smin); assertEq(ACCOUNT.balance - before, eth); assertEq(address(guard).balance, gEth); assertEq(IERC20(USDC).balanceOf(address(guard)), gTok);
     }
     function test_fork_buy_paid_to_thief_reverts() public {
         (bytes memory b, uint256 bmin) = _fx("buyThief");

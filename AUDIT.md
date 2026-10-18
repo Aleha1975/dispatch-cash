@@ -1,11 +1,11 @@
-# Audit scope — round 7
+# Audit scope — round 8
 
-**What to review:** `src/GuardedSwap.sol` (v8, this branch) and its interaction with the KyberSwap MetaAggregationRouterV2 on Base. One contract, no dependencies.
+**What to review:** `src/GuardedSwap.sol` (v9, this branch) and its interaction with the KyberSwap MetaAggregationRouterV2 on Base. One contract, no dependencies.
 
-**Deployed:** Base (chain 8453), `0x061c0a41bb8d83e6fecc3142f3801fed9e5b88d4`, source verified on Sourcify (exact match):
-https://sourcify.dev/server/v2/contract/8453/0x061c0a41bb8d83e6fecc3142f3801fed9e5b88d4
+**Deployed:** Base (chain 8453), `0x2ea0ed9b4eaf9e6c17231e10d56531ce77faef50`, source verified on Sourcify (exact match):
+https://sourcify.dev/server/v2/contract/8453/0x2ea0ed9b4eaf9e6c17231e10d56531ce77faef50
 
-Previous subjects: v7 `0xb1ef2b0c04e65b22e70bc6a54ddf454259d726e4` (round 6), v6 `0x259f17ed184ff97730407002140bcd512dca7a0a` (round 5), v5 `0x3511a33478465d2f6fd5ebfebf52160ef39ec7a1` (round 4), v4 `0x970b033ab9965ce9c9f92584b529afa6100a994e` (round 3), v3 `0xf563ddf97a6c9ec1d1366dde3410f5aa2c07b485` (round 2), v2 `0x91b51882805051b83efc53e7407a01894d341ca0` (round 1).
+Previous subjects: v8 `0x061c0a41bb8d83e6fecc3142f3801fed9e5b88d4` (round 7), v7 `0xb1ef2b0c04e65b22e70bc6a54ddf454259d726e4` (round 6), v6 `0x259f17ed184ff97730407002140bcd512dca7a0a` (round 5), v5 `0x3511a33478465d2f6fd5ebfebf52160ef39ec7a1` (round 4), v4 `0x970b033ab9965ce9c9f92584b529afa6100a994e` (round 3), v3 `0xf563ddf97a6c9ec1d1366dde3410f5aa2c07b485` (round 2), v2 `0x91b51882805051b83efc53e7407a01894d341ca0` (round 1).
 
 **What it must guarantee:** an executor key that calls this contract on behalf of a client's smart account can never move the account's ETH or tokens to anyone but the account itself; a bad trade is bounded by a 50% floor against the lot's floor price (the higher of its first-buy reference and its cost-weighted average), only the lot itself can be sold, an announced 1-hour slow path keeps 20% of the floor price, and per-account hourly limits cap sales, ETH in and ETH out; a pause-only guardian can stop buys and delay sales but never block an exit for more than seven days in eight, cannot touch announcements, nor funds.
 
@@ -95,4 +95,17 @@ Previous subjects: v7 `0xb1ef2b0c04e65b22e70bc6a54ddf454259d726e4` (round 6), v6
 | Info: zero-cost first buy | Fixed | a buy that spends nothing is refused |
 | Info: rebasing, `balanceOf` lies on a self-seeded token, deploy-time trust in router/executor, returndata bombs, sequencer notes, `pausedAt` sentinel | Accepted / documented | as before |
 
-**Tests:** `forge test --no-match-contract Fork --fuzz-runs 2000` (61 tests, the round-1 to round-6 PoCs included) and `forge test --match-contract Fork --fork-url <base rpc>` (2 tests against the live Kyber router with real calldata). All pass on Foundry 1.8.5 / solc 0.8.26.
+**Round 7 findings and what changed in v9**
+
+| Finding | Status | Fix |
+| --- | --- | --- |
+| C-1 `flags` was never checked: bit `0x20` inside the same `swap()` selector takes the deployed router into its simple mode, which pulls the sold tokens to pools named in `targetData`, a field this contract does not check | Fixed | every flag bit the router dispatches on (`0x01`–`0x100`: partial fill, extra ETH, claim, burn, simple mode, fees, approve) is refused; only `0x200`, which live routes carry and the router's verified source never reads, is accepted (`FLAGS_ALLOWED`). The lesson is recorded: the router's dispatch is read from its verified source, every field and every flag listed, and any value this contract does not understand is refused |
+| M-1 `announce` was not bound to the lot and a repeat buy did not clear it | Fixed | an announcement never exceeds the lot (`NotInLot`); any buy of the token clears it |
+| M-2 the first buy of a lot fixes the reference with no price bound | Accepted / documented | as round 4 M-6: the hourly ETH budget and the engine's quote-based `minOut` are the bound; no oracle exists for these tokens |
+| M-3 fee-on-transfer / rebasing tokens could strand a lot above the real balance | Fixed | the lot shrinks by what the account gave up (pull-side fees included) and closes when the account holds none of the token |
+| L-1 a sale paid to the caller directly reached its `receive()` before settlement | Fixed | a sale is paid to this contract only and forwarded after settlement (`dstReceiver == this`); ETH is accepted only while a trade is in progress (the live router unwraps through its executor, so the payer is not always the router itself); a buy may still deliver tokens to the caller |
+| L-2 cost release rounds down (average drifts up) | Accepted / documented | protocol-favouring; erased on full exit |
+| L-3 tokens that return `false` on success, L-4 issuer blacklisting the gate, L-5 `uint96` token ceilings, L-6 no deadline, L-7 public mempool, L-8 no minimum rotation delay, L-9 pause griefing bounded, L-10 returndata bombs, L-11 refund failure, L-12 `balanceOf` reverts, L-13 24-hour censorship | Accepted / documented | all self-only or already-documented trade-offs; the constructor now also bounds `maxSellsPerHour` to `uint64` (lead) |
+| Lead: a partial fill leaves the router a standing allowance | Accepted / documented | only the router could spend it, and the router is trusted infrastructure; the cleanup `approve(0)` is best-effort by design |
+
+**Tests:** `forge test --no-match-contract Fork --fuzz-runs 2000` (67 tests, the round-1 to round-7 PoCs included) and `forge test --match-contract Fork --fork-url <base rpc>` (2 tests against the live Kyber router with real calldata). All pass on Foundry 1.8.5 / solc 0.8.26.
