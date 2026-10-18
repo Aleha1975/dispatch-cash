@@ -416,7 +416,7 @@ contract GuardedSwapTest is Test {
         vm.startPrank(address(acct)); tok.approve(address(guard), 100e18); vm.expectRevert(GuardedSwap.TransferFailed.selector);
         guard.sell(address(tok), 100e18, 1, route(address(tok), K_ETH, 100e18, address(acct))); vm.stopPrank();
         assertEq(tok.balanceOf(address(acct)), 950e18);                     // the route pulled 50, the other 50 came back; the refused sale moved nothing
-        tok.setRevertOnZeroApprove(false);
+        tok.setRevertOnZeroApprove(false); vm.prank(address(acct)); tok.approve(address(guard), 0);   // the account's own leftover approval to the guard is reset too
         out = _sell(100e18, 1); assertEq(out, 0.1 ether);                     // direct approve fails (zero first), zero, approve again: the sale goes through
     }
     function test_R6_L2_state_is_final_before_eth_leaves() public {
