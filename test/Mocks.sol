@@ -35,7 +35,8 @@ contract LyingToken {
 /// desc.srcToken from msg.sender and pays ETH at ethPerToken to desc.dstReceiver (or `payTo`). Optional re-entrancy.
 contract MockRouter {
     address constant K_ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
-    uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo; bool public reenter; address public guard; bool public reenterOk; uint256 public overpay; bool public pullLess; uint256 public refund;
+    uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo; bool public reenter; address public guard; bool public reenterOk; uint256 public overpay; bool public pullLess; bool public pullNone; uint256 public refund;
+    function setPullNone(bool b) external { pullNone = b; }
     function setRefund(uint256 w) external { refund = w; }
     function setOverpay(uint256 w) external { overpay = w; }
     function setPullLess(bool b) external { pullLess = b; }
@@ -54,7 +55,7 @@ contract MockRouter {
             if (reenter) { (bool ok, ) = guard.call(abi.encodeWithSignature("announce(address,uint256)", d.dstToken, uint256(1))); reenterOk = ok; }
             return (msg.value * tokensPerEth, 0);
         }
-        MockToken(d.srcToken).transferFrom(msg.sender, address(this), pullLess ? d.amount / 2 : d.amount);   // pullLess: a route that leaves half the allowance behind
+        if (!pullNone) MockToken(d.srcToken).transferFrom(msg.sender, address(this), pullLess ? d.amount / 2 : d.amount);   // pullLess: a route that leaves half the allowance behind; pullNone: takes nothing
         uint256 eth = d.amount * ethPerToken / 1e18;
         (bool ok2, ) = to.call{value: eth}(""); require(ok2, "pay");
         return (eth, 0);

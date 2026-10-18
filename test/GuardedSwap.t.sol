@@ -482,6 +482,38 @@ contract GuardedSwapTest is Test {
         spy.sell(100e18, 1, route(address(tok), K_ETH, 100e18, address(guard)));
         assertEq(spy.hooks(), 1); assertEq(spy.seenTokens(), got - 100e18);   // the payout hook already sees the reduced lot
     }
+
+    // ---- round 8 / v10 ----
+    function test_R8_L1_tokens_the_owner_moved_out_leave_the_lot() public {
+        _buy(1 ether); vm.prank(address(acct)); tok.transfer(address(0xdead), 700e18);   // the owner moved 700 out directly
+        vm.prank(address(acct)); vm.expectRevert(abi.encodeWithSelector(GuardedSwap.NotInLot.selector, 300e18, 1000e18)); guard.announce(address(tok), 1000e18);   // the lot is 300 now
+        vm.startPrank(address(acct)); tok.approve(address(guard), 300e18); vm.expectRevert(abi.encodeWithSelector(GuardedSwap.NotInLot.selector, 300e18, 1000e18));
+        guard.sell(address(tok), 1000e18, 1, route(address(tok), K_ETH, 1000e18, address(guard))); vm.stopPrank();
+        vm.prank(address(acct)); guard.announce(address(tok), 300e18);                                               // a call that goes through reconciles the lot
+        (uint256 tokens, uint256 ethIn,,) = guard.basis(address(acct), address(tok)); assertEq(tokens, 300e18); assertEq(ethIn, 0.3 ether);   // pro rata, as if sold at cost
+        assertEq(guard.floorFor(address(acct), address(tok), 300e18), 0.15 ether);
+        uint256 out = _sell(300e18, 1); assertEq(out, 0.3 ether);                                                      // and the rest sells at the entry price as before
+        (tokens,,,) = guard.basis(address(acct), address(tok)); assertEq(tokens, 0);
+    }
+    function test_R8_L1_an_emptied_lot_closes_and_rebuys_are_not_bricked() public {
+        _buy(1 ether); vm.prank(address(acct)); tok.transfer(address(0xdead), 1000e18);   // everything moved out directly
+        router.set(100000, 1e15, address(0)); _buy(0.1 ether);                            // 100x cheaper: v9 would revert DilutesBasis against the stale reference
+        (uint256 tokens,, uint256 refEth,) = guard.basis(address(acct), address(tok)); assertEq(tokens, 10000e18); assertEq(refEth, 0.1 ether);
+    }
+    function test_R8_L4_a_sale_that_moves_nothing_is_refused() public {
+        _buy(1 ether); router.setPullNone(true); vm.deal(address(router), 100 ether);
+        vm.startPrank(address(acct)); tok.approve(address(guard), 100e18); vm.expectRevert(GuardedSwap.ZeroAmount.selector);
+        guard.sell(address(tok), 100e18, 1, route(address(tok), K_ETH, 100e18, address(guard))); vm.stopPrank();
+        (, uint64 sells,,) = guard.window(address(acct)); assertEq(sells, 0);            // no slot spent, no floor dodged
+    }
+    function test_R8_I4_the_gate_itself_is_not_a_receiver() public {
+        _buy(1 ether);
+        GuardedSwap.SwapDescriptionV2 memory d; d.srcToken = address(tok); d.dstToken = K_ETH; d.dstReceiver = address(guard); d.amount = 10e18; d.minReturnAmount = 1;
+        d.srcReceivers = new address[](1); d.srcAmounts = new uint256[](1); d.srcReceivers[0] = address(guard); d.srcAmounts[0] = 1;
+        GuardedSwap.SwapExecutionParams memory p; p.desc = d; p.callTarget = exec;
+        vm.startPrank(address(acct)); tok.approve(address(guard), 10e18); vm.expectRevert(GuardedSwap.BadRoute.selector);
+        guard.sell(address(tok), 10e18, 1, abi.encodeWithSelector(bytes4(0xe21fd0e9), p)); vm.stopPrank();
+    }
     function testFuzz_basis_tracks_sales(uint96 price, uint8 fracBps) public {
         vm.assume(price > 1e9 && price < 5e16); uint256 frac = uint256(fracBps) % 100 + 1;     // 1..100 %; router holds 100 ETH
         router.set(1000, price, address(0)); _buy(1 ether);

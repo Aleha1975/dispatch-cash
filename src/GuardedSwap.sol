@@ -16,7 +16,8 @@ pragma solidity ^0.8.26;
 ///         2. Only the lot is for sale. sell() handles at most the tokens this contract saw bought for the account;
 ///            tokens that reached the account any other way (airdrops, positions opened before this gate) are not the
 ///            executor's to sell -- the account owner sells them directly. There is no price to protect those with.
-///            The lot shrinks by what the account gave up, and closes when the account holds none of the token.
+///            The lot shrinks by what the account gave up, never exceeds what the account holds (tokens the owner moved
+///            out leave the lot pro rata, as if sold at cost), and closes when the account holds none of the token.
 ///         3. Slow path. A sale below the floor, or under a pause, is allowed only after announce(token, amount) at
 ///            least SLOW_DELAY earlier, within ANNOUNCE_TTL and up to that amount, and must still return SLOW_FLOOR_BPS
 ///            of the floor price. An announcement never exceeds the lot and any buy of the token clears it, so the
@@ -186,6 +187,16 @@ contract GuardedSwap {
         (uint256 e, uint256 t) = _floorPair(b);
         return _ceil(e * amount * bps, t * 10000);
     }
+    /// @dev The lot never exceeds what the account holds: tokens the owner moved out (or a negative rebase) leave the lot
+    ///      pro rata, as if sold at cost (rounded so the average never drops). An empty balance closes the lot. Tokens that
+    ///      arrive before the next call are indistinguishable from the lot and protected at its floor.
+    function _trim(address token) private returns (Basis storage b) {
+        b = basis[msg.sender][token];
+        if (b.tokens == 0) return b;
+        uint256 bal = IERC20(token).balanceOf(msg.sender);
+        if (bal == 0) { delete basis[msg.sender][token]; delete slow[msg.sender][token]; return b; }
+        if (bal < b.tokens) { b.ethIn = _ceil(b.ethIn * bal, b.tokens); b.tokens = bal; }
+    }
 
     /// @dev The router calldata must be swap(SwapExecutionParams) with flags == 0, run by EXECUTOR, carry no fee receivers
     ///      and no permit, move exactly `tokenIn` -> `tokenOut` for `amount`, and demand at least `minOut` from the router
@@ -206,7 +217,7 @@ contract GuardedSwap {
         if (d.minReturnAmount < minOut) revert BadRoute();
         if (d.srcReceivers.length != d.srcAmounts.length || d.srcReceivers.length > MAX_RECEIVERS) revert BadRoute();
         if (tokenIn == K_ETH) { if (d.srcReceivers.length != 0) revert BadRoute(); }
-        else { uint256 sum; for (uint256 i = 0; i < d.srcReceivers.length; i++) { if (d.srcReceivers[i].code.length == 0 || d.srcReceivers[i] == msg.sender) revert BadRoute(); sum += d.srcAmounts[i]; } if (sum > amount) revert BadRoute(); }
+        else { uint256 sum; for (uint256 i = 0; i < d.srcReceivers.length; i++) { if (d.srcReceivers[i].code.length == 0 || d.srcReceivers[i] == msg.sender || d.srcReceivers[i] == address(this)) revert BadRoute(); sum += d.srcAmounts[i]; } if (sum > amount) revert BadRoute(); }
     }
 
     /// @notice Spend msg.value of ETH on `token` through the router. Output and any unspent ETH go to msg.sender.
@@ -215,6 +226,7 @@ contract GuardedSwap {
         if (msg.value == 0) revert ZeroAmount();
         if (minOut == 0) revert MinOutZero();
         if (token.code.length == 0) revert NotAContract();
+        _trim(token);                                               // the lot is reconciled with what the account holds before this buy
         _checkRoute(routerData, K_ETH, token, msg.value, minOut);
         if (msg.value > MAX_BUY_ETH_PER_HOUR) revert RateLimited();   // the net spend is counted below, once known
         uint256 ethBase = address(this).balance - msg.value;        // ETH that was here before this call stays untouched
@@ -247,7 +259,7 @@ contract GuardedSwap {
         if (amount == 0) revert ZeroAmount();
         if (minOut == 0) revert MinOutZero();
         if (token.code.length == 0) revert NotAContract();
-        { uint256 lot = basis[msg.sender][token].tokens; if (amount > lot) revert NotInLot(lot, amount); }   // only what this gate saw bought
+        { uint256 lot = _trim(token).tokens; if (amount > lot) revert NotInLot(lot, amount); }   // only what this gate saw bought, and still holds
         _countSell(0);
         uint256 tokBase = IERC20(token).balanceOf(address(this));   // tokens that were here before this call stay untouched
         uint256 got = _pull(token, msg.sender, amount);             // what actually arrived (fee-on-transfer aware)
@@ -260,6 +272,7 @@ contract GuardedSwap {
         out = address(this).balance - ethBase;                      // the sale is paid here and forwarded last
         if (out < minOut) revert BelowMinOut(out, minOut);
         _countSell(out);
+        if (back >= amount) revert ZeroAmount();                    // nothing was sold: no floor to clear, no slot to spend
         _settle(token, amount - back, out);                         // the lot shrinks by what the account gave up (pull-side fees included)
         if (out > 0) _sendEth(msg.sender, out);                     // state is final before any ETH leaves
     }
@@ -292,7 +305,7 @@ contract GuardedSwap {
         if (amount == 0) revert ZeroAmount();
         if (amount > type(uint192).max) revert TooLarge();
         if (token.code.length == 0) revert NotAContract();
-        { uint256 lot = basis[msg.sender][token].tokens; if (amount > lot) revert NotInLot(lot, amount); }
+        { uint256 lot = _trim(token).tokens; if (amount > lot) revert NotInLot(lot, amount); }
         uint256 from = block.timestamp + SLOW_DELAY;
         slow[msg.sender][token] = Slow(uint64(from), uint192(amount));
         emit SlowSaleArmed(msg.sender, token, amount, from);
