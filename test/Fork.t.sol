@@ -20,7 +20,7 @@ contract ForkTest is Test {
         (bytes memory b, uint256 bmin) = _fx("buy");
         vm.prank(ACCOUNT); uint256 got = guard.buy{value: 0.0005 ether}(USDC, bmin, b);
         assertGe(got, bmin); assertEq(IERC20(USDC).balanceOf(address(guard)), 0);
-        (uint256 ethIn, uint256 tokens) = guard.basis(ACCOUNT, USDC); assertEq(ethIn, 0.0005 ether); assertEq(tokens, got);
+        (uint256 ethIn, uint256 tokens,,) = guard.basis(ACCOUNT, USDC); assertEq(ethIn, 0.0005 ether); assertEq(tokens, got);
         (bytes memory s, uint256 smin) = _fx("sell");                 // sells exactly 1 USDC
         vm.startPrank(ACCOUNT); (bool ok, ) = USDC.call(abi.encodeWithSelector(0x095ea7b3, address(guard), 1_000_000)); require(ok);
         uint256 before = ACCOUNT.balance;
