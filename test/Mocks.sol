@@ -35,7 +35,8 @@ contract LyingToken {
 /// desc.srcToken from msg.sender and pays ETH at ethPerToken to desc.dstReceiver (or `payTo`). Optional re-entrancy.
 contract MockRouter {
     address constant K_ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
-    uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo; bool public reenter; address public guard; bool public reenterOk; uint256 public overpay; bool public pullLess;
+    uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo; bool public reenter; address public guard; bool public reenterOk; uint256 public overpay; bool public pullLess; uint256 public refund;
+    function setRefund(uint256 w) external { refund = w; }
     function setOverpay(uint256 w) external { overpay = w; }
     function setPullLess(bool b) external { pullLess = b; }
     receive() external payable {}
@@ -49,7 +50,8 @@ contract MockRouter {
             require(msg.value == d.amount, "value");
             MockToken(d.dstToken).mint(to, msg.value * tokensPerEth);
             if (overpay > 0) { (bool okp, ) = msg.sender.call{value: msg.value + overpay}(""); require(okp, "overpay"); }   // refunds more than it was sent
-            if (reenter) { (bool ok, ) = guard.call(abi.encodeWithSignature("announce(address,uint256,uint256)", d.dstToken, uint256(1), uint256(1))); reenterOk = ok; }
+            if (refund > 0) { (bool okr, ) = msg.sender.call{value: refund}(""); require(okr, "refund"); }                   // returns part of the input as change
+            if (reenter) { (bool ok, ) = guard.call(abi.encodeWithSignature("announce(address,uint256)", d.dstToken, uint256(1))); reenterOk = ok; }
             return (msg.value * tokensPerEth, 0);
         }
         MockToken(d.srcToken).transferFrom(msg.sender, address(this), pullLess ? d.amount / 2 : d.amount);   // pullLess: a route that leaves half the allowance behind
@@ -60,3 +62,11 @@ contract MockRouter {
 }
 
 contract Wallet { receive() external payable {} }
+
+/// A caller that reads the guard's view of its own lot from inside the ETH-refund hook (round-6 L-2: state must be final by then).
+contract SpyWallet {
+    GuardedSwap public g; address public tok; uint256 public seenTokens; uint256 public hooks;
+    function set(GuardedSwap g_, address t) external { g = g_; tok = t; }
+    receive() external payable { hooks += 1; (seenTokens, , , ) = g.basis(address(this), tok); }
+    function buy(uint256 eth, uint256 minOut, bytes calldata data) external returns (uint256) { return g.buy{value: eth}(tok, minOut, data); }
+}

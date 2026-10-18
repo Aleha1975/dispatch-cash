@@ -35,10 +35,10 @@ contract GuardedSwapTest is Test {
     function test_buy_pays_caller_and_records_basis() public {
         uint256 out = _buy(1 ether);
         assertEq(out, 1000e18); assertEq(tok.balanceOf(address(acct)), 1000e18); assertEq(tok.balanceOf(address(guard)), 0);
-        (uint256 tokens, uint256 refEth, uint256 refTok) = guard.basis(address(acct), address(tok)); assertEq(tokens, 1000e18); assertEq(refEth, 1 ether); assertEq(refTok, 1000e18);
+        (uint256 tokens,, uint256 refEth, uint256 refTok) = guard.basis(address(acct), address(tok)); assertEq(tokens, 1000e18); assertEq(refEth, 1 ether); assertEq(refTok, 1000e18);
     }
-    function test_buy_simple_mode_accepted() public {
-        vm.prank(address(acct)); uint256 out = guard.buy{value: 1 ether}(address(tok), 1, routeSimple(K_ETH, address(tok), 1 ether, address(acct))); assertEq(out, 1000e18);
+    function test_buy_simple_mode_rejected() public {            // v8: swapSimpleMode keeps its pools in a field this contract would not check (round-6 L-3)
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwap.BadRoute.selector); guard.buy{value: 1 ether}(address(tok), 1, routeSimple(K_ETH, address(tok), 1 ether, address(acct)));
     }
     function test_buy_output_held_by_guard_is_forwarded() public {
         vm.prank(address(acct)); uint256 out = guard.buy{value: 1 ether}(address(tok), 1, route(K_ETH, address(tok), 1 ether, address(guard)));
@@ -84,7 +84,7 @@ contract GuardedSwapTest is Test {
     function test_R2_1_stray_tokens_are_not_swept_or_counted() public {
         tok.mint(address(guard), 500e18);                        // stray tokens sitting in the contract (flash-loan planting)
         uint256 out = _buy(1 ether); assertEq(out, 1000e18);
-        (uint256 tokens, uint256 refEth, uint256 refTok) = guard.basis(address(acct), address(tok)); assertEq(tokens, 1000e18); assertEq(refEth, 1 ether); assertEq(refTok, 1000e18);
+        (uint256 tokens,, uint256 refEth, uint256 refTok) = guard.basis(address(acct), address(tok)); assertEq(tokens, 1000e18); assertEq(refEth, 1 ether); assertEq(refTok, 1000e18);
         assertEq(tok.balanceOf(address(guard)), 500e18);         // untouched, uncredited
         uint256 got = _sell(500e18, 1); assertEq(got, 0.5 ether); assertEq(tok.balanceOf(address(guard)), 500e18);
     }
@@ -111,24 +111,18 @@ contract GuardedSwapTest is Test {
     }
     function test_R3_full_exit_resets_the_reference() public {
         _buy(1 ether); _sell(1000e18, 1);
-        (uint256 tokens, uint256 refEth, uint256 refTok) = guard.basis(address(acct), address(tok));
+        (uint256 tokens,, uint256 refEth, uint256 refTok) = guard.basis(address(acct), address(tok));
         assertEq(tokens, 0); assertEq(refEth, 0); assertEq(refTok, 0);
         router.set(100000, 1e15, address(0)); _buy(0.1 ether);  // a new lot may start at any price
     }
     function test_R3_C1_slow_path_keeps_a_floor_of_its_own() public {
         _buy(1 ether); router.set(1000, 1e14, address(0));       // 10% of entry: below the 20% slow floor
-        vm.prank(address(acct)); guard.announce(address(tok), 500e18, 1); vm.warp(block.timestamp + 1 hours);
+        vm.prank(address(acct)); guard.announce(address(tok), 500e18); vm.warp(block.timestamp + 1 hours);
         vm.startPrank(address(acct)); tok.approve(address(guard), 500e18);
         vm.expectRevert(abi.encodeWithSelector(GuardedSwap.BelowFloor.selector, 0.05 ether, 0.1 ether));
         guard.sell(address(tok), 500e18, 1, route(address(tok), K_ETH, 500e18, address(acct))); vm.stopPrank();
         router.set(1000, 25e13, address(0));                     // 25% of entry: announced sale passes
         uint256 out = _sell(500e18, 1); assertEq(out, 0.125 ether);
-    }
-    function test_R3_C1_guardian_can_cancel_an_armed_announcement() public {
-        _buy(1 ether); vm.prank(address(acct)); guard.announce(address(tok), 500e18, 1);
-        vm.prank(address(acct)); vm.expectRevert(GuardedSwap.NotGuardian.selector); guard.cancelSlow(address(acct), address(tok));
-        guard.cancelSlow(address(acct), address(tok));
-        (uint64 from, , ) = guard.slow(address(acct), address(tok)); assertEq(from, 0);
     }
     function test_R3_M2_pause_expires_by_itself() public {
         guard.setPaused(true); assertTrue(guard.paused());
@@ -137,7 +131,7 @@ contract GuardedSwapTest is Test {
         uint256 out = _buy(0.1 ether); assertEq(out, 100e18);   // a lost guardian key cannot freeze buys forever
     }
     function test_R3_L1_announce_rejects_oversized_amount() public {
-        vm.prank(address(acct)); vm.expectRevert(GuardedSwap.TooLarge.selector); guard.announce(address(tok), uint256(type(uint192).max) + 1, 1);
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwap.TooLarge.selector); guard.announce(address(tok), uint256(type(uint192).max) + 1);
     }
     function test_R2_4_guardian_rotation_two_step() public {
         address g2 = address(0xBEEF);
@@ -150,13 +144,13 @@ contract GuardedSwapTest is Test {
     }
     function test_R2_5_cancel_and_partial_announcement() public {
         _buy(1 ether); router.set(1000, 25e13, address(0));
-        vm.startPrank(address(acct)); guard.announce(address(tok), 500e18, 1); guard.cancelAnnounce(address(tok));
-        (uint64 from, , ) = guard.slow(address(acct), address(tok)); assertEq(from, 0);
-        guard.announce(address(tok), 500e18, 1); vm.stopPrank(); vm.warp(block.timestamp + 1 hours);
+        vm.startPrank(address(acct)); guard.announce(address(tok), 500e18); guard.cancelAnnounce(address(tok));
+        (uint64 from, ) = guard.slow(address(acct), address(tok)); assertEq(from, 0);
+        guard.announce(address(tok), 500e18); vm.stopPrank(); vm.warp(block.timestamp + 1 hours);
         _sell(200e18, 1);
-        (, uint192 left, ) = guard.slow(address(acct), address(tok)); assertEq(left, 300e18);   // remainder stays usable
+        (, uint192 left) = guard.slow(address(acct), address(tok)); assertEq(left, 300e18);   // remainder stays usable
         _sell(300e18, 1);
-        (from, , ) = guard.slow(address(acct), address(tok)); assertEq(from, 0);
+        (from, ) = guard.slow(address(acct), address(tok)); assertEq(from, 0);
     }
     function test_R2_6_zero_approve_reverting_token_still_sells() public {
         _buy(1 ether); tok.setRevertOnZeroApprove(true);
@@ -174,7 +168,7 @@ contract GuardedSwapTest is Test {
     function test_M2_stray_eth_does_not_break_or_skew_buys() public {
         vm.deal(address(guard), 5 ether);                    // force-sent ETH sitting in the contract
         uint256 out = _buy(1 ether); assertEq(out, 1000e18);
-        (, uint256 refEth,) = guard.basis(address(acct), address(tok)); assertEq(refEth, 1 ether);   // spent = msg.value, not skewed by the stray
+        (,, uint256 refEth,) = guard.basis(address(acct), address(tok)); assertEq(refEth, 1 ether);   // spent = msg.value, not skewed by the stray
         assertEq(address(guard).balance, 5 ether);           // the stray is neither swept to the caller nor counted
         assertEq(address(acct).balance, 9 ether);
     }
@@ -182,7 +176,7 @@ contract GuardedSwapTest is Test {
     function test_sell_at_entry_price_passes_and_reduces_basis() public {
         _buy(1 ether); uint256 out = _sell(500e18, 1);
         assertEq(out, 0.5 ether); assertEq(address(acct).balance, 9.5 ether);
-        (uint256 tokens, uint256 refEth, uint256 refTok) = guard.basis(address(acct), address(tok)); assertEq(tokens, 500e18); assertEq(refEth, 1 ether); assertEq(refTok, 1000e18);   // the reference does not move
+        (uint256 tokens,, uint256 refEth, uint256 refTok) = guard.basis(address(acct), address(tok)); assertEq(tokens, 500e18); assertEq(refEth, 1 ether); assertEq(refTok, 1000e18);   // the reference does not move
     }
     function test_sell_calldata_recipient_thief_rejected() public {
         _buy(1 ether); vm.startPrank(address(acct)); tok.approve(address(guard), 500e18); vm.expectRevert(GuardedSwap.BadRoute.selector);
@@ -198,42 +192,22 @@ contract GuardedSwapTest is Test {
     function test_sell_below_floor_needs_announcement() public {
         _buy(1 ether); router.set(1000, 25e13, address(0));  // price fell to 25% of entry (fast floor 50%, slow floor 20%)
         _expectSell(500e18, GuardedSwap.NotAnnounced.selector);
-        vm.prank(address(acct)); guard.announce(address(tok), 500e18, 1);
+        vm.prank(address(acct)); guard.announce(address(tok), 500e18);
         _expectSell(500e18, GuardedSwap.NotAnnounced.selector);                       // too early
         vm.warp(block.timestamp + 1 hours);
         uint256 out = _sell(500e18, 1); assertEq(out, 0.125 ether);
-        (uint64 from, , ) = guard.slow(address(acct), address(tok)); assertEq(from, 0);   // one announcement = one slow sale
+        (uint64 from, ) = guard.slow(address(acct), address(tok)); assertEq(from, 0);   // one announcement = one slow sale
         _expectSell(500e18, GuardedSwap.NotAnnounced.selector);
     }
     function test_sell_at_floor_exactly_passes() public { _buy(1 ether); router.set(1000, 5e14, address(0)); uint256 out = _sell(500e18, 1); assertEq(out, 0.25 ether); }
     function test_L2_announcement_bound_to_amount_and_expires() public {
         _buy(1 ether); router.set(1000, 1e14, address(0));
-        vm.prank(address(acct)); guard.announce(address(tok), 100e18, 1);
+        vm.prank(address(acct)); guard.announce(address(tok), 100e18);
         vm.warp(block.timestamp + 1 hours);
         _expectSell(500e18, GuardedSwap.NotAnnounced.selector);                       // more than announced
-        vm.prank(address(acct)); guard.announce(address(tok), 500e18, 1);
+        vm.prank(address(acct)); guard.announce(address(tok), 500e18);
         vm.warp(block.timestamp + 1 hours + 24 hours + 1);
         _expectSell(500e18, GuardedSwap.NotAnnounced.selector);                       // expired
-    }
-    function test_sell_unknown_token_needs_announcement() public {
-        tok.mint(address(acct), 100e18);
-        _expectSell(100e18, GuardedSwap.NotAnnounced.selector);
-        vm.prank(address(acct)); guard.announce(address(tok), 100e18, 1); vm.warp(block.timestamp + 1 hours);
-        uint256 out = _sell(100e18, 1); assertEq(out, 0.1 ether);
-    }
-    function test_H2_dust_basis_does_not_unlock_the_rest() public {
-        tok.mint(address(acct), 1000e18);                    // tokens the gate never saw bought
-        _buy(1);                                             // dust buy: 1 wei of ETH -> basis of 1000 wei of tokens
-        _expectSell(1000e18, GuardedSwap.NotAnnounced.selector);                      // the whole balance still takes the slow path
-        vm.prank(address(acct)); guard.announce(address(tok), 1000e18, 1); vm.warp(block.timestamp + 1 hours);
-        uint256 out = _sell(1000e18, 1); assertEq(out, 1 ether);
-    }
-    function test_sell_more_than_basis_is_slow() public {
-        _buy(1 ether); tok.mint(address(acct), 1000e18);
-        _expectSell(2000e18, GuardedSwap.NotAnnounced.selector);
-        vm.prank(address(acct)); guard.announce(address(tok), 2000e18, 1); vm.warp(block.timestamp + 1 hours);
-        uint256 out = _sell(2000e18, 1); assertEq(out, 2 ether);
-        (uint256 tokens,,) = guard.basis(address(acct), address(tok)); assertEq(tokens, 0);
     }
     function test_fee_on_transfer_token_sells_what_arrived() public {
         _buy(1 ether); tok.setFee(1000);                     // 10% burned on every transfer: 450 arrive, the route must be for 450
@@ -253,7 +227,7 @@ contract GuardedSwapTest is Test {
         guard.setPaused(true);
         vm.prank(address(acct)); vm.expectRevert(GuardedSwap.IsPaused.selector); guard.buy{value: 0.1 ether}(address(tok), 1, route(K_ETH, address(tok), 0.1 ether, address(acct)));
         _expectSell(10e18, GuardedSwap.IsPaused.selector);
-        vm.prank(address(acct)); guard.announce(address(tok), 10e18, 1); vm.warp(block.timestamp + 1 hours);
+        vm.prank(address(acct)); guard.announce(address(tok), 10e18); vm.warp(block.timestamp + 1 hours);
         uint256 out = _sell(10e18, 1); assertEq(out, 0.01 ether);                    // an announced exit works even under pause
         _expectSell(10e18, GuardedSwap.IsPaused.selector);                            // the announcement was consumed
         guard.setPaused(false); out = _sell(10e18, 1); assertEq(out, 0.01 ether);
@@ -282,7 +256,7 @@ contract GuardedSwapTest is Test {
     function test_reentrancy_blocked() public {
         router.setReenter(address(guard)); _buy(1 ether);
         assertFalse(router.reenterOk());                     // the router's re-entrant call into the guard is refused
-        (uint64 from, , ) = guard.slow(address(router), address(tok)); assertEq(from, 0);
+        (uint64 from, ) = guard.slow(address(router), address(tok)); assertEq(from, 0);
     }
     function test_guard_keeps_nothing() public { _buy(1 ether); _sell(100e18, 1); assertEq(address(guard).balance, 0); assertEq(tok.balanceOf(address(guard)), 0); }
     function test_M2_stray_eth_does_not_break_or_skew_buys_v4() public {
@@ -295,38 +269,14 @@ contract GuardedSwapTest is Test {
     }
 
     // ---- round 4 ----
-    function test_R4_C1_untracked_tokens_sell_only_at_the_announced_price() public {
-        _buy(1 ether); tok.mint(address(acct), 1_000_000e18);        // 1000 tracked at 0.001 ETH each, a million untracked
-        router.set(1000, 1e12, address(0));                          // market now pays 1e-6 ETH per token: 1.001 ETH for everything
-        // announcing a price of 500 ETH for the lot: a sale returning 1.001 ETH is refused (v5 would have let it through for 0.2 ETH)
-        vm.prank(address(acct)); guard.announce(address(tok), 1_001_000e18, 500 ether); vm.warp(block.timestamp + 1 hours);
-        vm.startPrank(address(acct)); tok.approve(address(guard), 1_001_000e18);
-        vm.expectRevert(abi.encodeWithSelector(GuardedSwap.BelowFloor.selector, 1.001 ether, 500 ether));
-        guard.sell(address(tok), 1_001_000e18, 1, route(address(tok), K_ETH, 1_001_000e18, address(acct))); vm.stopPrank();
-        // an announcement priced at the market goes through, and still had to clear 20% of the tracked entry
-        vm.prank(address(acct)); guard.announce(address(tok), 1_001_000e18, 1 ether); vm.warp(block.timestamp + 1 hours);
-        uint256 out = _sell(1_001_000e18, 1); assertEq(out, 1.001 ether);
-    }
-    function test_R4_C1_announced_price_is_pro_rata_and_the_tracked_part_keeps_its_floor() public {
-        _buy(1 ether); router.set(1000, 1e14, address(0));           // 10% of entry
-        vm.prank(address(acct)); guard.announce(address(tok), 1000e18, 0.05 ether); vm.warp(block.timestamp + 1 hours);   // a dump price: 5% of entry
-        vm.startPrank(address(acct)); tok.approve(address(guard), 500e18);
-        vm.expectRevert(abi.encodeWithSelector(GuardedSwap.BelowFloor.selector, 0.05 ether, 0.1 ether));   // the 20% floor on the tracked part still binds
-        guard.sell(address(tok), 500e18, 1, route(address(tok), K_ETH, 500e18, address(acct))); vm.stopPrank();
-        router.set(1000, 3e14, address(0));                          // 30% of entry: above both floors
-        vm.prank(address(acct)); guard.announce(address(tok), 1000e18, 0.25 ether); vm.warp(block.timestamp + 1 hours);   // 0.25 ETH for 1000 = 0.125 per 500
-        uint256 out = _sell(500e18, 1); assertEq(out, 0.15 ether);
-        (, uint192 left, uint256 minEth) = guard.slow(address(acct), address(tok)); assertEq(left, 500e18); assertEq(minEth, 0.125 ether);   // the rest keeps its share
-        assertEq(guard.slowFloorFor(address(acct), address(tok), 500e18), 0.125 ether);
-    }
     function test_R4_H2_full_exit_and_new_lot_clear_the_announcement() public {
         _buy(0.01 ether);
-        vm.prank(address(acct)); guard.announce(address(tok), 1_000_000e18, 1); vm.warp(block.timestamp + 1 hours);
+        vm.prank(address(acct)); guard.announce(address(tok), 10e18); vm.warp(block.timestamp + 1 hours);
         _sell(10e18, 1);                                             // full exit of lot A
-        (uint64 from, , ) = guard.slow(address(acct), address(tok)); assertEq(from, 0);     // the stale announcement is gone
-        vm.prank(address(acct)); guard.announce(address(tok), 1_000_000e18, 1);
+        (uint64 from, ) = guard.slow(address(acct), address(tok)); assertEq(from, 0);     // the stale announcement is gone
+        vm.prank(address(acct)); guard.announce(address(tok), 1_000_000e18);
         _buy(1 ether);                                               // a new lot clears it too
-        (from, , ) = guard.slow(address(acct), address(tok)); assertEq(from, 0);
+        (from, ) = guard.slow(address(acct), address(tok)); assertEq(from, 0);
         router.set(1000, 2e14, address(0));                          // 20% of entry: slow, and nothing is announced
         _expectSell(1000e18, GuardedSwap.NotAnnounced.selector);
     }
@@ -340,15 +290,6 @@ contract GuardedSwapTest is Test {
         guard.setPaused(false);
         vm.expectRevert(GuardedSwap.PauseCooldown.selector); guard.setPaused(true);          // and after an unpause
         vm.warp(block.timestamp + 1 days); guard.setPaused(true); guard.setPaused(false);
-        // cancelSlow: only before maturity, once per day per account and token
-        vm.prank(address(acct)); guard.announce(address(tok), 100e18, 1);
-        guard.cancelSlow(address(acct), address(tok));
-        vm.prank(address(acct)); guard.announce(address(tok), 100e18, 1);
-        vm.expectRevert(GuardedSwap.CancelCooldown.selector); guard.cancelSlow(address(acct), address(tok));
-        vm.warp(block.timestamp + 25 hours);                                 // v7: an announcement made during the cooldown matures an hour after it ends
-        vm.expectRevert(GuardedSwap.CancelLate.selector); guard.cancelSlow(address(acct), address(tok));   // matured: the exit happens
-        router.set(1000, 3e14, address(0)); uint256 out = _sell(100e18, 1); assertEq(out, 0.03 ether);
-        vm.expectRevert(GuardedSwap.CancelLate.selector); guard.cancelSlow(address(acct), address(tok));   // nothing to cancel
     }
     function test_R4_M1_sell_eth_per_hour_is_capped() public {
         _tight(); vm.deal(address(acct), 100 ether);
@@ -402,18 +343,6 @@ contract GuardedSwapTest is Test {
     }
 
     // ---- round 5 ----
-    function test_R5_C1_announcement_after_a_guardian_cancel_matures_only_after_the_cooldown() public {
-        _buy(1 ether); router.set(1000, 3e14, address(0));
-        vm.prank(address(acct)); guard.announce(address(tok), 500e18, 1);
-        guard.cancelSlow(address(acct), address(tok));                       // the guardian spends its one cancel
-        vm.prank(address(acct)); guard.announce(address(tok), 500e18, 1);    // the decoy trick: re-announce at once
-        (uint64 from, , ) = guard.slow(address(acct), address(tok)); assertEq(from, block.timestamp + 25 hours);   // matures an hour after the guardian can act again, not in an hour
-        vm.warp(block.timestamp + 1 hours + 1); _expectSell(500e18, GuardedSwap.NotAnnounced.selector);
-        vm.warp(block.timestamp + 23 hours);                                 // cooldown over, announcement not yet mature: the guardian can cancel this one too...
-        guard.cancelSlow(address(acct), address(tok));
-        vm.prank(address(acct)); guard.announce(address(tok), 500e18, 1);    // ...and an honest account's exit is delayed by a day and an hour at most
-        vm.warp(block.timestamp + 25 hours); uint256 out = _sell(500e18, 1); assertEq(out, 0.15 ether);
-    }
     function test_R5_C2_partial_sales_never_erode_the_floor() public {
         router.set(3, 0, address(0)); _buy(1);                                // a dust lot: 1 wei of ETH for 3 tokens (reference 1/3 wei per token)
         router.set(3, 333333333333333333, address(0));                       // the router pays 1 wei for 3 tokens, 0 for 1 or 2 (rounding)
@@ -429,7 +358,7 @@ contract GuardedSwapTest is Test {
     function test_R5_C3_a_repeat_buy_at_the_boundary_cannot_move_the_floor() public {
         _buy(1 ether);                                                       // reference: 0.001 ETH per token, 1000 tokens
         router.set(2000, 1e15, address(0)); _buy(0.3 ether);                 // a repeat at exactly half the reference: 600 tokens (allowed)
-        (uint256 tokens, uint256 refEth, uint256 refTok) = guard.basis(address(acct), address(tok)); assertEq(tokens, 1600e18); assertEq(refEth, 1 ether); assertEq(refTok, 1000e18);
+        (uint256 tokens,, uint256 refEth, uint256 refTok) = guard.basis(address(acct), address(tok)); assertEq(tokens, 1600e18); assertEq(refEth, 1 ether); assertEq(refTok, 1000e18);
         // v6 took the floor from the blended average (1.3 ETH / 1600 = 0.0008125 per token): the whole lot could go for 0.65 ETH on the fast path.
         // v7 takes it from the reference: selling all 1600 tokens needs 50% of 0.001 each = 0.8 ETH
         assertEq(guard.floorFor(address(acct), address(tok), 1600e18), 0.8 ether);
@@ -440,6 +369,71 @@ contract GuardedSwapTest is Test {
         _buy(1 ether); tok.setAllowanceReverts(true);
         uint256 out = _sell(100e18, 1); assertEq(out, 0.1 ether);
     }
+
+    // ---- round 6 / v8 ----
+    function test_R6_H1_expensive_repeat_buys_raise_the_floor_with_their_cost() public {
+        _buy(0.01 ether);                                                    // reference: 0.001 ETH per token, 10 tokens
+        router.set(250, 1e15, address(0)); _buy(4 ether);                    // a repeat at exactly 4x the reference: 1000 tokens for 4 ETH (allowed)
+        (uint256 tokens, uint256 ethIn, uint256 refEth, uint256 refTok) = guard.basis(address(acct), address(tok));
+        assertEq(tokens, 1010e18); assertEq(ethIn, 4.01 ether); assertEq(refEth, 0.01 ether); assertEq(refTok, 10e18);
+        // v7 froze the floor at the reference: the whole lot could go for 0.505 ETH (12.6% of the 4.01 ETH paid).
+        // v8 takes the higher of the reference and the running average: 50% of what was actually paid
+        assertEq(guard.floorFor(address(acct), address(tok), 1010e18), 2.005 ether);
+        router.set(250, 198e13, address(0)); _expectSell(1010e18, GuardedSwap.NotAnnounced.selector);   // 1.9998 ETH: below
+        router.set(250, 2e15, address(0)); uint256 out = _sell(1010e18, 1); assertEq(out, 2.02 ether);   // 2.02 ETH: fast
+    }
+    function test_R6_cheap_repeat_cannot_pull_the_floor_below_the_reference() public {
+        _buy(1 ether); router.set(2000, 1e15, address(0)); _buy(0.3 ether);   // a repeat at half the reference (round-5 C-3 shape)
+        assertEq(guard.floorFor(address(acct), address(tok), 1600e18), 0.8 ether);   // 50% of the reference for every token, not of the diluted average
+    }
+    function test_R6_only_the_lot_is_for_sale() public {
+        tok.mint(address(acct), 100e18);                                     // untracked tokens: an airdrop, or a position opened before the gate
+        vm.startPrank(address(acct)); tok.approve(address(guard), 100e18);
+        vm.expectRevert(abi.encodeWithSelector(GuardedSwap.NotInLot.selector, 0, 100e18));
+        guard.sell(address(tok), 100e18, 1, route(address(tok), K_ETH, 100e18, address(acct))); vm.stopPrank();
+        _buy(1 ether);                                                       // a lot of 1000: selling 1001 is refused outright, announced or not
+        vm.prank(address(acct)); guard.announce(address(tok), 1100e18); vm.warp(block.timestamp + 1 hours);
+        vm.startPrank(address(acct)); tok.approve(address(guard), 1100e18);
+        vm.expectRevert(abi.encodeWithSelector(GuardedSwap.NotInLot.selector, 1000e18, 1100e18));
+        guard.sell(address(tok), 1100e18, 1, route(address(tok), K_ETH, 1100e18, address(acct))); vm.stopPrank();
+        assertEq(tok.balanceOf(address(acct)), 1100e18);                     // nothing moved
+    }
+    function test_R6_dust_lot_does_not_unlock_untracked_tokens() public {
+        tok.mint(address(acct), 1000e18); _buy(1);                           // 1 wei buys a dust lot of 1000 units; the 1000 untracked tokens stay out of reach
+        vm.startPrank(address(acct)); tok.approve(address(guard), 1000e18); vm.expectRevert(abi.encodeWithSelector(GuardedSwap.NotInLot.selector, 1000, 1000e18));
+        guard.sell(address(tok), 1000e18, 1, route(address(tok), K_ETH, 1000e18, address(acct))); vm.stopPrank();
+    }
+    function test_R6_no_guardian_power_over_announcements() public {
+        _buy(1 ether); vm.prank(address(acct)); guard.announce(address(tok), 500e18);
+        (bool ok, ) = address(guard).call(abi.encodeWithSignature("cancelSlow(address,address)", address(acct), address(tok))); assertFalse(ok);
+        vm.warp(block.timestamp + 1 hours); router.set(1000, 3e14, address(0)); uint256 out = _sell(500e18, 1); assertEq(out, 0.15 ether);   // an announced exit always matures
+    }
+    function test_R6_M1_zero_first_token_with_a_leftover_allowance_still_sells() public {
+        _buy(1 ether); tok.setZeroFirst(true); router.setPullLess(true); tok.setRevertOnZeroApprove(true);   // every route leaves half the allowance behind and the cleanup approve(0) fails
+        uint256 out = _sell(100e18, 1); assertEq(out, 0.1 ether);
+        assertGt(tok.allowance(address(guard), address(router)), 0);
+        // a token that refuses approve(0) AND wants zero first is the one unsupported combination: it fails closed, nothing moves
+        vm.startPrank(address(acct)); tok.approve(address(guard), 100e18); vm.expectRevert(GuardedSwap.TransferFailed.selector);
+        guard.sell(address(tok), 100e18, 1, route(address(tok), K_ETH, 100e18, address(acct))); vm.stopPrank();
+        assertEq(tok.balanceOf(address(acct)), 950e18);                     // the route pulled 50, the other 50 came back; the refused sale moved nothing
+        tok.setRevertOnZeroApprove(false);
+        out = _sell(100e18, 1); assertEq(out, 0.1 ether);                     // direct approve fails (zero first), zero, approve again: the sale goes through
+    }
+    function test_R6_L2_state_is_final_before_eth_leaves() public {
+        SpyWallet spy = new SpyWallet(); spy.set(guard, address(tok)); vm.deal(address(spy), 2 ether); router.setRefund(0.1 ether);
+        uint256 out = spy.buy(1 ether, 1, route(K_ETH, address(tok), 1 ether, address(spy)));
+        assertEq(spy.hooks(), 1); assertEq(spy.seenTokens(), out);           // the refund hook already sees the new lot
+        (uint256 tokens, uint256 ethIn,,) = guard.basis(address(spy), address(tok)); assertEq(tokens, out); assertEq(ethIn, 0.9 ether);   // and the change was not counted as spent
+    }
+    function test_R6_zero_cost_lot_refused() public {
+        router.setRefund(1 ether); vm.prank(address(acct)); vm.expectRevert(GuardedSwap.ZeroAmount.selector);
+        guard.buy{value: 1 ether}(address(tok), 1, route(K_ETH, address(tok), 1 ether, address(acct)));
+    }
+    function test_R6_L1_lot_size_bounded() public {
+        router.set(2e40, 1e15, address(0));                                  // 2e40 raw units per wei of ETH
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwap.TooLarge.selector);
+        guard.buy{value: 1}(address(tok), 1, route(K_ETH, address(tok), 1, address(acct)));
+    }
     function testFuzz_basis_tracks_sales(uint96 price, uint8 fracBps) public {
         vm.assume(price > 1e9 && price < 5e16); uint256 frac = uint256(fracBps) % 100 + 1;     // 1..100 %; router holds 100 ETH
         router.set(1000, price, address(0)); _buy(1 ether);
@@ -447,7 +441,7 @@ contract GuardedSwapTest is Test {
         uint256 floor = guard.floorFor(address(acct), address(tok), sellAmt);
         uint256 expectOut = sellAmt * price / 1e18;
         if (expectOut >= floor) { uint256 out = _sell(sellAmt, 1); assertEq(out, expectOut);
-            (uint256 tokens, uint256 refEth,) = guard.basis(address(acct), address(tok));
+            (uint256 tokens,, uint256 refEth,) = guard.basis(address(acct), address(tok));
             assertEq(tokens, 1000e18 - sellAmt); assertEq(refEth, tokens == 0 ? 0 : 1 ether); }   // the reference moves only on a full exit
         else _expectSell(sellAmt, GuardedSwap.NotAnnounced.selector);
     }
