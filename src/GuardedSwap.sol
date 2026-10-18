@@ -9,12 +9,13 @@ pragma solidity ^0.8.26;
 ///         No owner, no upgrade, no funds kept between calls. Anyone may call it; it can only ever pay the caller.
 ///
 ///         Guards on top of the recipient rule, because an executor key that is stolen could still trade badly:
-///         1. Price floor. buy() records the ETH paid per token for the calling account; a fast sell() refuses to return
-///            less than FLOOR_BPS of that entry price. Tokens beyond what this contract saw bought take the slow path.
+///         1. Price floor. The first buy of a lot records its REFERENCE price (ETH paid per token) for the calling
+///            account; a fast sell() refuses to return less than FLOOR_BPS of that reference price. The floor never moves
+///            with later buys or partial sales. Tokens beyond what this contract saw bought take the slow path.
 ///         2. Slow path. A sale below the floor, beyond the recorded basis, or of tokens this contract never saw bought
 ///            is allowed only after announce(token, amount, minEth) at least SLOW_DELAY earlier, within ANNOUNCE_TTL and
 ///            up to that amount. The announcement carries a PRICE: the sale must return at least minEth pro rata over
-///            the whole amount sold, tracked or not; the tracked part must also clear SLOW_FLOOR_BPS of its entry.
+///            the whole amount sold, tracked or not; the tracked part must also clear SLOW_FLOOR_BPS of its reference.
 ///            Announcing never unlocks a sale for dust, and the operator sees the announced price an hour ahead.
 ///         3. Rate limit. Per account and fixed hour window: at most MAX_SELLS_PER_HOUR sales, MAX_BUY_ETH_PER_HOUR of
 ///            ETH spent on buys and MAX_SELL_ETH_PER_HOUR of ETH taken out of sales (a burst at the window edge can
@@ -23,19 +24,21 @@ pragma solidity ^0.8.26;
 ///            delay an exit by an hour but never block it. A pause lifts itself after PAUSE_MAX and a new one may start
 ///            only PAUSE_COOLDOWN after the last one ended, so a hostile guardian cannot keep the fast path shut. The
 ///            guardian may cancel an announcement only before it matures and once per account and token per
-///            CANCEL_COOLDOWN; it cannot move funds; withdrawals never pass through here. The guardian is rotated in
-///            two steps (propose, accept within PENDING_TTL) and should be a multisig.
+///            CANCEL_COOLDOWN; an announcement made during that cooldown matures only SLOW_DELAY after it ends, so a
+///            cancelled dump cannot simply be re-announced (and an honest exit is delayed by at most a day and an
+///            hour). The guardian cannot move funds; withdrawals never pass through here. It is rotated in two steps
+///            (propose, accept within PENDING_TTL) and should be a multisig.
 ///         5. Only this call's funds. Token and ETH balances are measured as deltas around the router call: anything sent
 ///            to this contract outside a call is neither swept, nor counted, nor recoverable.
 ///         6. The router's executor is pinned (EXECUTOR). Buys may not name any srcReceivers; the router's permit hook is
-///            refused. A repeat buy may not set the price below half or above four times the REFERENCE entry (the first
-///            buy of the lot), so repeats cannot compound. A new lot, or a full exit, clears any standing announcement.
+///            refused. A repeat buy may not price the token below half or above four times the lot's reference (the
+///            first buy), and the floor is always taken from that reference, so repeats can neither dilute nor move it.
+///            A new lot, or a full exit, clears any standing announcement.
 ///         7. Residual, by design: a sale's srcReceivers are chosen by the aggregator (often the first pool) and cannot be
 ///            told apart from a planted sink on-chain; what such a sink can take is bounded by the floors and the
 ///            announced price above. The first buy of a lot has no price reference other than the hourly ETH budget.
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
-    function allowance(address, address) external view returns (uint256);
 }
 
 contract GuardedSwap {
@@ -48,18 +51,18 @@ contract GuardedSwap {
 
     address public immutable ROUTER;
     address public immutable EXECUTOR;                // the router's aggregation executor the calldata must call
-    uint256 public constant FLOOR_BPS = 5000;       // a fast sale may return no less than 50% of the entry price...
+    uint256 public constant FLOOR_BPS = 5000;       // a fast sale may return no less than 50% of the lot's reference price...
     uint256 public constant SLOW_FLOOR_BPS = 2000;  // ...an announced one no less than 20% on the tracked part, and no less than the announced price overall
     uint256 public constant REF_MAX_X = 4;          // a repeat buy may not price the token above 4x the reference entry
     uint256 public constant SLOW_DELAY = 1 hours;   // a slow sale must have been announced this long before
     uint256 public constant ANNOUNCE_TTL = 24 hours; // an announcement is good for this long after the delay
     uint256 public constant PAUSE_MAX = 7 days;     // a pause lifts itself after this
     uint256 public constant PAUSE_COOLDOWN = 1 days; // and a new pause may start only this long after the last one ended
-    uint256 public constant CANCEL_COOLDOWN = 24 hours; // the guardian cancels at most one announcement per account and token per this
+    uint256 public constant CANCEL_COOLDOWN = 24 hours; // the guardian cancels at most one announcement per account and token per this; the next matures after it
     uint256 public constant PENDING_TTL = 7 days;   // a proposed guardian must accept within this
     uint256 public constant MAX_RECEIVERS = 8;      // srcReceivers a sale route may name
 
-    struct Basis { uint256 ethIn; uint256 tokens; uint256 refEthIn; uint256 refTokens; }   // running entry and the lot's reference entry (first buy)
+    struct Basis { uint256 tokens; uint256 refEthIn; uint256 refTokens; }   // tokens of the lot still held, and the lot's reference entry (first buy)
     mapping(address => mapping(address => Basis)) public basis;
     struct Slow { uint64 from; uint192 amount; uint256 minEth; }   // an announced slow sale: allowed from `from`, up to `amount`, for no less than `minEth` pro rata
     mapping(address => mapping(address => Slow)) public slow;
@@ -229,7 +232,6 @@ contract GuardedSwap {
         // nor exceed four times it (inflation)
         if (b.tokens == 0) { b.refEthIn = spent; b.refTokens = out; delete slow[msg.sender][token]; }
         else if (spent * b.refTokens * 10000 < b.refEthIn * out * FLOOR_BPS || spent * b.refTokens > b.refEthIn * out * REF_MAX_X) revert DilutesBasis();
-        b.ethIn += spent;
         b.tokens += out;
         emit Bought(msg.sender, token, spent, out);
     }
@@ -243,7 +245,7 @@ contract GuardedSwap {
         uint256 tokBase = IERC20(token).balanceOf(address(this));   // tokens that were here before this call stay untouched
         uint256 got = _pull(token, msg.sender, amount);             // what actually arrived (fee-on-transfer aware)
         _checkRoute(routerData, token, K_ETH, got, minOut);
-        if (IERC20(token).allowance(address(this), ROUTER) != 0) _approveSoft(token, ROUTER, 0);   // tokens that want zero first
+        if (_allowance(token, ROUTER) != 0) _approveSoft(token, ROUTER, 0);   // tokens that want zero first
         _approve(token, ROUTER, got);
         uint256 ethBase = address(this).balance;
         uint256 before = msg.sender.balance;
@@ -258,41 +260,41 @@ contract GuardedSwap {
         _settle(token, sold, out);
     }
 
-    /// @dev Price floor against the entry price recorded by buy(). A sale of more than the recorded basis, or below the
-    ///      floor, must have been announced SLOW_DELAY earlier for at least that amount and clears the announced price
-    ///      pro rata over everything sold. Then the basis is reduced.
+    /// @dev Price floor against the lot's reference price recorded by its first buy(). A sale of more than the lot, or
+    ///      below the floor, must have been announced SLOW_DELAY earlier for at least that amount and clears the announced
+    ///      price pro rata over everything sold. Then the lot is reduced; the reference never moves until a full exit.
     function _settle(address token, uint256 sold, uint256 out) private {
         Basis storage b = basis[msg.sender][token];
         // under a pause every sale is a slow one: announced an hour ahead, so a pause can delay an exit but never block it
-        bool isSlow = paused() || b.tokens == 0 || sold > b.tokens || out < _ceil(b.ethIn * sold * FLOOR_BPS, b.tokens * 10000);
+        bool isSlow = paused() || b.tokens == 0 || sold > b.tokens || out < _ceil(b.refEthIn * sold * FLOOR_BPS, b.refTokens * 10000);
         if (isSlow) {
             Slow storage s = slow[msg.sender][token];
             if (s.from == 0 || block.timestamp < s.from || block.timestamp > s.from + ANNOUNCE_TTL || sold > s.amount) { if (paused()) revert IsPaused(); revert NotAnnounced(); }
-            // the announced price covers the whole sale, tracked tokens or not; the tracked part must also keep 20% of its entry
+            // the announced price covers the whole sale, tracked tokens or not; the tracked part must also keep 20% of its reference
             uint256 fl = _ceil(s.minEth * sold, s.amount);
-            if (b.tokens > 0) { uint256 fb = sold > b.tokens ? b.tokens : sold; uint256 f2 = _ceil(b.ethIn * fb * SLOW_FLOOR_BPS, b.tokens * 10000); if (f2 > fl) fl = f2; }
+            if (b.tokens > 0) { uint256 fb = sold > b.tokens ? b.tokens : sold; uint256 f2 = _ceil(b.refEthIn * fb * SLOW_FLOOR_BPS, b.refTokens * 10000); if (f2 > fl) fl = f2; }
             if (out < fl) revert BelowFloor(out, fl);
             if (sold == s.amount) delete slow[msg.sender][token];
             else { uint256 used = s.minEth * sold / s.amount; s.minEth -= used; s.amount -= uint192(sold); }   // the rest of the announcement keeps its share of the price
         }
         if (b.tokens > 0) {
-            uint256 fromBasis = sold > b.tokens ? b.tokens : sold;
-            uint256 share = _ceil(b.ethIn * fromBasis, b.tokens);                     // round the released cost UP: the remainder's floor never drifts upward
-            b.ethIn = share > b.ethIn ? 0 : b.ethIn - share;
-            b.tokens -= fromBasis;
-            if (b.tokens == 0) { b.ethIn = 0; b.refEthIn = 0; b.refTokens = 0; delete slow[msg.sender][token]; }  // full exit: the next buy starts a new lot with its own announcement
+            b.tokens -= sold > b.tokens ? b.tokens : sold;                            // the reference price is untouched by partial sales
+            if (b.tokens == 0) { b.refEthIn = 0; b.refTokens = 0; delete slow[msg.sender][token]; }  // full exit: the next buy starts a new lot with its own announcement
         }
         emit Sold(msg.sender, token, sold, out, isSlow);
     }
 
     /// @notice Announce a slow sale of up to `amount` of `token` for no less than `minEth` in total (pro rata if sold in
-    ///         parts); possible after SLOW_DELAY, for ANNOUNCE_TTL. Watched by the operator, who sees the price an hour ahead.
+    ///         parts); possible after SLOW_DELAY (or after the guardian's cancel cooldown, if it cancelled one), for
+    ///         ANNOUNCE_TTL. Watched by the operator, who sees the price an hour ahead.
     function announce(address token, uint256 amount, uint256 minEth) external lock {
         if (amount == 0) revert ZeroAmount();
         if (minEth == 0) revert MinOutZero();
         if (amount > type(uint192).max) revert TooLarge();
         if (token.code.length == 0) revert NotAContract();
         uint256 from = block.timestamp + SLOW_DELAY;
+        uint256 last = lastCancel[msg.sender][token];                                  // after a guardian cancellation the next announcement matures only once the guardian could act on it again
+        if (last != 0 && block.timestamp < last + CANCEL_COOLDOWN) from = last + CANCEL_COOLDOWN + SLOW_DELAY;
         slow[msg.sender][token] = Slow(uint64(from), uint192(amount), minEth);
         emit SlowSaleArmed(msg.sender, token, amount, from, minEth);
     }
@@ -307,16 +309,16 @@ contract GuardedSwap {
     function floorFor(address account, address token, uint256 amount) external view returns (uint256) {
         Basis storage b = basis[account][token];
         if (b.tokens == 0 || amount > b.tokens) return 0;
-        return _ceil(b.ethIn * amount * FLOOR_BPS, b.tokens * 10000);
+        return _ceil(b.refEthIn * amount * FLOOR_BPS, b.refTokens * 10000);
     }
     /// @notice The lowest ETH an ANNOUNCED sale of `amount` would accept: the announced price pro rata, and 20% of the
-    ///         entry on the tracked part (0 = nothing announced).
+    ///         reference on the tracked part (0 = nothing announced).
     function slowFloorFor(address account, address token, uint256 amount) external view returns (uint256 fl) {
         Slow storage s = slow[account][token];
         if (s.from == 0 || amount > s.amount) return 0;
         fl = _ceil(s.minEth * amount, s.amount);
         Basis storage b = basis[account][token];
-        if (b.tokens > 0) { uint256 fb = amount > b.tokens ? b.tokens : amount; uint256 f2 = _ceil(b.ethIn * fb * SLOW_FLOOR_BPS, b.tokens * 10000); if (f2 > fl) fl = f2; }
+        if (b.tokens > 0) { uint256 fb = amount > b.tokens ? b.tokens : amount; uint256 f2 = _ceil(b.refEthIn * fb * SLOW_FLOOR_BPS, b.refTokens * 10000); if (f2 > fl) fl = f2; }
     }
 
     function _callRouter(bytes calldata data, uint256 value) private {
@@ -345,6 +347,11 @@ contract GuardedSwap {
     function _approve(address token, address spender, uint256 amount) private {
         (bool ok, bytes memory r) = token.call(abi.encodeWithSelector(0x095ea7b3, spender, amount));
         if (!ok || (r.length != 0 && !abi.decode(r, (bool)))) revert TransferFailed();
+    }
+    /// @dev A tolerant allowance read: a token whose allowance() misbehaves is treated as 0 (the approve that follows decides).
+    function _allowance(address token, address spender) private view returns (uint256) {
+        (bool ok, bytes memory r) = token.staticcall(abi.encodeWithSelector(0xdd62ed3e, address(this), spender));
+        return (ok && r.length >= 32) ? abi.decode(r, (uint256)) : 0;
     }
     function _approveSoft(address token, address spender, uint256 amount) private {
         (bool ok, ) = token.call(abi.encodeWithSelector(0x095ea7b3, spender, amount)); ok;

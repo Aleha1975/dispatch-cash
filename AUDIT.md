@@ -1,13 +1,13 @@
-# Audit scope — round 5
+# Audit scope — round 6
 
-**What to review:** `src/GuardedSwap.sol` (v6, this branch) and its interaction with the KyberSwap MetaAggregationRouterV2 on Base. One contract, no dependencies.
+**What to review:** `src/GuardedSwap.sol` (v7, this branch) and its interaction with the KyberSwap MetaAggregationRouterV2 on Base. One contract, no dependencies.
 
-**Deployed:** Base (chain 8453), `0x259f17ed184ff97730407002140bcd512dca7a0a`, source verified on Sourcify (exact match):
-https://sourcify.dev/server/v2/contract/8453/0x259f17ed184ff97730407002140bcd512dca7a0a
+**Deployed:** Base (chain 8453), `0xb1ef2b0c04e65b22e70bc6a54ddf454259d726e4`, source verified on Sourcify (exact match):
+https://sourcify.dev/server/v2/contract/8453/0xb1ef2b0c04e65b22e70bc6a54ddf454259d726e4
 
-Previous subjects: v5 `0x3511a33478465d2f6fd5ebfebf52160ef39ec7a1` (round 4), v4 `0x970b033ab9965ce9c9f92584b529afa6100a994e` (round 3), v3 `0xf563ddf97a6c9ec1d1366dde3410f5aa2c07b485` (round 2), v2 `0x91b51882805051b83efc53e7407a01894d341ca0` (round 1).
+Previous subjects: v6 `0x259f17ed184ff97730407002140bcd512dca7a0a` (round 5), v5 `0x3511a33478465d2f6fd5ebfebf52160ef39ec7a1` (round 4), v4 `0x970b033ab9965ce9c9f92584b529afa6100a994e` (round 3), v3 `0xf563ddf97a6c9ec1d1366dde3410f5aa2c07b485` (round 2), v2 `0x91b51882805051b83efc53e7407a01894d341ca0` (round 1).
 
-**What it must guarantee:** an executor key that calls this contract on behalf of a client's smart account can never move the account's ETH or tokens to anyone but the account itself; a bad trade is bounded by a 50% floor against the recorded entry price, an announced 1-hour slow path that carries its own price, and per-account hourly limits on sales, ETH in and ETH out; a pause-only guardian can stop buys and delay sales but never block an exit for more than seven days in eight, nor touch funds.
+**What it must guarantee:** an executor key that calls this contract on behalf of a client's smart account can never move the account's ETH or tokens to anyone but the account itself; a bad trade is bounded by a 50% floor against the lot's reference price (fixed by its first buy, never moved by later buys or partial sales), an announced 1-hour slow path that carries its own price, and per-account hourly limits on sales, ETH in and ETH out; a pause-only guardian can stop buys and delay sales but never block an exit for more than seven days in eight, nor touch funds.
 
 **Round 1 findings and what changed in v3**
 
@@ -72,4 +72,14 @@ Previous subjects: v5 `0x3511a33478465d2f6fd5ebfebf52160ef39ec7a1` (round 4), v4
 | L-5 failed refund unwinds the trade, L-7 unsupported token classes, L-8 double fee via `address(this)`, L-9 unbounded revert copy | Accepted / documented | callers must accept ETH; token classes listed in the README; prefer `dstReceiver = msg.sender` |
 | L-6 router overpaying hit a bare panic | Fixed | `RouterOverpaid` |
 
-**Tests:** `forge test --no-match-contract Fork --fuzz-runs 2000` (54 tests, the round-1 to round-4 PoCs included) and `forge test --match-contract Fork --fork-url <base rpc>` (2 tests against the live Kyber router with real calldata). All pass on Foundry 1.8.5 / solc 0.8.26.
+**Round 5 findings and what changed in v7**
+
+| Finding | Status | Fix |
+| --- | --- | --- |
+| C-1 the guardian's one cancel per day was spent by a decoy, then the real dump was re-announced and matured before the guardian could act | Fixed | an announcement made during the cancel cooldown matures only `SLOW_DELAY` after the cooldown ends (`announce`), so the guardian can always act on it once; worst case for an honest slow exit is a day and an hour |
+| C-2 a partial sale could round the recorded entry cost to zero and leave the rest of the lot with no floor | Fixed | the running cost is gone: the floor is taken from the lot's reference price, which partial sales never touch |
+| C-3 one repeat buy at the allowed boundary moved the blended floor of the whole lot | Fixed | same change: floors (fast 50%, slow 20%) come from the reference, so a repeat buy cannot move the floor of tokens already held |
+| I-4 strict `allowance()` call | Fixed | tolerant `staticcall`, a misbehaving `allowance()` reads as 0 |
+| Leads: unconstrained `targetData`/`clientData`/`flags`; `cancelAnnounce` front-run of `cancelSlow`; remainder deletion on a full exit; `refEthIn == 0` | Accepted / documented | the executor and `dstReceiver` are pinned and output is measured on the caller, so those fields can only change the route, not the payee; Base has no public mempool and a self-cancelled announcement never matures; the remainder deletion costs the account one extra delay; a zero-cost non-zero-output swap is not reachable through the pinned router (fork-tested routes) |
+
+**Tests:** `forge test --no-match-contract Fork --fuzz-runs 2000` (59 tests, the round-1 to round-5 PoCs included) and `forge test --match-contract Fork --fork-url <base rpc>` (2 tests against the live Kyber router with real calldata). All pass on Foundry 1.8.5 / solc 0.8.26.

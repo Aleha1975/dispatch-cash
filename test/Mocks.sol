@@ -4,18 +4,21 @@ import "../src/GuardedSwap.sol";
 
 contract MockToken {
     string public name = "Mock"; string public symbol = "MOCK"; uint8 public decimals = 18;
-    mapping(address => uint256) public balanceOf; mapping(address => mapping(address => uint256)) public allowance;
+    mapping(address => uint256) public balanceOf; mapping(address => mapping(address => uint256)) internal _allow;
+    function allowance(address o, address s) external view returns (uint256) { if (allowanceReverts) revert("no"); return _allow[o][s]; }
     uint256 public feeBps;                                  // fee-on-transfer, burned
     bool public revertOnZeroApprove;                        // BNB-style approve(spender, 0) revert
     bool public zeroFirst;                                  // USDT-style: a non-zero allowance may only be set from zero
+    bool public allowanceReverts;                           // allowance() that does not answer (round-5 I-4)
+    function setAllowanceReverts(bool b) external { allowanceReverts = b; }
     function setZeroFirst(bool b) external { zeroFirst = b; }
     function setRevertOnZeroApprove(bool b) external { revertOnZeroApprove = b; }
     function setFee(uint256 b) external { feeBps = b; }
     function mint(address to, uint256 a) external { balanceOf[to] += a; }
-    function approve(address s, uint256 a) external returns (bool) { if (revertOnZeroApprove && a == 0) revert("zero"); if (zeroFirst && a != 0 && allowance[msg.sender][s] != 0) revert("zero first"); allowance[msg.sender][s] = a; return true; }
+    function approve(address s, uint256 a) external returns (bool) { if (revertOnZeroApprove && a == 0) revert("zero"); if (zeroFirst && a != 0 && _allow[msg.sender][s] != 0) revert("zero first"); _allow[msg.sender][s] = a; return true; }
     function transfer(address to, uint256 a) external returns (bool) { _move(msg.sender, to, a); return true; }
     function transferFrom(address f, address to, uint256 a) external returns (bool) {
-        uint256 al = allowance[f][msg.sender]; require(al >= a, "allowance"); allowance[f][msg.sender] = al - a; _move(f, to, a); return true; }
+        uint256 al = _allow[f][msg.sender]; require(al >= a, "allowance"); _allow[f][msg.sender] = al - a; _move(f, to, a); return true; }
     function _move(address f, address to, uint256 a) internal { require(balanceOf[f] >= a, "balance"); balanceOf[f] -= a; uint256 fee = a * feeBps / 10000; balanceOf[to] += a - fee; }
 }
 
