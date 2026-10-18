@@ -6,21 +6,22 @@ import "./Mocks.sol";
 
 contract GuardedSwapTest is Test {
     address constant K_ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
-    MockToken tok; MockRouter router; GuardedSwap guard; Wallet acct; address thief = address(0x1111111111111111111111111111111111111111);
+    MockToken tok; MockRouter router; GuardedSwap guard; Wallet acct; address exec; address thief = address(0x1111111111111111111111111111111111111111);
     function setUp() public {
-        tok = new MockToken(); router = new MockRouter(); guard = new GuardedSwap(address(router), address(this), 1000, 1000 ether); acct = new Wallet();
+        tok = new MockToken(); router = new MockRouter(); exec = address(new Wallet()); guard = new GuardedSwap(address(router), exec, address(this), 1000, 1000 ether); acct = new Wallet();
         vm.deal(address(router), 100 ether); vm.deal(address(acct), 10 ether);
         router.set(1000, 1e15, address(0));          // 1 ETH -> 1000 tokens; 1 token -> 0.001 ETH (entry price); pays the calldata recipient
     }
     // ---- Kyber-shaped calldata builders ----
-    function route(address tin, address tout, uint256 amount, address recipient) internal pure returns (bytes memory) {
-        GuardedSwap.SwapDescriptionV2 memory d; d.srcToken = tin; d.dstToken = tout; d.dstReceiver = recipient; d.amount = amount; d.minReturnAmount = 1;
-        GuardedSwap.SwapExecutionParams memory p; p.desc = d;
+    function routeMin(address tin, address tout, uint256 amount, address recipient, uint256 minRet, address callTarget) internal pure returns (bytes memory) {
+        GuardedSwap.SwapDescriptionV2 memory d; d.srcToken = tin; d.dstToken = tout; d.dstReceiver = recipient; d.amount = amount; d.minReturnAmount = minRet;
+        GuardedSwap.SwapExecutionParams memory p; p.desc = d; p.callTarget = callTarget;
         return abi.encodeWithSelector(0xe21fd0e9, p);
     }
-    function routeSimple(address tin, address tout, uint256 amount, address recipient) internal pure returns (bytes memory) {
+    function route(address tin, address tout, uint256 amount, address recipient) internal view returns (bytes memory) { return routeMin(tin, tout, amount, recipient, 1, exec); }
+    function routeSimple(address tin, address tout, uint256 amount, address recipient) internal view returns (bytes memory) {
         GuardedSwap.SwapDescriptionV2 memory d; d.srcToken = tin; d.dstToken = tout; d.dstReceiver = recipient; d.amount = amount; d.minReturnAmount = 1;
-        return abi.encodeWithSelector(0x8af033fb, address(0), d, bytes(""), bytes(""));
+        return abi.encodeWithSelector(0x8af033fb, exec, d, bytes(""), bytes(""));
     }
     function _buy(uint256 eth) internal returns (uint256) { vm.prank(address(acct)); return guard.buy{value: eth}(address(tok), 1, route(K_ETH, address(tok), eth, address(acct))); }
     function _sell(uint256 amount, uint256 minOut) internal returns (uint256) {
@@ -66,14 +67,58 @@ contract GuardedSwapTest is Test {
     }
     function test_route_checks_tokens_amount_selector_fees() public {
         vm.startPrank(address(acct));
+        vm.expectRevert(GuardedSwap.BadRoute.selector); guard.buy{value: 1 ether}(address(tok), 1, routeMin(K_ETH, address(tok), 1 ether, address(acct), 1, thief));          // wrong executor
+        vm.expectRevert(GuardedSwap.BadRoute.selector); guard.buy{value: 1 ether}(address(tok), 5, routeMin(K_ETH, address(tok), 1 ether, address(acct), 1, exec));           // router minimum below ours
+        vm.expectRevert(GuardedSwap.BadRoute.selector); guard.buy{value: 1 ether}(address(tok), 1, abi.encodeWithSelector(bytes4(0x8af033fb), thief, GuardedSwap.SwapDescriptionV2(K_ETH, address(tok), new address[](0), new uint256[](0), new address[](0), new uint256[](0), address(acct), 1 ether, 1, 0, ""), bytes(""), bytes("")));  // simple mode, wrong caller
         vm.expectRevert(GuardedSwap.BadRoute.selector); guard.buy{value: 1 ether}(address(tok), 1, route(K_ETH, address(0xBEEF), 1 ether, address(acct)));   // wrong dstToken
         vm.expectRevert(GuardedSwap.BadRoute.selector); guard.buy{value: 1 ether}(address(tok), 1, route(K_ETH, address(tok), 2 ether, address(acct)));      // amount mismatch
         vm.expectRevert(GuardedSwap.BadRoute.selector); guard.buy{value: 1 ether}(address(tok), 1, hex"deadbeef");                                            // unknown selector
         GuardedSwap.SwapDescriptionV2 memory d; d.srcToken = K_ETH; d.dstToken = address(tok); d.dstReceiver = address(acct); d.amount = 1 ether; d.minReturnAmount = 1;
         d.feeReceivers = new address[](1); d.feeReceivers[0] = thief; d.feeAmounts = new uint256[](1); d.feeAmounts[0] = 1;
-        GuardedSwap.SwapExecutionParams memory p; p.desc = d;
+        GuardedSwap.SwapExecutionParams memory p; p.desc = d; p.callTarget = exec;
         vm.expectRevert(GuardedSwap.BadRoute.selector); guard.buy{value: 1 ether}(address(tok), 1, abi.encodeWithSelector(bytes4(0xe21fd0e9), p));             // fee receivers
+        d.feeReceivers = new address[](0); d.feeAmounts = new uint256[](0); d.srcReceivers = new address[](1); d.srcReceivers[0] = thief; d.srcAmounts = new uint256[](1); d.srcAmounts[0] = 0.9 ether; p.desc = d;
+        vm.expectRevert(GuardedSwap.BadRoute.selector); guard.buy{value: 1 ether}(address(tok), 1, abi.encodeWithSelector(bytes4(0xe21fd0e9), p));             // R2-2: input diverted on a buy
         vm.stopPrank();
+    }
+    function test_R2_1_stray_tokens_are_not_swept_or_counted() public {
+        tok.mint(address(guard), 500e18);                        // stray tokens sitting in the contract (flash-loan planting)
+        uint256 out = _buy(1 ether); assertEq(out, 1000e18);
+        (uint256 ethIn, uint256 tokens) = guard.basis(address(acct), address(tok)); assertEq(ethIn, 1 ether); assertEq(tokens, 1000e18);
+        assertEq(tok.balanceOf(address(guard)), 500e18);         // untouched, uncredited
+        uint256 got = _sell(500e18, 1); assertEq(got, 0.5 ether); assertEq(tok.balanceOf(address(guard)), 500e18);
+    }
+    function test_R2_3_repeat_buy_cannot_dilute_basis() public {
+        _buy(1 ether); router.set(100000, 1e15, address(0));       // 10x cheaper than the recorded entry
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwap.DilutesBasis.selector);
+        guard.buy{value: 0.1 ether}(address(tok), 1, route(K_ETH, address(tok), 0.1 ether, address(acct)));
+        router.set(1500, 1e15, address(0)); _buy(0.1 ether);     // 1.5x cheaper (above half the entry) is fine
+    }
+    function test_R2_4_guardian_rotation_two_step() public {
+        address g2 = address(0xBEEF);
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwap.NotGuardian.selector); guard.proposeGuardian(g2);
+        guard.proposeGuardian(g2);
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwap.NotPendingGuardian.selector); guard.acceptGuardian();
+        vm.prank(g2); guard.acceptGuardian(); assertEq(guard.guardian(), g2); assertEq(guard.pendingGuardian(), address(0));
+        vm.expectRevert(GuardedSwap.NotGuardian.selector); guard.setPaused(true);          // the old guardian is out
+        vm.prank(g2); guard.setPaused(true); assertTrue(guard.paused());
+    }
+    function test_R2_5_cancel_and_partial_announcement() public {
+        _buy(1 ether); router.set(1000, 1e14, address(0));
+        vm.startPrank(address(acct)); guard.announce(address(tok), 500e18); guard.cancelAnnounce(address(tok));
+        (uint64 from, ) = guard.slow(address(acct), address(tok)); assertEq(from, 0);
+        guard.announce(address(tok), 500e18); vm.stopPrank(); vm.warp(block.timestamp + 1 hours);
+        _sell(200e18, 1);
+        (, uint192 left) = guard.slow(address(acct), address(tok)); assertEq(left, 300e18);   // remainder stays usable
+        _sell(300e18, 1);
+        (from, ) = guard.slow(address(acct), address(tok)); assertEq(from, 0);
+    }
+    function test_R2_6_zero_approve_reverting_token_still_sells() public {
+        _buy(1 ether); tok.setRevertOnZeroApprove(true);
+        uint256 out = _sell(100e18, 1); assertEq(out, 0.1 ether);
+    }
+    function test_R2_8_direct_eth_refused() public {
+        vm.prank(address(acct)); (bool ok, ) = address(guard).call{value: 1 ether}(""); assertFalse(ok);
     }
     function test_buy_minOut_zero_and_non_contract_token() public {
         vm.startPrank(address(acct));
@@ -154,7 +199,7 @@ contract GuardedSwapTest is Test {
     function test_sell_minOut_enforced() public {
         _buy(1 ether); vm.startPrank(address(acct)); tok.approve(address(guard), 500e18);
         vm.expectRevert(abi.encodeWithSelector(GuardedSwap.BelowMinOut.selector, 0.5 ether, 0.6 ether));
-        guard.sell(address(tok), 500e18, 0.6 ether, route(address(tok), K_ETH, 500e18, address(acct))); vm.stopPrank();
+        guard.sell(address(tok), 500e18, 0.6 ether, routeMin(address(tok), K_ETH, 500e18, address(acct), 0.6 ether, exec)); vm.stopPrank();
     }
     // ---- pause, limits, misc ----
     function test_L3_pause_blocks_buys_and_fast_sales_but_not_announced_exits() public {
@@ -172,7 +217,7 @@ contract GuardedSwapTest is Test {
         _buy(1 ether); guard.setPaused(true); guard.setPaused(false);
         assertEq(tok.balanceOf(address(acct)), 1000e18); assertEq(tok.balanceOf(address(this)), 0); assertEq(address(guard).balance, 0);
     }
-    function _tight() internal { guard = new GuardedSwap(address(router), address(this), 12, 0.3 ether); }
+    function _tight() internal { guard = new GuardedSwap(address(router), exec, address(this), 12, 0.3 ether); }
     function test_rate_limit_sells_per_hour() public {
         _tight(); _buy(0.3 ether);
         for (uint256 i = 0; i < 12; i++) _sell(10e18, 1);
@@ -195,6 +240,9 @@ contract GuardedSwapTest is Test {
         (uint64 from, ) = guard.slow(address(router), address(tok)); assertEq(from, 0);
     }
     function test_guard_keeps_nothing() public { _buy(1 ether); _sell(100e18, 1); assertEq(address(guard).balance, 0); assertEq(tok.balanceOf(address(guard)), 0); }
+    function test_M2_stray_eth_does_not_break_or_skew_buys_v4() public {
+        vm.deal(address(guard), 5 ether); uint256 out = _buy(1 ether); assertEq(out, 1000e18); assertEq(address(guard).balance, 5 ether);
+    }
     function test_router_revert_bubbles() public {
         router.set(0, 0, address(0));                        // a router that mints nothing -> output 0 -> BelowMinOut; and a failing router -> RouterFailed
         vm.prank(address(acct)); vm.expectRevert(abi.encodeWithSelector(GuardedSwap.BelowMinOut.selector, 0, 1));

@@ -6,9 +6,11 @@ contract MockToken {
     string public name = "Mock"; string public symbol = "MOCK"; uint8 public decimals = 18;
     mapping(address => uint256) public balanceOf; mapping(address => mapping(address => uint256)) public allowance;
     uint256 public feeBps;                                  // fee-on-transfer, burned
+    bool public revertOnZeroApprove;                        // BNB-style approve(spender, 0) revert
+    function setRevertOnZeroApprove(bool b) external { revertOnZeroApprove = b; }
     function setFee(uint256 b) external { feeBps = b; }
     function mint(address to, uint256 a) external { balanceOf[to] += a; }
-    function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
+    function approve(address s, uint256 a) external returns (bool) { if (revertOnZeroApprove && a == 0) revert("zero"); allowance[msg.sender][s] = a; return true; }
     function transfer(address to, uint256 a) external returns (bool) { _move(msg.sender, to, a); return true; }
     function transferFrom(address f, address to, uint256 a) external returns (bool) {
         uint256 al = allowance[f][msg.sender]; require(al >= a, "allowance"); allowance[f][msg.sender] = al - a; _move(f, to, a); return true; }

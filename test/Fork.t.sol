@@ -9,11 +9,12 @@ contract ForkTest is Test {
     address constant USDC = 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913;
     address constant ACCOUNT = 0x2675604b10222309807Cbd3d8CdD2A1d7ac82ef4;   // the owner's live smart account (fork: no real effect)
     address constant THIEF = 0x1111111111111111111111111111111111111111;
+    address constant EXECUTOR = 0x8F10B468b06c6FD214B65F87778827F7D113f996;   // Kyber aggregation executor on Base (callTarget of every real route)
     GuardedSwap guard;
-    function setUp() public { guard = new GuardedSwap(ROUTER, address(this), 12, 0.3 ether); /* production limits */ vm.deal(ACCOUNT, 1 ether); }
+    function setUp() public { guard = new GuardedSwap(ROUTER, EXECUTOR, address(this), 12, 0.3 ether); /* production limits */ vm.deal(ACCOUNT, 1 ether); }
     function _fx(string memory k) internal view returns (bytes memory data, uint256 minOut) {
         string memory j = vm.readFile("test/fixtures.json");
-        data = vm.parseJsonBytes(j, string.concat(".", k, ".data")); minOut = vm.parseJsonUint(j, string.concat(".", k, ".minOut"));
+        data = vm.parseJsonBytes(j, string.concat(".", k, ".data")); minOut = vm.parseJsonUint(j, string.concat(".", k, ".minOut")) * 99 / 100;   // just under the route's own minimum
     }
     function test_fork_buy_then_sell_usdc() public {
         (bytes memory b, uint256 bmin) = _fx("buy");

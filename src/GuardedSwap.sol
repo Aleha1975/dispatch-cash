@@ -15,9 +15,13 @@ pragma solidity ^0.8.26;
 ///            announce(token, amount) at least SLOW_DELAY earlier, within ANNOUNCE_TTL and up to that amount.
 ///         3. Rate limit. Per account and fixed hour window: at most MAX_SELLS_PER_HOUR sales and MAX_BUY_ETH_PER_HOUR of
 ///            ETH spent on buys (a burst at the window edge can reach twice that across two windows).
-///         4. Pause. A guardian address can pause buys; under a pause every sale takes the announced slow path, so a
-///            pause can delay an exit by an hour but never block it. The guardian cannot move funds; withdrawals never
-///            pass through here.
+///         4. Pause. A guardian can pause buys; under a pause every sale takes the announced slow path, so a pause can
+///            delay an exit by an hour but never block it. The guardian cannot move funds; withdrawals never pass through
+///            here. The guardian is rotated in two steps (propose, accept) and should be a multisig.
+///         5. Only this call's funds. Token and ETH balances are measured as deltas around the router call: anything sent
+///            to this contract outside a call is neither swept, nor counted, nor recoverable.
+///         6. The router's executor is pinned (EXECUTOR). Buys may not name any srcReceivers; a repeat buy may not dilute
+///            the recorded entry price below half.
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
 }
@@ -31,6 +35,7 @@ contract GuardedSwap {
     address private constant K_ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
 
     address public immutable ROUTER;
+    address public immutable EXECUTOR;                // the router's aggregation executor the calldata must call
     uint256 public constant FLOOR_BPS = 5000;       // a sale may return no less than 50% of the entry price...
     uint256 public constant SLOW_DELAY = 1 hours;   // ...unless announced this long before
     uint256 public constant ANNOUNCE_TTL = 24 hours; // an announcement is good for this long after the delay
@@ -45,7 +50,8 @@ contract GuardedSwap {
     struct Window { uint64 start; uint64 sells; uint128 buyEth; }      // per account, resets when the hour is over
     mapping(address => Window) public window;
 
-    address public immutable GUARDIAN;
+    address public guardian;
+    address public pendingGuardian;
     bool public paused;
 
     uint256 private _lock;
@@ -54,6 +60,9 @@ contract GuardedSwap {
     event Sold(address indexed account, address indexed token, uint256 tokensIn, uint256 ethOut, bool slow);
     event SlowSaleArmed(address indexed account, address indexed token, uint256 amount, uint256 allowedFrom);
     event Paused(bool paused);
+    event GuardianProposed(address indexed current, address indexed proposed);
+    event GuardianChanged(address indexed previous, address indexed current);
+    event SlowSaleCancelled(address indexed account, address indexed token);
 
     error Reentrancy();
     error ZeroAmount();
@@ -68,23 +77,32 @@ contract GuardedSwap {
     error RateLimited();
     error BadRoute();
     error NotAContract();
+    error DilutesBasis();
+    error NotPendingGuardian();
+    error NoDirectEth();
 
-    constructor(address router, address guardian, uint256 maxSellsPerHour, uint256 maxBuyEthPerHour) {
-        require(router != address(0) && guardian != address(0), "zero address");
+    constructor(address router, address executor, address guardian_, uint256 maxSellsPerHour, uint256 maxBuyEthPerHour) {
+        require(router != address(0) && executor != address(0) && guardian_ != address(0), "zero address");
+        require(guardian_ != router && guardian_ != executor, "guardian");
+        require(router.code.length > 0 && executor.code.length > 0, "not a contract");
         require(maxSellsPerHour > 0 && maxBuyEthPerHour > 0, "zero limit");
-        ROUTER = router; GUARDIAN = guardian;
+        ROUTER = router; EXECUTOR = executor; guardian = guardian_;
         MAX_SELLS_PER_HOUR = maxSellsPerHour; MAX_BUY_ETH_PER_HOUR = maxBuyEthPerHour;
     }
 
-    receive() external payable {}
+    /// @dev Only the router may send ETH here (the proceeds of a sale). Anything else is refused rather than stranded.
+    receive() external payable { if (msg.sender != ROUTER) revert NoDirectEth(); }
 
     modifier lock() { if (_lock != 0) revert Reentrancy(); _lock = 1; _; _lock = 0; }
+    modifier onlyGuardian() { if (msg.sender != guardian) revert NotGuardian(); _; }
 
     /// @notice The guardian stops and resumes buys and fast sales. Announced sales are never blocked.
-    function setPaused(bool p) external {
-        if (msg.sender != GUARDIAN) revert NotGuardian();
-        paused = p;
-        emit Paused(p);
+    function setPaused(bool p) external lock onlyGuardian { paused = p; emit Paused(p); }
+    /// @notice Two-step guardian rotation: the current guardian proposes, the proposed address accepts.
+    function proposeGuardian(address next) external onlyGuardian { pendingGuardian = next; emit GuardianProposed(guardian, next); }
+    function acceptGuardian() external {
+        if (msg.sender != pendingGuardian || msg.sender == address(0)) revert NotPendingGuardian();
+        emit GuardianChanged(guardian, msg.sender); guardian = msg.sender; pendingGuardian = address(0);
     }
 
     /// @dev Hour-window counters per account: `sells` sales and `buyEth` wei spent since `start`.
@@ -95,19 +113,27 @@ contract GuardedSwap {
         else { if (w.buyEth + ethIn > MAX_BUY_ETH_PER_HOUR) revert RateLimited(); w.buyEth += uint128(ethIn); }
     }
 
-    /// @dev The router calldata must be one of the two swap entry points, pay this contract or the caller, carry no fee
-    ///      receivers, and move exactly `tokenIn` -> `tokenOut` for `amount`.
-    function _checkRoute(bytes calldata routerData, address tokenIn, address tokenOut, uint256 amount) private view {
+    /// @dev The router calldata must be one of the two swap entry points run by EXECUTOR, pay this contract or the caller,
+    ///      carry no fee receivers, move exactly `tokenIn` -> `tokenOut` for `amount`, and demand at least `minOut` from
+    ///      the router itself. A buy (ETH in) may not hand the input to any srcReceiver; a sale may, because the router
+    ///      delivers the sold tokens straight to the first pool -- the price floor bounds what that can cost.
+    function _checkRoute(bytes calldata routerData, address tokenIn, address tokenOut, uint256 amount, uint256 minOut) private view {
         if (routerData.length < 4) revert BadRoute();
         bytes4 sel = bytes4(routerData[:4]);
-        SwapDescriptionV2 memory d;
-        if (sel == SEL_SWAP) { SwapExecutionParams memory p = abi.decode(routerData[4:], (SwapExecutionParams)); d = p.desc; }
-        else if (sel == SEL_SIMPLE) { (, d, , ) = abi.decode(routerData[4:], (address, SwapDescriptionV2, bytes, bytes)); }
+        SwapDescriptionV2 memory d; address exec;
+        if (sel == SEL_SWAP) { SwapExecutionParams memory p = abi.decode(routerData[4:], (SwapExecutionParams)); d = p.desc; exec = p.callTarget;
+            if (p.approveTarget != address(0) && p.approveTarget != EXECUTOR) revert BadRoute(); }
+        else if (sel == SEL_SIMPLE) { (exec, d, , ) = abi.decode(routerData[4:], (address, SwapDescriptionV2, bytes, bytes)); }
         else revert BadRoute();
+        if (exec != EXECUTOR) revert BadRoute();
         if (d.dstReceiver != msg.sender && d.dstReceiver != address(this)) revert BadRoute();
         if (d.feeReceivers.length != 0 || d.feeAmounts.length != 0) revert BadRoute();
         if (d.srcToken != tokenIn || d.dstToken != tokenOut) revert BadRoute();
         if (d.amount != amount) revert BadRoute();
+        if (d.minReturnAmount < minOut) revert BadRoute();
+        if (d.srcReceivers.length != d.srcAmounts.length) revert BadRoute();
+        if (tokenIn == K_ETH) { if (d.srcReceivers.length != 0) revert BadRoute(); }
+        else { uint256 sum; for (uint256 i = 0; i < d.srcReceivers.length; i++) { if (d.srcReceivers[i].code.length == 0 || d.srcReceivers[i] == msg.sender) revert BadRoute(); sum += d.srcAmounts[i]; } if (sum > amount) revert BadRoute(); }
     }
 
     /// @notice Spend msg.value of ETH on `token` through the router. Output and any unspent ETH go to msg.sender.
@@ -116,18 +142,21 @@ contract GuardedSwap {
         if (msg.value == 0) revert ZeroAmount();
         if (minOut == 0) revert MinOutZero();
         if (token.code.length == 0) revert NotAContract();
-        _checkRoute(routerData, K_ETH, token, msg.value);
+        _checkRoute(routerData, K_ETH, token, msg.value, minOut);
         _count(false, msg.value);
         uint256 ethBase = address(this).balance - msg.value;        // ETH that was here before this call stays untouched
+        uint256 tokBase = IERC20(token).balanceOf(address(this));   // tokens that were here before this call stay untouched
         uint256 before = IERC20(token).balanceOf(msg.sender);
         _callRouter(routerData, msg.value);
-        _sweepToken(token);
+        _sweepToken(token, tokBase);
         out = IERC20(token).balanceOf(msg.sender) - before;
         if (out < minOut) revert BelowMinOut(out, minOut);
         uint256 change = address(this).balance - ethBase;           // unspent part of msg.value, returned to the caller
         if (change > 0) _sendEth(msg.sender, change);
         uint256 spent = msg.value - change;
         Basis storage b = basis[msg.sender][token];
+        // a repeat buy may not pull the recorded entry price down below half: spent/out >= 50% of ethIn/tokens
+        if (b.tokens > 0 && spent * b.tokens * 10000 < b.ethIn * out * FLOOR_BPS) revert DilutesBasis();
         b.ethIn += spent;
         b.tokens += out;
         emit Bought(msg.sender, token, spent, out);
@@ -139,14 +168,15 @@ contract GuardedSwap {
         if (minOut == 0) revert MinOutZero();
         if (token.code.length == 0) revert NotAContract();
         _count(true, 0);
+        uint256 tokBase = IERC20(token).balanceOf(address(this));   // tokens that were here before this call stay untouched
         uint256 got = _pull(token, msg.sender, amount);             // what actually arrived (fee-on-transfer aware)
-        _checkRoute(routerData, token, K_ETH, got);
+        _checkRoute(routerData, token, K_ETH, got, minOut);
         _approve(token, ROUTER, got);
         uint256 ethBase = address(this).balance;
         uint256 before = msg.sender.balance;
         _callRouter(routerData, 0);
-        _approve(token, ROUTER, 0);
-        uint256 sold = got - _sweepToken(token);
+        _approveSoft(token, ROUTER, 0);                             // cleanup only; a token that rejects approve(0) must not undo the sale
+        uint256 sold = got - _sweepToken(token, tokBase);
         uint256 mine = address(this).balance - ethBase;             // ETH the router paid to this contract in this call
         if (mine > 0) _sendEth(msg.sender, mine);
         out = msg.sender.balance - before;
@@ -163,7 +193,7 @@ contract GuardedSwap {
         if (isSlow) {
             Slow storage s = slow[msg.sender][token];
             if (s.from == 0 || block.timestamp < s.from || block.timestamp > s.from + ANNOUNCE_TTL || sold > s.amount) { if (paused) revert IsPaused(); revert NotAnnounced(); }
-            delete slow[msg.sender][token];
+            if (sold == s.amount) delete slow[msg.sender][token]; else s.amount -= uint192(sold);   // the rest of the announcement stays usable
         }
         if (b.tokens > 0) {
             uint256 fromBasis = sold > b.tokens ? b.tokens : sold;
@@ -176,9 +206,16 @@ contract GuardedSwap {
     /// @notice Announce a slow sale of up to `amount` of `token`; possible after SLOW_DELAY, for ANNOUNCE_TTL. Watched by the operator.
     function announce(address token, uint256 amount) external lock {
         if (amount == 0) revert ZeroAmount();
+        if (token.code.length == 0) revert NotAContract();
         uint256 from = block.timestamp + SLOW_DELAY;
         slow[msg.sender][token] = Slow(uint64(from), uint192(amount));
         emit SlowSaleArmed(msg.sender, token, amount, from);
+    }
+
+    /// @notice Withdraw an announcement (the account's own).
+    function cancelAnnounce(address token) external lock {
+        delete slow[msg.sender][token];
+        emit SlowSaleCancelled(msg.sender, token);
     }
 
     /// @notice The lowest ETH `sell()` would accept right now for `amount` of `token` on the fast path (0 = slow path only).
@@ -192,9 +229,10 @@ contract GuardedSwap {
         (bool ok, bytes memory err) = ROUTER.call{value: value}(data);
         if (!ok) revert RouterFailed(err);
     }
-    /// @dev Everything of `token` this contract holds goes to msg.sender; returns the amount moved.
-    function _sweepToken(address token) private returns (uint256 held) {
-        held = IERC20(token).balanceOf(address(this));
+    /// @dev What this call added to the contract's `token` balance (above `base`) goes to msg.sender; returns the amount moved.
+    function _sweepToken(address token, uint256 base) private returns (uint256 held) {
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        held = bal > base ? bal - base : 0;
         if (held > 0) _send(token, msg.sender, held);
     }
 
@@ -213,6 +251,9 @@ contract GuardedSwap {
     function _approve(address token, address spender, uint256 amount) private {
         (bool ok, bytes memory r) = token.call(abi.encodeWithSelector(0x095ea7b3, spender, amount));
         if (!ok || (r.length != 0 && !abi.decode(r, (bool)))) revert TransferFailed();
+    }
+    function _approveSoft(address token, address spender, uint256 amount) private {
+        (bool ok, ) = token.call(abi.encodeWithSelector(0x095ea7b3, spender, amount)); ok;
     }
     function _sendEth(address to, uint256 amount) private {
         (bool ok, ) = to.call{value: amount}("");
