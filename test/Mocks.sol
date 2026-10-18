@@ -7,10 +7,12 @@ contract MockToken {
     mapping(address => uint256) public balanceOf; mapping(address => mapping(address => uint256)) public allowance;
     uint256 public feeBps;                                  // fee-on-transfer, burned
     bool public revertOnZeroApprove;                        // BNB-style approve(spender, 0) revert
+    bool public zeroFirst;                                  // USDT-style: a non-zero allowance may only be set from zero
+    function setZeroFirst(bool b) external { zeroFirst = b; }
     function setRevertOnZeroApprove(bool b) external { revertOnZeroApprove = b; }
     function setFee(uint256 b) external { feeBps = b; }
     function mint(address to, uint256 a) external { balanceOf[to] += a; }
-    function approve(address s, uint256 a) external returns (bool) { if (revertOnZeroApprove && a == 0) revert("zero"); allowance[msg.sender][s] = a; return true; }
+    function approve(address s, uint256 a) external returns (bool) { if (revertOnZeroApprove && a == 0) revert("zero"); if (zeroFirst && a != 0 && allowance[msg.sender][s] != 0) revert("zero first"); allowance[msg.sender][s] = a; return true; }
     function transfer(address to, uint256 a) external returns (bool) { _move(msg.sender, to, a); return true; }
     function transferFrom(address f, address to, uint256 a) external returns (bool) {
         uint256 al = allowance[f][msg.sender]; require(al >= a, "allowance"); allowance[f][msg.sender] = al - a; _move(f, to, a); return true; }
@@ -30,7 +32,9 @@ contract LyingToken {
 /// desc.srcToken from msg.sender and pays ETH at ethPerToken to desc.dstReceiver (or `payTo`). Optional re-entrancy.
 contract MockRouter {
     address constant K_ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
-    uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo; bool public reenter; address public guard; bool public reenterOk;
+    uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo; bool public reenter; address public guard; bool public reenterOk; uint256 public overpay; bool public pullLess;
+    function setOverpay(uint256 w) external { overpay = w; }
+    function setPullLess(bool b) external { pullLess = b; }
     receive() external payable {}
     function set(uint256 tpe, uint256 ept, address to) external { tokensPerEth = tpe; ethPerToken = ept; payTo = to; }
     function setReenter(address g) external { reenter = true; guard = g; }
@@ -41,10 +45,11 @@ contract MockRouter {
         if (d.srcToken == K_ETH) {
             require(msg.value == d.amount, "value");
             MockToken(d.dstToken).mint(to, msg.value * tokensPerEth);
-            if (reenter) { (bool ok, ) = guard.call(abi.encodeWithSignature("announce(address,uint256)", d.dstToken, uint256(1))); reenterOk = ok; }
+            if (overpay > 0) { (bool okp, ) = msg.sender.call{value: msg.value + overpay}(""); require(okp, "overpay"); }   // refunds more than it was sent
+            if (reenter) { (bool ok, ) = guard.call(abi.encodeWithSignature("announce(address,uint256,uint256)", d.dstToken, uint256(1), uint256(1))); reenterOk = ok; }
             return (msg.value * tokensPerEth, 0);
         }
-        MockToken(d.srcToken).transferFrom(msg.sender, address(this), d.amount);
+        MockToken(d.srcToken).transferFrom(msg.sender, address(this), pullLess ? d.amount / 2 : d.amount);   // pullLess: a route that leaves half the allowance behind
         uint256 eth = d.amount * ethPerToken / 1e18;
         (bool ok2, ) = to.call{value: eth}(""); require(ok2, "pay");
         return (eth, 0);

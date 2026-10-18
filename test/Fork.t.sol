@@ -11,7 +11,7 @@ contract ForkTest is Test {
     address constant THIEF = 0x1111111111111111111111111111111111111111;
     address constant EXECUTOR = 0x8F10B468b06c6FD214B65F87778827F7D113f996;   // Kyber aggregation executor on Base (callTarget of every real route)
     GuardedSwap guard;
-    function setUp() public { guard = new GuardedSwap(ROUTER, EXECUTOR, address(this), 12, 0.3 ether); /* production limits */ vm.deal(ACCOUNT, 1 ether); }
+    function setUp() public { guard = new GuardedSwap(ROUTER, EXECUTOR, address(this), 12, 0.3 ether, 1 ether); /* production limits */ vm.deal(ACCOUNT, 1 ether); }
     function _fx(string memory k) internal view returns (bytes memory data, uint256 minOut) {
         string memory j = vm.readFile("test/fixtures.json");
         data = vm.parseJsonBytes(j, string.concat(".", k, ".data")); minOut = vm.parseJsonUint(j, string.concat(".", k, ".minOut")) * 99 / 100;   // just under the route's own minimum

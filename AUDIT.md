@@ -1,13 +1,13 @@
-# Audit scope — round 4
+# Audit scope — round 5
 
-**What to review:** `src/GuardedSwap.sol` (v5, this branch) and its interaction with the KyberSwap MetaAggregationRouterV2 on Base. One contract, no dependencies.
+**What to review:** `src/GuardedSwap.sol` (v6, this branch) and its interaction with the KyberSwap MetaAggregationRouterV2 on Base. One contract, no dependencies.
 
-**Deployed:** Base (chain 8453), `0x3511a33478465d2f6fd5ebfebf52160ef39ec7a1`, source verified on Sourcify (exact match):
-https://sourcify.dev/server/v2/contract/8453/0x3511a33478465d2f6fd5ebfebf52160ef39ec7a1
+**Deployed:** Base (chain 8453), `0x259f17ed184ff97730407002140bcd512dca7a0a`, source verified on Sourcify (exact match):
+https://sourcify.dev/server/v2/contract/8453/0x259f17ed184ff97730407002140bcd512dca7a0a
 
-Previous subjects: v4 `0x970b033ab9965ce9c9f92584b529afa6100a994e` (round 3), v3 `0xf563ddf97a6c9ec1d1366dde3410f5aa2c07b485` (round 2), v2 `0x91b51882805051b83efc53e7407a01894d341ca0` (round 1).
+Previous subjects: v5 `0x3511a33478465d2f6fd5ebfebf52160ef39ec7a1` (round 4), v4 `0x970b033ab9965ce9c9f92584b529afa6100a994e` (round 3), v3 `0xf563ddf97a6c9ec1d1366dde3410f5aa2c07b485` (round 2), v2 `0x91b51882805051b83efc53e7407a01894d341ca0` (round 1).
 
-**What it must guarantee:** an executor key that calls this contract on behalf of a client's smart account can never move the account's ETH or tokens to anyone but the account itself; a bad trade is bounded by a 50% floor against the recorded entry price, an announced 1-hour slow path, and per-account hourly limits; a pause-only guardian can stop buys and delay sales but never block an exit or touch funds.
+**What it must guarantee:** an executor key that calls this contract on behalf of a client's smart account can never move the account's ETH or tokens to anyone but the account itself; a bad trade is bounded by a 50% floor against the recorded entry price, an announced 1-hour slow path that carries its own price, and per-account hourly limits on sales, ETH in and ETH out; a pause-only guardian can stop buys and delay sales but never block an exit for more than seven days in eight, nor touch funds.
 
 **Round 1 findings and what changed in v3**
 
@@ -52,4 +52,24 @@ Previous subjects: v4 `0x970b033ab9965ce9c9f92584b529afa6100a994e` (round 3), v3
 | L-2 rounding direction of the released cost; `_approveSoft`; fee-on-transfer leftover | Fixed / accepted | released cost rounded up (the remainder's floor never drifts upward); `_approveSoft` and the leftover sweep documented as accepted |
 | I-1 README constructor drift | Fixed | README updated |
 
-**Tests:** `forge test --no-match-contract Fork --fuzz-runs 2000` (43 tests, the round-1, round-2 and round-3 PoCs included) and `forge test --match-contract Fork --fork-url <base rpc>` (2 tests against the live Kyber router with real calldata). All pass on Foundry 1.8.5 / solc 0.8.26.
+**Round 4 findings and what changed in v6**
+
+| Finding | Status | Fix |
+| --- | --- | --- |
+| C-1 the slow-path floor priced only `min(sold, basis)`: untracked tokens and the excess over the basis sold with no price floor at all | Fixed | `announce(token, amount, minEth)` carries a price; a slow sale must return at least `minEth` pro rata over everything sold (tracked or not), and the tracked part must still clear 20% of its entry (`BelowFloor`). The watcher sees the announced price an hour ahead |
+| H-1 guardian could re-arm the pause forever and cancel every announcement, blocking exits | Fixed | a pause may not be re-stamped; a new pause may start only 1 day after the last one ended (`PAUSE_COOLDOWN`); `cancelSlow` works only before maturity and once per account and token per 24 h (`CANCEL_COOLDOWN`), so the next announcement always matures |
+| H-2 a stale announcement survived a full exit and armed a new lot | Fixed | a full exit and the first buy of a new lot both delete the account's announcement for that token |
+| M-1 no value cap on sales | Fixed | `MAX_SELL_ETH_PER_HOUR` (production 1 ETH) on ETH taken out of sales per account and hour |
+| M-2 router `permit` field forwarded unchecked | Fixed | `permit` must be empty (`BadRoute`) |
+| M-3 a leftover allowance could brick zero-first tokens | Fixed | a non-zero allowance to the router is reset to zero before a new approval |
+| M-4 multi-address tokens, M-5 rebasing tokens | Accepted / documented | not supported; stated in the README |
+| M-6 the first buy of a lot has no price reference | Accepted / documented | the hourly ETH budget is the bound; the engine sets `minOut` from a fresh quote |
+| M-7 `approveTarget` validated but allowance granted to the router | Verified | the router pulls the input itself (`transferFrom` by the router), confirmed by the fork test against the live router; `approveTarget` is the router's internal approval target |
+| L-1 floors could truncate to zero | Fixed | ceiling division in every floor |
+| L-2 unbounded `srcReceivers` | Fixed | at most 8 (`MAX_RECEIVERS`) |
+| L-3 no deadline | Accepted | the executor submits directly, no relayer; `minOut` comes from a fresh quote |
+| L-4 proposal hygiene | Fixed | `proposeGuardian` refuses zero, itself, router, executor; a proposal lapses after 7 days (`PENDING_TTL`) |
+| L-5 failed refund unwinds the trade, L-7 unsupported token classes, L-8 double fee via `address(this)`, L-9 unbounded revert copy | Accepted / documented | callers must accept ETH; token classes listed in the README; prefer `dstReceiver = msg.sender` |
+| L-6 router overpaying hit a bare panic | Fixed | `RouterOverpaid` |
+
+**Tests:** `forge test --no-match-contract Fork --fuzz-runs 2000` (54 tests, the round-1 to round-4 PoCs included) and `forge test --match-contract Fork --fork-url <base rpc>` (2 tests against the live Kyber router with real calldata). All pass on Foundry 1.8.5 / solc 0.8.26.
