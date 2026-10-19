@@ -119,7 +119,8 @@ contract GuardedSwap {
 
     constructor(address router, address executor, address guardian_, uint256 maxSellsPerHour, uint256 maxBuyEthPerHour, uint256 maxSellEthPerHour) {
         require(router != address(0) && executor != address(0) && guardian_ != address(0), "zero address");
-        require(guardian_ != router && guardian_ != executor, "guardian");
+        require(guardian_ != router && guardian_ != executor && guardian_ != address(this), "guardian");
+        require(router != executor, "router == executor");
         require(router.code.length > 0 && executor.code.length > 0, "not a contract");
         require(maxSellsPerHour > 0 && maxBuyEthPerHour > 0 && maxSellEthPerHour > 0, "zero limit");
         require(maxSellsPerHour <= type(uint64).max && maxBuyEthPerHour <= type(uint128).max && maxSellEthPerHour <= type(uint128).max, "limit too large");
@@ -189,13 +190,28 @@ contract GuardedSwap {
     }
     /// @dev The lot never exceeds what the account holds: tokens the owner moved out (or a negative rebase) leave the lot
     ///      pro rata, as if sold at cost (rounded so the average never drops). An empty balance closes the lot. Tokens that
-    ///      arrive before the next call are indistinguishable from the lot and protected at its floor.
+    ///      arrive before the next call are indistinguishable from the lot and protected at its floor. A standing
+    ///      announcement never exceeds the lot either.
     function _trim(address token) private returns (Basis storage b) {
         b = basis[msg.sender][token];
         if (b.tokens == 0) return b;
         uint256 bal = IERC20(token).balanceOf(msg.sender);
         if (bal == 0) { delete basis[msg.sender][token]; delete slow[msg.sender][token]; return b; }
-        if (bal < b.tokens) { b.ethIn = _ceil(b.ethIn * bal, b.tokens); b.tokens = bal; }
+        if (bal < b.tokens) { b.ethIn = _ceil(b.ethIn * bal, b.tokens); b.tokens = bal; _capSlow(token, bal); }
+    }
+    function _capSlow(address token, uint256 lot) private { Slow storage s = slow[msg.sender][token]; if (s.from != 0 && s.amount > lot) s.amount = uint192(lot); }
+    /// @dev What _trim would make of the lot, without writing: the views quote the reconciled lot.
+    function _trimmed(address account, address token) private view returns (uint256 tokens, uint256 ethIn, uint256 refEthIn, uint256 refTokens) {
+        Basis storage b = basis[account][token];
+        (tokens, ethIn, refEthIn, refTokens) = (b.tokens, b.ethIn, b.refEthIn, b.refTokens);
+        if (tokens == 0) return (0, 0, 0, 0);
+        uint256 bal = IERC20(token).balanceOf(account);
+        if (bal == 0) return (0, 0, 0, 0);
+        if (bal < tokens) { ethIn = _ceil(ethIn * bal, tokens); tokens = bal; }
+    }
+    function _floorOf(uint256 tokens, uint256 ethIn, uint256 refEthIn, uint256 refTokens, uint256 amount, uint256 bps) private pure returns (uint256) {
+        (uint256 e, uint256 t) = ethIn * refTokens >= refEthIn * tokens ? (ethIn, tokens) : (refEthIn, refTokens);
+        return _ceil(e * amount * bps, t * 10000);
     }
 
     /// @dev The router calldata must be swap(SwapExecutionParams) with flags == 0, run by EXECUTOR, carry no fee receivers
@@ -296,6 +312,7 @@ contract GuardedSwap {
         b.ethIn -= cost;
         b.tokens -= sold;
         if (b.tokens == 0 || IERC20(token).balanceOf(msg.sender) == 0) { b.ethIn = 0; b.tokens = 0; b.refEthIn = 0; b.refTokens = 0; delete slow[msg.sender][token]; }  // full exit: the next buy starts a new lot
+        else _capSlow(token, b.tokens);                             // a fast sale shrank the lot: the announcement never exceeds it
         emit Sold(msg.sender, token, sold, out, isSlow);
     }
 
@@ -313,22 +330,26 @@ contract GuardedSwap {
 
     /// @notice Withdraw an announcement (the account's own).
     function cancelAnnounce(address token) external lock {
+        if (token.code.length == 0) revert NotAContract();
         delete slow[msg.sender][token];
         emit SlowSaleCancelled(msg.sender, token);
     }
 
-    /// @notice The lowest ETH `sell()` would accept right now for `amount` of `token` on the fast path (0 = not in the lot).
+    /// @notice The lowest ETH `sell()` would accept right now for `amount` of `token` on the fast path (0 = not in the lot),
+    ///         quoted on the lot as the next call will reconcile it with the account's balance.
     function floorFor(address account, address token, uint256 amount) external view returns (uint256) {
-        Basis storage b = basis[account][token];
-        if (b.tokens == 0 || amount > b.tokens) return 0;
-        return _floor(b, amount, FLOOR_BPS);
+        (uint256 tokens, uint256 ethIn, uint256 refE, uint256 refT) = _trimmed(account, token);
+        if (tokens == 0 || amount > tokens) return 0;
+        return _floorOf(tokens, ethIn, refE, refT, amount, FLOOR_BPS);
     }
-    /// @notice The lowest ETH an ANNOUNCED sale of `amount` would accept (0 = not in the lot).
+    /// @notice The lowest ETH an ANNOUNCED sale of `amount` would accept (0 = not in the lot), on the reconciled lot.
     function slowFloorFor(address account, address token, uint256 amount) external view returns (uint256) {
-        Basis storage b = basis[account][token];
-        if (b.tokens == 0 || amount > b.tokens) return 0;
-        return _floor(b, amount, SLOW_FLOOR_BPS);
+        (uint256 tokens, uint256 ethIn, uint256 refE, uint256 refT) = _trimmed(account, token);
+        if (tokens == 0 || amount > tokens) return 0;
+        return _floorOf(tokens, ethIn, refE, refT, amount, SLOW_FLOOR_BPS);
     }
+    /// @notice The lot as the next call will see it: tokens still held, their cost, and the reference entry.
+    function lotOf(address account, address token) external view returns (uint256 tokens, uint256 ethIn, uint256 refEthIn, uint256 refTokens) { return _trimmed(account, token); }
 
     function _callRouter(bytes calldata data, uint256 value) private {
         (bool ok, bytes memory err) = ROUTER.call{value: value}(data);

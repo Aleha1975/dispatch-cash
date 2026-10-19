@@ -514,6 +514,31 @@ contract GuardedSwapTest is Test {
         vm.startPrank(address(acct)); tok.approve(address(guard), 10e18); vm.expectRevert(GuardedSwap.BadRoute.selector);
         guard.sell(address(tok), 10e18, 1, abi.encodeWithSelector(bytes4(0xe21fd0e9), p)); vm.stopPrank();
     }
+
+    // ---- round 9 / v11 ----
+    function test_R9_L1_views_quote_the_reconciled_lot() public {
+        _buy(1 ether); vm.prank(address(acct)); tok.transfer(address(0xdead), 400e18);   // 600 left, the record still says 1000
+        assertEq(guard.floorFor(address(acct), address(tok), 800e18), 0);                 // not sellable: the view already knows
+        assertEq(guard.floorFor(address(acct), address(tok), 600e18), 0.3 ether);         // 50% of the pro-rata cost of the 600 that remain
+        (uint256 tokens, uint256 ethIn,,) = guard.lotOf(address(acct), address(tok)); assertEq(tokens, 600e18); assertEq(ethIn, 0.6 ether);
+        (tokens,,,) = guard.basis(address(acct), address(tok)); assertEq(tokens, 1000e18); // the record itself is reconciled on the next call
+        vm.prank(address(acct)); tok.transfer(address(0xdead), 600e18);
+        assertEq(guard.floorFor(address(acct), address(tok), 1), 0); assertEq(guard.slowFloorFor(address(acct), address(tok), 1), 0);
+    }
+    function test_R9_L2_a_fast_sale_or_a_trim_caps_the_announcement() public {
+        _buy(1 ether); vm.prank(address(acct)); guard.announce(address(tok), 1000e18); vm.warp(block.timestamp + 1 hours);
+        _sell(999e18, 1);                                                                 // fast sale at the entry price
+        (, uint192 amt) = guard.slow(address(acct), address(tok)); assertEq(amt, 1e18);   // the announcement now covers only what is left
+        router.set(1000, 3e14, address(0)); uint256 out = _sell(1e18, 1); assertEq(out, 3e14);   // the remainder still slow-sells within it
+        _buy(1 ether); vm.prank(address(acct)); guard.announce(address(tok), 1000e18);
+        vm.prank(address(acct)); tok.transfer(address(0xdead), 700e18);
+        vm.prank(address(acct)); guard.announce(address(tok), 300e18);                     // any call reconciles: 300 is the most that can be announced now
+        vm.prank(address(acct)); vm.expectRevert(abi.encodeWithSelector(GuardedSwap.NotInLot.selector, 300e18, 301e18)); guard.announce(address(tok), 301e18);
+    }
+    function test_R9_constructor_hygiene() public {
+        vm.expectRevert(bytes("router == executor")); new GuardedSwap(address(router), address(router), address(this), 12, 0.3 ether, 1 ether);
+        vm.expectRevert(GuardedSwap.NotAContract.selector); vm.prank(address(acct)); guard.cancelAnnounce(thief);
+    }
     function testFuzz_basis_tracks_sales(uint96 price, uint8 fracBps) public {
         vm.assume(price > 1e9 && price < 5e16); uint256 frac = uint256(fracBps) % 100 + 1;     // 1..100 %; router holds 100 ETH
         router.set(1000, price, address(0)); _buy(1 ether);

@@ -1,11 +1,11 @@
-# Audit scope — round 9
+# Audit scope — round 10
 
-**What to review:** `src/GuardedSwap.sol` (v10, this branch) and its interaction with the KyberSwap MetaAggregationRouterV2 on Base. One contract, no dependencies.
+**What to review:** `src/GuardedSwap.sol` (v11, this branch) and its interaction with the KyberSwap MetaAggregationRouterV2 on Base. One contract, no dependencies.
 
-**Deployed:** Base (chain 8453), `0x72ac1cd4b96988b14b0a55b5bf962ba3eb314a39`, source verified on Sourcify (exact match):
-https://sourcify.dev/server/v2/contract/8453/0x72ac1cd4b96988b14b0a55b5bf962ba3eb314a39
+**Deployed:** Base (chain 8453), `0xdbc4fca0cc48baf929685b1393c1c93436ddbc9a`, source verified on Sourcify (exact match):
+https://sourcify.dev/server/v2/contract/8453/0xdbc4fca0cc48baf929685b1393c1c93436ddbc9a
 
-Previous subjects: v9 `0x2ea0ed9b4eaf9e6c17231e10d56531ce77faef50` (round 8), v8 `0x061c0a41bb8d83e6fecc3142f3801fed9e5b88d4` (round 7), v7 `0xb1ef2b0c04e65b22e70bc6a54ddf454259d726e4` (round 6), v6 `0x259f17ed184ff97730407002140bcd512dca7a0a` (round 5), v5 `0x3511a33478465d2f6fd5ebfebf52160ef39ec7a1` (round 4), v4 `0x970b033ab9965ce9c9f92584b529afa6100a994e` (round 3), v3 `0xf563ddf97a6c9ec1d1366dde3410f5aa2c07b485` (round 2), v2 `0x91b51882805051b83efc53e7407a01894d341ca0` (round 1).
+Previous subjects: v10 `0x72ac1cd4b96988b14b0a55b5bf962ba3eb314a39` (round 9), v9 `0x2ea0ed9b4eaf9e6c17231e10d56531ce77faef50` (round 8), v8 `0x061c0a41bb8d83e6fecc3142f3801fed9e5b88d4` (round 7), v7 `0xb1ef2b0c04e65b22e70bc6a54ddf454259d726e4` (round 6), v6 `0x259f17ed184ff97730407002140bcd512dca7a0a` (round 5), v5 `0x3511a33478465d2f6fd5ebfebf52160ef39ec7a1` (round 4), v4 `0x970b033ab9965ce9c9f92584b529afa6100a994e` (round 3), v3 `0xf563ddf97a6c9ec1d1366dde3410f5aa2c07b485` (round 2), v2 `0x91b51882805051b83efc53e7407a01894d341ca0` (round 1).
 
 **What it must guarantee:** an executor key that calls this contract on behalf of a client's smart account can never move the account's ETH or tokens to anyone but the account itself; a bad trade is bounded by a 50% floor against the lot's floor price (the higher of its first-buy reference and its cost-weighted average), only the lot itself can be sold, an announced 1-hour slow path keeps 20% of the floor price, and per-account hourly limits cap sales, ETH in and ETH out; a pause-only guardian can stop buys and delay sales but never block an exit for more than seven days in eight, cannot touch announcements, nor funds.
 
@@ -120,4 +120,14 @@ Previous subjects: v9 `0x2ea0ed9b4eaf9e6c17231e10d56531ce77faef50` (round 8), v8
 | L-4 a route returning everything plus a donation let `_settle` run with `sold == 0` | Fixed | a sale that moves nothing is refused (`ZeroAmount`) |
 | I-1 `dstReceiver == 0`, I-2 token hooks see pre-state in `buy`, I-3 executor source unverified, I-4 `srcReceivers[i] == this` | Fixed (I-4) / accepted | the gate itself is refused as a receiver; the rest is conservative or documented |
 
-**Tests:** `forge test --no-match-contract Fork --fuzz-runs 2000` (71 tests, the round-1 to round-8 PoCs included) and `forge test --match-contract Fork --fork-url <base rpc>` (2 tests against the live Kyber router with real calldata). All pass on Foundry 1.8.5 / solc 0.8.26.
+**Round 9 findings and what changed in v11** — round 9 found no Critical, High or Medium; the rounding in `_trim` and in the cost release was proven algebraically, and the flag mask and `approveTarget` assumptions were re-verified against the router source. What remained were three Lows at the seams of the new reconciliation.
+
+| Finding | Status | Fix |
+| --- | --- | --- |
+| L-1 `floorFor` / `slowFloorFor` quoted the raw record, not the reconciled lot | Fixed | the views run the same reconciliation without writing (`_trimmed`); `lotOf` exposes it |
+| L-2 a fast sale, or a reconciliation, left a standing announcement larger than the lot | Fixed | the announcement is capped to the lot whenever the lot shrinks (`_capSlow` in `_trim` and after every sale) |
+| L-3 a single `balanceOf() == 0` read closes the lot (reference and announcement included) | Accepted / documented | a lying token can only reset its own lot, which is the accepted first-buy residual; a transient zero from an honest token closes the lot, and the next buy opens a new one — no value moves |
+| I-1 `cancelAnnounce` without the contract check, I-2 guardian == this, I-4 router == executor | Fixed | checks added |
+| I-3 lapsed proposal not cleared, I-5 read-only reentrancy, I-6 fee-on-transfer refund leg, I-7 router assumptions | Accepted / confirmed | as documented |
+
+**Tests:** `forge test --no-match-contract Fork --fuzz-runs 2000` (74 tests, the round-1 to round-9 PoCs included) and `forge test --match-contract Fork --fork-url <base rpc>` (2 tests against the live Kyber router with real calldata). All pass on Foundry 1.8.5 / solc 0.8.26.
