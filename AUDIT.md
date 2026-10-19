@@ -1,13 +1,13 @@
-# Audit scope — round 10
+# Audit scope — round 11
 
-**What to review:** `src/GuardedSwap.sol` (v11, this branch) and its interaction with the KyberSwap MetaAggregationRouterV2 on Base. One contract, no dependencies.
+**What to review:** `src/GuardedSwap.sol` (v12, this branch) and its interaction with the KyberSwap MetaAggregationRouterV2 on Base. One contract, no dependencies.
 
-**Deployed:** Base (chain 8453), `0xdbc4fca0cc48baf929685b1393c1c93436ddbc9a`, source verified on Sourcify (exact match):
-https://sourcify.dev/server/v2/contract/8453/0xdbc4fca0cc48baf929685b1393c1c93436ddbc9a
+**Deployed:** Base (chain 8453), `0x455016186178544c1326cdbf9eb4a2d1a0c51ea4`, source verified on Sourcify (exact match):
+https://sourcify.dev/server/v2/contract/8453/0x455016186178544c1326cdbf9eb4a2d1a0c51ea4
 
-Previous subjects: v10 `0x72ac1cd4b96988b14b0a55b5bf962ba3eb314a39` (round 9), v9 `0x2ea0ed9b4eaf9e6c17231e10d56531ce77faef50` (round 8), v8 `0x061c0a41bb8d83e6fecc3142f3801fed9e5b88d4` (round 7), v7 `0xb1ef2b0c04e65b22e70bc6a54ddf454259d726e4` (round 6), v6 `0x259f17ed184ff97730407002140bcd512dca7a0a` (round 5), v5 `0x3511a33478465d2f6fd5ebfebf52160ef39ec7a1` (round 4), v4 `0x970b033ab9965ce9c9f92584b529afa6100a994e` (round 3), v3 `0xf563ddf97a6c9ec1d1366dde3410f5aa2c07b485` (round 2), v2 `0x91b51882805051b83efc53e7407a01894d341ca0` (round 1).
+Previous subjects: v11 `0xdbc4fca0cc48baf929685b1393c1c93436ddbc9a` (round 10), v10 `0x72ac1cd4b96988b14b0a55b5bf962ba3eb314a39` (round 9), v9 `0x2ea0ed9b4eaf9e6c17231e10d56531ce77faef50` (round 8), v8 `0x061c0a41bb8d83e6fecc3142f3801fed9e5b88d4` (round 7), v7 `0xb1ef2b0c04e65b22e70bc6a54ddf454259d726e4` (round 6), v6 `0x259f17ed184ff97730407002140bcd512dca7a0a` (round 5), v5 `0x3511a33478465d2f6fd5ebfebf52160ef39ec7a1` (round 4), v4 `0x970b033ab9965ce9c9f92584b529afa6100a994e` (round 3), v3 `0xf563ddf97a6c9ec1d1366dde3410f5aa2c07b485` (round 2), v2 `0x91b51882805051b83efc53e7407a01894d341ca0` (round 1).
 
-**What it must guarantee:** an executor key that calls this contract on behalf of a client's smart account can never move the account's ETH or tokens to anyone but the account itself; a bad trade is bounded by a 50% floor against the lot's floor price (the higher of its first-buy reference and its cost-weighted average), only the lot itself can be sold, an announced 1-hour slow path keeps 20% of the floor price, and per-account hourly limits cap sales, ETH in and ETH out; a pause-only guardian can stop buys and delay sales but never block an exit for more than seven days in eight, cannot touch announcements, nor funds.
+**What it must guarantee:** an executor key that calls this contract on behalf of a client's smart account can never move the account's ETH or tokens to anyone but the account itself; bad trades are bounded by a per-account loss budget (losses below cost at most 30% of the cost basis, refilling over a week; sales at or above cost are free), only the lot itself can be sold, and per-account hourly limits cap sales, ETH in and ETH out; a pause-only guardian can stop buys for at most seven days in eight and never blocks a sale; the operator's cold exit key can clear a budget (`unlock`) and run `exit` (a sale outside the budget and limits, still paid only to the account) to evacuate positions into ETH on the clients' own accounts when the executor key is compromised. Neither key can move funds anywhere else.
 
 **Round 1 findings and what changed in v3**
 
@@ -130,6 +130,8 @@ Previous subjects: v10 `0x72ac1cd4b96988b14b0a55b5bf962ba3eb314a39` (round 9), v
 | I-1 `cancelAnnounce` without the contract check, I-2 guardian == this, I-4 router == executor | Fixed | checks added |
 | I-3 lapsed proposal not cleared, I-5 read-only reentrancy, I-6 fee-on-transfer refund leg, I-7 router assumptions | Accepted / confirmed | as documented |
 
+**v12 — a product decision, not an audit response.** The 50% / 20% price floors of v5–v11 blocked honest exits on deep crashes (an hour's delay past −50%, no exit through the gate past −80%) and could not be explained to clients. No service without an oracle bounds a sale against the market (Enzyme's cumulative slippage policy needs one; Hyperliquid's agent wallets and exchange API keys bound nothing but withdrawal; intent systems need the owner's signature per trade), so v12 replaces the floors with the one bound that is explainable and does not need a price: a per-account loss budget, plus a cold exit key for the incident itself. Removed with the floors: announcements, the slow path, the first-buy reference and the repeat-buy band — four states fewer. The round-11 scope is this new budget/exit mechanism and its seams with the lot rule and the hourly limits.
+
 **Round 10 findings (v11, no code change)** — round 10 found no Critical, High or Medium. The four Lows are recorded here with their disposition; none moves value and none is acted upon before the next call reconciles the lot. A further version is a product decision, not a security need.
 
 | Finding | Status | Response |
@@ -140,4 +142,4 @@ Previous subjects: v10 `0x72ac1cd4b96988b14b0a55b5bf962ba3eb314a39` (round 9), v
 | L-4 trailing bytes after the ABI-encoded `SwapExecutionParams` are not rejected | Accepted / verified | the router is Solidity: its `swap(SwapExecutionParams)` decodes its argument with the ABI decoder and never reads calldata beyond the tuple, so trailing bytes change nothing on either side |
 | I-1 first-buy reference, I-2 `targetData`/`clientData` unread, I-4 `approveTarget` validated but unused, I-5 best-effort `approve(0)`, I-6 lot not re-priced when the balance returns, I-7 `uint192` narrowing in `_capSlow` (bounded by `MAX_LOT`), I-3 `proposeGuardian(this)` lapses harmlessly | Accepted / documented | as in earlier rounds |
 
-**Tests:** `forge test --no-match-contract Fork --fuzz-runs 2000` (74 tests, the round-1 to round-9 PoCs included) and `forge test --match-contract Fork --fork-url <base rpc>` (2 tests against the live Kyber router with real calldata). All pass on Foundry 1.8.5 / solc 0.8.26.
+**Tests:** `forge test --no-match-contract Fork --fuzz-runs 2000` (35 tests, the earlier rounds' PoCs that still apply included) and `forge test --match-contract Fork --fork-url <base rpc>` (3 tests against the live Kyber router with real calldata, including an exit by the cold key). All pass on Foundry 1.8.5 / solc 0.8.26.

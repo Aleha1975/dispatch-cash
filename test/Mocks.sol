@@ -52,7 +52,7 @@ contract MockRouter {
             MockToken(d.dstToken).mint(to, msg.value * tokensPerEth);
             if (overpay > 0) { (bool okp, ) = msg.sender.call{value: msg.value + overpay}(""); require(okp, "overpay"); }   // refunds more than it was sent
             if (refund > 0) { (bool okr, ) = msg.sender.call{value: refund}(""); require(okr, "refund"); }                   // returns part of the input as change
-            if (reenter) { (bool ok, ) = guard.call(abi.encodeWithSignature("announce(address,uint256)", d.dstToken, uint256(1))); reenterOk = ok; }
+            if (reenter) { (bool ok, ) = guard.call(abi.encodeWithSignature("sell(address,uint256,uint256,bytes)", d.dstToken, uint256(1), uint256(1), bytes(""))); reenterOk = ok; }
             return (msg.value * tokensPerEth, 0);
         }
         if (!pullNone) MockToken(d.srcToken).transferFrom(msg.sender, address(this), pullLess ? d.amount / 2 : d.amount);   // pullLess: a route that leaves half the allowance behind; pullNone: takes nothing
@@ -68,7 +68,7 @@ contract Wallet { receive() external payable {} }
 contract SpyWallet {
     GuardedSwap public g; address public tok; uint256 public seenTokens; uint256 public hooks;
     function set(GuardedSwap g_, address t) external { g = g_; tok = t; }
-    receive() external payable { hooks += 1; (seenTokens, , , ) = g.basis(address(this), tok); }
+    receive() external payable { hooks += 1; (seenTokens, ) = g.basis(address(this), tok); }
     function buy(uint256 eth, uint256 minOut, bytes calldata data) external returns (uint256) { return g.buy{value: eth}(tok, minOut, data); }
     function sell(uint256 amount, uint256 minOut, bytes calldata data) external returns (uint256) { MockToken(tok).approve(address(g), amount); return g.sell(tok, amount, minOut, data); }
 }
