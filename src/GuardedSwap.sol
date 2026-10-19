@@ -12,8 +12,8 @@ pragma solidity ^0.8.26;
 ///         1. Loss budget. Every buy is recorded in the account's lot for that token at cost. A sale that returns less
 ///            than the cost of the tokens it gives up is a LOSS; losses accumulate per account and must stay within
 ///            BUDGET_BPS of the account's total cost basis, refilling linearly over REFILL. A sale beyond the budget does
-///            not go through. The refill speed is fixed when a loss is booked (the budget in force then) and never rises
-///            while a loss is outstanding, so neither new buys nor closing the lot can make a loss fade faster or freeze it.
+///            not go through. What is outstanding fades linearly over REFILL from the last booking -- nothing but time (or the
+///            cold key's unlock) moves it: new buys, closed lots or a changed base neither speed it up nor freeze it.
 ///            Sales at or above cost never touch the budget, so taking profit is never delayed; a market
 ///            crash of one position is far inside the budget; a thief dumping everything hits it within minutes.
 ///         2. Only the lot is for sale. sell() handles at most the tokens this contract saw bought for the account;
@@ -62,13 +62,14 @@ contract GuardedSwap {
     uint256 public constant PAUSE_COOLDOWN = 1 days; // and a new pause may start only this long after the last one ended
     uint256 public constant PENDING_TTL = 7 days;   // a proposed guardian must accept within this
     uint256 public constant MAX_RECEIVERS = 8;      // srcReceivers a sale route may name
+    uint256 public constant MAX_UNLOCK = 64;        // accounts one unlock() may clear
     uint256 public constant MAX_LOT = 1e40;         // raw token units a lot may hold (keeps the arithmetic far from overflow)
 
     struct Basis { uint256 tokens; uint256 ethIn; }     // the lot: tokens held and their running cost
     mapping(address => mapping(address => Basis)) public basis;
     mapping(address => uint256) public costOf;        // the account's total cost basis across lots (the budget's base)
-    struct Loss { uint256 amount; uint256 rate; uint64 at; }   // losses accumulated, as of `at`, refilling at `rate` per REFILL: the budget in
-                                                                 // force when the loss was booked, never raised while a loss is outstanding (round 11, C-1)
+    struct Loss { uint256 amount; uint64 at; }         // losses outstanding as of `at`; the whole amount fades linearly over REFILL from then (v15: no
+                                                        // rate, no budget in the decay -- a later buy, sale or closed lot cannot speed it up or freeze it)
     mapping(address => Loss) public loss;
 
     uint256 public immutable MAX_SELLS_PER_HOUR;      // set at deployment (production: 12)
@@ -152,6 +153,14 @@ contract GuardedSwap {
         emit Paused(p);
     }
     /// @notice Two-step guardian rotation: the current guardian proposes, the proposed address accepts within PENDING_TTL.
+    /// @notice The cold key may replace the guardian outright: a lost or hostile guardian key cannot hold the executor in a
+    ///         pause cycle for good (round 13, F-3). The new guardian lifts the pause itself. (`replaceGuardian` is the only
+    ///         power the cold key has over the guardian; it cannot pause or trade.)
+    function replaceGuardian(address next) external lock {
+        if (msg.sender != EXIT_KEY) revert NotExitKey();
+        if (next == address(0) || next == guardian || next == ROUTER || next == EXECUTOR || next == EXIT_KEY || next == address(this)) revert BadGuardian();
+        emit GuardianChanged(guardian, next); guardian = next; pendingGuardian = address(0); pendingAt = 0;
+    }
     function proposeGuardian(address next) external lock onlyGuardian {
         if (next == address(0) || next == guardian || next == ROUTER || next == EXECUTOR || next == EXIT_KEY || next == address(this)) revert BadGuardian();
         pendingGuardian = next; pendingAt = block.timestamp; emit GuardianProposed(guardian, next);
@@ -165,7 +174,8 @@ contract GuardedSwap {
     // ---- exit key: unlock a budget, run an exit ----
     /// @notice The cold key clears the accumulated losses of these accounts (a crash was the market, not a theft).
     function unlock(address[] calldata accounts) external lock {
-        if (tx.origin != EXIT_KEY) revert NotExitKey();        // like exit(): the key signs the transaction itself, whatever code it may carry (round 12, L-1)
+        if (msg.sender != EXIT_KEY) revert NotExitKey();       // the key itself, directly: no contract between the key and this call may clear budgets (round 13, F-1)
+        if (accounts.length > MAX_UNLOCK) revert TooLarge();
         for (uint256 i = 0; i < accounts.length; i++) { uint256 l = loss[accounts[i]].amount; delete loss[accounts[i]]; emit Unlocked(accounts[i], l); }
     }
 
@@ -189,7 +199,8 @@ contract GuardedSwap {
     function _decayed(address account) private view returns (uint256) {
         Loss storage l = loss[account];
         if (l.amount == 0) return 0;
-        uint256 back = l.rate * (block.timestamp - l.at) / REFILL;   // against the rate frozen at booking, not today's cost basis
+        if (block.timestamp <= l.at) return l.amount;                   // (round 13, L-2) no backward time
+        uint256 back = l.amount * (block.timestamp - l.at) / REFILL;  // the booked amount itself is the rate: gone within REFILL of its booking
         return back >= l.amount ? 0 : l.amount - back;
     }
     /// @notice Losses on the account's record right now, and the budget they must stay within.
@@ -314,10 +325,9 @@ contract GuardedSwap {
             added = cost - out;
             uint256 carried = _decayed(msg.sender); uint256 total = carried + added; uint256 budget = _budget(msg.sender);   // the budget is measured before this sale's cost leaves the base
             if (total > budget) revert BudgetExceeded(total, budget);
-            // the refill speed is the budget in force now, but never more than the speed already running: a buy after a loss
-            // cannot make the loss fade faster, and a loss outlives the lots it came from (round 11, C-1 mechanisms B-D)
-            uint256 rate = loss[msg.sender].rate; if (carried == 0 || rate > budget) rate = budget;
-            loss[msg.sender] = Loss(total, rate, uint64(block.timestamp));
+            // what is outstanding now fades over REFILL from now: booking more resets the clock on a larger amount (slower overall),
+            // nothing else moves it -- not new buys, not closed lots, not a shrinking base (round 11 C-1, round 13 F-4)
+            loss[msg.sender] = Loss(total, uint64(block.timestamp));
         }
         b.ethIn -= cost; b.tokens -= sold; costOf[msg.sender] -= cost;
         (bool okb, uint256 left) = _balanceOf(token, msg.sender);

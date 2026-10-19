@@ -171,3 +171,20 @@ Previous subjects: v11 `0xdbc4fca0cc48baf929685b1393c1c93436ddbc9a` (round 10), 
 | I-3 the loss budget refills during a sequencer outage | Accepted / documented | bounded by outage length (12–24 h ≈ 7–14% of the week's refill) |
 
 **Tests (v14):** 43 unit tests (new: a bricked balance refused on buy; the pause test now checks that sales stop and `exit()` still runs), 4 stateful invariants, 3 fork tests on the live router — all passing. Deployed as v14 at `0x257543fec106428c550fd3c5b375eba8d71bda5e` (Base, block 52816419), Sourcify exact match.
+
+**Round 13 findings (v14) and what changed in v15** — round 13 found no Critical; 2 High, 2 Medium, 4 Low, 7 Informational. Both Highs and one Medium sit on seams created by the round-11/12 fixes themselves, so v15 removes a mechanism rather than adding one.
+
+| Finding | Status | Response (v15) |
+| --- | --- | --- |
+| F-1 `unlock()` gated on `tx.origin` (the round-12 L-1 change) is a confused deputy: a contract the cold key happens to call can clear any account's budget | Fixed | `unlock()` is gated on `msg.sender == EXIT_KEY` again (an EIP-7702 account calling the gate directly still passes; nothing between the key and the gate ever does); `accounts.length` capped at `MAX_UNLOCK` (64) |
+| F-4 the frozen refill rate (round-11 C-1 fix) drifts from the documented "fades within REFILL" in both directions | Fixed by removal | `Loss.rate` is gone. What is outstanding fades linearly over `REFILL` from its last booking; booking more resets the clock on the larger amount. The decay no longer reads the budget or the cost basis at all, so new buys, closed lots or a shrinking base can neither speed it up nor freeze it — the same guarantee C-1 wanted, with one rule instead of two |
+| F-3 with v14's sell-side pause a hostile guardian could hold the executor in a 7-of-8-day cycle with no remedy | Fixed | `replaceGuardian(address)` by the cold key: the new guardian lifts the pause at once. The cold key gains no other power over the guardian. The sell-side pause stays (it is what lets the watchers end a drain) |
+| F-2 the contract's reads of its own balance are strict, so a token that stops answering for the gate's address blocks `sell()` and `exit()` for that token | Accepted / documented | The gate measures its own balance to know what the router took and what came back; without that it cannot settle a sale honestly, so it must not proceed. Such a token is sold by the owner from the wallet, outside the gate |
+| F-5 the first increment of the round-12 H-1 inflation can happen inside one transaction, before any watcher reacts | Accepted / documented | One increment is bounded by the hourly buy cap (0.3 ETH → 0.09 ETH of allowance); the watchers' pause bounds every further one |
+| L-1 unbounded `accounts` in `unlock()` | Fixed | `MAX_UNLOCK` |
+| L-2 `_decayed` with a backward timestamp | Fixed | no decay for `block.timestamp <= at` |
+| L-3 the unreadable-balance fallback in `_sweepToken` can understate a booked loss | Accepted / documented | only for a token that stops answering the account's balance mid-sale; the lot is reconciled at the next call |
+| I-1 no containment if `EXIT_KEY` itself is compromised | Accepted / documented | by design: the cold key can only pay the owning account and replace the guardian |
+| I-2 … I-7 (overflow under misconfigured parameters, `tx.origin` reachability of `exit`, L1→L2 aliasing, zero-cost rounding, opposite rounding directions, read-only reentrancy of views) | Documented | unchanged from the earlier rounds' dispositions |
+
+**Tests (v15):** 42 unit tests (new: a loss fades over a week whatever the base does, keeps fading after the lot closes, booking more resets the clock, the cold key replaces a guardian that holds the pause), 4 stateful invariants (now including: outstanding loss is zero within `REFILL` of its booking), 3 fork tests on the live router — all passing. Deployed as v15 at `0x2c894b3a726b49d9e68e71d548157964e5e0fbb6` (Base, block 52819182), Sourcify exact match.

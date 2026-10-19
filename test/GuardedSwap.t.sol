@@ -199,9 +199,9 @@ contract GuardedSwapTest is Test {
     function test_budget_refills_linearly_over_a_week() public {
         _buy(1 ether); router.set(1000, 5e14, address(0)); _sell(500e18, 1);                         // loss 0.25 of cost 1 -> budget now 30% of 0.5 = 0.15, lost 0.25 (over, as the base shrank)
         _expectSell(100e18, abi.encodeWithSelector(GuardedSwap.BudgetExceeded.selector, 0.3 ether, 0.15 ether));
-        vm.warp(block.timestamp + 3.5 days);                                                         // half a week at the 0.3/week rate booked with the loss: 0.15 of room came back
-        (uint256 lost, ) = guard.budgetOf(address(acct)); assertEq(lost, 0.1 ether);
-        vm.warp(block.timestamp + 3.5 days); (lost, ) = guard.budgetOf(address(acct)); assertEq(lost, 0);   // a loss never outlives REFILL at the rate it was booked with
+        vm.warp(block.timestamp + 3.5 days);                                                         // half a week: half of the booked loss has faded
+        (uint256 lost, ) = guard.budgetOf(address(acct)); assertEq(lost, 0.125 ether);
+        vm.warp(block.timestamp + 3.5 days); (lost, ) = guard.budgetOf(address(acct)); assertEq(lost, 0);   // and all of it within REFILL of the booking
         uint256 out = _sell(100e18, 1); assertEq(out, 0.05 ether);
     }
     function test_unlock_only_by_the_cold_key() public {
@@ -209,8 +209,8 @@ contract GuardedSwapTest is Test {
         address[] memory a = new address[](1); a[0] = address(acct);
         vm.expectRevert(GuardedSwap.NotExitKey.selector); guard.unlock(a);                          // not the guardian (this test contract)
         vm.prank(address(acct)); vm.expectRevert(GuardedSwap.NotExitKey.selector); guard.unlock(a);  // not the account
-        vm.prank(address(acct), cold); guard.unlock(a);                                                  // (round 12, L-1) the key as transaction origin through a contract: accepted, like exit()
-        vm.prank(cold, cold); guard.unlock(a);
+        vm.prank(address(acct), cold); vm.expectRevert(GuardedSwap.NotExitKey.selector); guard.unlock(a);   // (round 13, F-1) the key as origin but a contract as sender: refused
+        vm.prank(cold); guard.unlock(a);
         (uint256 lost, ) = guard.budgetOf(address(acct)); assertEq(lost, 0);
         uint256 out = _sell(100e18, 1); assertEq(out, 0.05 ether);
     }
@@ -254,7 +254,7 @@ contract GuardedSwapTest is Test {
     }
     function test_guardian_and_exit_key_cannot_touch_funds() public {
         _buy(1 ether); guard.setPaused(true); guard.setPaused(false);
-        address[] memory a = new address[](1); a[0] = address(acct); vm.prank(cold, cold); guard.unlock(a);
+        address[] memory a = new address[](1); a[0] = address(acct); vm.prank(cold); guard.unlock(a);
         assertEq(tok.balanceOf(address(acct)), 1000e18); assertEq(tok.balanceOf(address(this)), 0); assertEq(tok.balanceOf(cold), 0); assertEq(address(guard).balance, 0);
     }
     function test_guardian_rotation_two_step_with_rules_and_expiry() public {
@@ -305,40 +305,34 @@ contract GuardedSwapTest is Test {
     }
 
     // ---- round 11 (v13) ----
-    function test_refill_speed_is_fixed_when_the_loss_is_booked() public {
-        _buy(1 ether); router.set(1000, 5e14, address(0)); _sell(500e18, 1);                         // loss 0.25 booked at rate 0.3/week
-        vm.deal(address(acct), 20 ether); router.set(1000, 1e15, address(0)); for (uint256 i = 0; i < 10; i++) _buy(1 ether);   // +10 ETH of cost: budget is now 3.15
+    function test_a_loss_fades_over_a_week_whatever_the_base_does() public {
+        _buy(1 ether); router.set(1000, 5e14, address(0)); _sell(500e18, 1);                         // loss 0.25 booked now
+        vm.deal(address(acct), 20 ether); router.set(1000, 1e15, address(0)); for (uint256 i = 0; i < 10; i++) _buy(1 ether);   // +10 ETH of cost: budget 3.15
         vm.warp(block.timestamp + 3.5 days);
         (uint256 lost, uint256 budget) = guard.budgetOf(address(acct)); assertEq(budget, 3.15 ether);
-        assertEq(lost, 0.1 ether);                                                                   // 0.25 - 0.15: the new capital did not speed the refill (C-1 mechanism B)
+        assertEq(lost, 0.125 ether);                                                                 // half of 0.25 after half a week: the new capital changed nothing (C-1 B)
     }
     function test_a_loss_keeps_fading_after_the_lot_is_closed() public {
         _buy(1 ether); router.set(1000, 7e14, address(0)); _sell(1000e18, 1);                        // full exit at -30%: loss 0.3 == budget, lot closed, cost basis 0
         (uint256 lost, uint256 budget) = guard.budgetOf(address(acct)); assertEq(lost, 0.3 ether); assertEq(budget, 0);
-        vm.warp(block.timestamp + 3.5 days); (lost, ) = guard.budgetOf(address(acct)); assertEq(lost, 0.15 ether);   // fades at the booked 0.3/week although costOf is 0 (C-1 mechanism D)
+        vm.warp(block.timestamp + 3.5 days); (lost, ) = guard.budgetOf(address(acct)); assertEq(lost, 0.15 ether);   // fades although costOf is 0 (C-1 D)
         vm.warp(block.timestamp + 3.5 days); (lost, ) = guard.budgetOf(address(acct)); assertEq(lost, 0);
     }
-    function test_refill_speed_never_rises_while_a_loss_is_outstanding() public {
-        _buy(1 ether); router.set(1000, 5e14, address(0)); _sell(400e18, 1);                         // loss 0.2 at rate 0.3
-        vm.deal(address(acct), 20 ether); router.set(1000, 1e15, address(0)); for (uint256 i = 0; i < 10; i++) _buy(1 ether);   // cost 10.6, budget 3.18
-        router.set(1000, 5e14, address(0)); _sell(100e18, 1);                                        // a small new loss (0.05) while 0.2 is outstanding
-        (, uint256 rate, ) = guard.loss(address(acct)); assertEq(rate, 0.3 ether);                   // the rate stayed 0.3, not 3.18
-        vm.warp(block.timestamp + 3.5 days); (uint256 lost, ) = guard.budgetOf(address(acct)); assertEq(lost, 0.1 ether);   // 0.25 - 0.15
-        // once the record is clean, a new loss books at the current (larger) budget
-        vm.warp(block.timestamp + 3.5 days); router.set(1000, 5e14, address(0)); _sell(100e18, 1);
-        (, rate, ) = guard.loss(address(acct)); assertGt(rate, 3 ether);
+    function test_booking_more_resets_the_clock_on_the_whole_amount() public {
+        _buy(1 ether); router.set(1000, 5e14, address(0)); _sell(400e18, 1);                         // loss 0.2
+        vm.warp(block.timestamp + 3.5 days);                                                         // 0.1 left
+        router.set(1000, 5e14, address(0)); _sell(100e18, 1);                                        // +0.05: 0.15 outstanding, clock reset
+        (uint256 amt, uint64 at) = guard.loss(address(acct)); assertEq(amt, 0.15 ether); assertEq(at, uint64(block.timestamp));
+        vm.warp(block.timestamp + 7 days); (uint256 lost, ) = guard.budgetOf(address(acct)); assertEq(lost, 0);   // and the whole 0.15 is gone within REFILL of that booking (F-4)
     }
-    function test_refill_speed_follows_a_shrinking_budget() public {
-        _buy(1 ether); router.set(1000, 5e14, address(0)); _sell(400e18, 1);                         // loss 0.2 at rate 0.3 (cost 0.6 left)
-        router.set(1000, 1e15, address(0)); _sell(500e18, 1);                                        // at cost: 0.1 of cost left, budget 0.03
-        vm.warp(block.timestamp + 4.5 days);                                                         // the 0.2 loss has faded to 0.007 at the 0.3/week rate
-        router.set(1000, 5e14, address(0)); _sell(10e18, 1);                                         // a new small loss (0.005): rate drops to today's budget
-        (, uint256 rate, ) = guard.loss(address(acct)); assertLt(rate, 0.3 ether); assertEq(rate, 0.03 ether);
-    }
-    function test_buy_refuses_a_token_that_hides_the_account_balance() public {
-        tok.setBricked(address(acct), true);
-        vm.prank(address(acct)); vm.expectRevert(abi.encodeWithSelector(GuardedSwap.BelowMinOut.selector, 0, 1));
-        guard.buy{value: 1 ether}(address(tok), 1, route(K_ETH, address(tok), 1 ether, address(acct)));   // (round 12, L-2) a clean refusal, not a bare revert
+    function test_the_cold_key_can_replace_a_guardian_that_holds_the_pause() public {
+        guard.setPaused(true); assertTrue(guard.paused());
+        address g2 = address(0x6002);
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwap.NotExitKey.selector); guard.replaceGuardian(g2);   // only the cold key
+        vm.prank(cold); vm.expectRevert(GuardedSwap.BadGuardian.selector); guard.replaceGuardian(address(this));   // not the same guardian
+        vm.prank(cold); guard.replaceGuardian(g2); assertEq(guard.guardian(), g2);
+        vm.expectRevert(GuardedSwap.NotGuardian.selector); guard.setPaused(false);                   // the old key has no power left
+        vm.prank(g2); guard.setPaused(false); assertFalse(guard.paused());                           // the new guardian lifts the pause at once (F-3 / I-1)
     }
     function test_bricked_balance_does_not_block_sell_or_exit() public {
         _buy(1 ether); tok.setBricked(address(acct), true);                                          // the account can no longer be read (blacklist); the gate can

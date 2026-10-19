@@ -1,12 +1,12 @@
 # Dispatch.cash — GuardedSwap
 
-The trade gate of [Dispatch.cash](https://dispatch.cash), the copy-trading engine on Base. Live contract: [`0xdbeeec5d37e7f73360e344b8fe24139232a112e6`](https://basescan.org/address/0xdbeeec5d37e7f73360e344b8fe24139232a112e6) (v12, source verified on [Sourcify](https://sourcify.dev/server/v2/contract/8453/0x257543fec106428c550fd3c5b375eba8d71bda5e)). Design: [DESIGN.md](DESIGN.md). Audit history and responses: [AUDIT.md](AUDIT.md).
+The trade gate of [Dispatch.cash](https://dispatch.cash), the copy-trading engine on Base. Live contract: [`0xdbeeec5d37e7f73360e344b8fe24139232a112e6`](https://basescan.org/address/0xdbeeec5d37e7f73360e344b8fe24139232a112e6) (v12, source verified on [Sourcify](https://sourcify.dev/server/v2/contract/8453/0x2c894b3a726b49d9e68e71d548157964e5e0fbb6)). Design: [DESIGN.md](DESIGN.md). Audit history and responses: [AUDIT.md](AUDIT.md).
 
 A one-purpose, immutable gate between a client's MetaMask smart account and the KyberSwap aggregator router on Base (chain id 8453).
 
 The client grants its trading executor the right to call this contract instead of the router. Whatever a swap returns goes to the calling account and nobody else: there is no recipient parameter.
 
-## Rules (v14)
+## Rules (v15)
 
 1. **Recipient.** All swap output, change and unsold input are swept to `msg.sender`. Output is measured as the caller's balance change (buy) or the ETH that reached this contract (sale, forwarded after settlement) and must be at least `minOut` (> 0). ETH is accepted only while a trade is in progress.
 2. **Route check.** Only `swap(SwapExecutionParams)` of the pinned router, run by the pinned executor; of `flags` only bit `0x200` may be set (the one bit live routes carry and the router's verified source never reads; every bit the router dispatches on is refused); `approveTarget` zero or the executor, `dstReceiver` this contract (a buy may also name the caller), no fee receivers, no `permit`, declared tokens and amounts must match, the router's `minReturnAmount` at least our `minOut`; a buy may not name any `srcReceivers`, a sale's `srcReceivers` (at most 8) must be contracts other than the caller and this contract with amounts summing to at most the input. Anything else reverts `BadRoute`.
@@ -25,7 +25,8 @@ No owner, no upgrade path, no funds kept between calls.
 
 | | |
 | --- | --- |
-| GuardedSwap v14 (current) | `0x257543fec106428c550fd3c5b375eba8d71bda5e` |
+| GuardedSwap v15 (current) | `0x2c894b3a726b49d9e68e71d548157964e5e0fbb6` |
+| GuardedSwap v14 | `0x257543fec106428c550fd3c5b375eba8d71bda5e` |
 | GuardedSwap v13 | `0xdbeeec5d37e7f73360e344b8fe24139232a112e6` |
 | GuardedSwap v12 | `0x455016186178544c1326cdbf9eb4a2d1a0c51ea4` |
 | Deploy tx | `0xc0980d0af89e23f159b7a6c766d72e584c9b217848657c0edb4abeae93ec88e6` (block 52807106, 19 Oct 2026) |
@@ -35,7 +36,7 @@ No owner, no upgrade path, no funds kept between calls.
 | Guardian (pause only) | `0x5550C8E49616C15B89FdD1DaECddc493009e039B` |
 | Exit key (unlock, exit) | `0xe90E76A6e5AC772193826218821D89e0aB0CEaBD` (cold) |
 | Limits | 12 sells / hour, 0.3 ETH of buys / hour, 1 ETH out of sales / hour per account |
-| Source verification | Sourcify exact match: https://sourcify.dev/server/v2/contract/8453/0x257543fec106428c550fd3c5b375eba8d71bda5e |
+| Source verification | Sourcify exact match: https://sourcify.dev/server/v2/contract/8453/0x2c894b3a726b49d9e68e71d548157964e5e0fbb6 |
 
 ## Views
 
