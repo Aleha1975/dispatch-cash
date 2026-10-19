@@ -4,7 +4,7 @@
 
 **Threat model.** The executor key leaks. The attacker can call `buy`/`sell`/`announce` on behalf of every client account and can build any router calldata. The attacker cannot change the delegation, cannot withdraw and cannot call the router directly. The guardian key (pause only) may also leak. The router and its executor are trusted infrastructure; the tokens are not.
 
-## Rules (v13)
+## Rules (v14)
 
 | Rule | What it enforces |
 | --- | --- |
@@ -13,7 +13,7 @@
 | Loss budget | Every buy is recorded at cost. Selling below cost is a loss; losses per account must stay within 30% of the account's cost basis, refilling over a week at the rate in force when the loss was booked (never raised while a loss is outstanding, so new buys cannot speed the refill and closing a lot cannot freeze it). A sale beyond the budget does not go through. Sales at or above cost are never limited: taking profit is never delayed, one position crashing is far inside the budget, a thief dumping everything hits it within minutes. |
 | Only the lot | A sale can cover at most the tokens this contract saw bought for the account; the lot is reconciled with the balance at every call and closes when the account holds nothing. |
 | Rate limits | Per account and hour: 12 sales, 0.3 ETH into buys, 1 ETH out of sales. The delegation adds 0.5 ETH per 24 h. |
-| Guardian | Pause buys for at most 7 days, then a day's cooldown. Never blocks a sale. No other power. |
+| Guardian | Pause the executor — buys and sells — for at most 7 days, then a day's cooldown. Never blocks `exit()` or the owner's own wallet. No other power. |
 | Exit key | The operator's cold key, kept off the trading machine. `unlock` clears an account's losses when a crash was the market. `exit` sells a position outside the budget and the limits — still paid only to the account — to evacuate every client into ETH when the executor key is compromised. |
 
 No owner, no upgrade path, no funds held between calls. Anyone may call it; it can only ever pay the caller.
@@ -53,10 +53,10 @@ Deliberately not in the client wording: the numeric limits (they may still be tu
 
 ## Audit history
 
-Twelve independent rounds (One Dollar Audit, October 2026) against v2 → v13, every report in `AUDIT.md` with the response to each finding. Rounds 1–7 reported 7 Critical and 6 High in total, each fixed in the next version with the auditor's proof of concept added as a test. Rounds 8–10 reported no Critical or High; rounds 9–10 no Medium. Round 11, the first against the loss budget (v12), found that the budget's refill was measured against a live base the account's own calls could move (1 Critical, 2 High, 1 Medium); v13 freezes the refill rate at booking, guards the balance reads and measures the returned tokens on the account, with stateful invariant tests added. Round 12 (v13) is in progress. The last two versions answered findings by removing mechanisms (self-declared prices, guardian cancellations, a second router entry point) rather than adding them, after the pattern of rounds 2–7 — each new finding at the seam between a fix and an older mechanism — became clear.
+Twelve independent rounds (One Dollar Audit, October 2026) against v2 → v13, every report in `AUDIT.md` with the response to each finding. Rounds 1–7 reported 7 Critical and 6 High in total, each fixed in the next version with the auditor's proof of concept added as a test. Rounds 8–10 reported no Critical or High; rounds 9–10 no Medium. Round 11, the first against the loss budget (v12), found that the budget's refill was measured against a live base the account's own calls could move (1 Critical, 2 High, 1 Medium); v13 freezes the refill rate at booking, guards the balance reads and measures the returned tokens on the account, with stateful invariant tests added. Round 12 (v13) found no Critical: one High — a cost-based budget's ceiling can be inflated by self-dealt buys at near-zero cost, which no contract mechanism closes without a price oracle or per-position floors; v14 answers it at the system boundary by making a pause stop the executor's sales as well as its buys, so the watchers' first reaction ends an attack. Round 13 (v14) is in progress. The last two versions answered findings by removing mechanisms (self-declared prices, guardian cancellations, a second router entry point) rather than adding them, after the pattern of rounds 2–7 — each new finding at the seam between a fix and an older mechanism — became clear.
 
 ## Verification
 
-- Live: Base, `0xdbeeec5d37e7f73360e344b8fe24139232a112e6` — [Basescan](https://basescan.org/address/0xdbeeec5d37e7f73360e344b8fe24139232a112e6), [Sourcify exact match](https://sourcify.dev/server/v2/contract/8453/0xdbeeec5d37e7f73360e344b8fe24139232a112e6).
-- Tests: `forge test --no-match-path test/Fork.t.sol` (42 unit tests and 4 stateful invariants over random buy/sell/warp/unlock sequences) and `forge test --match-contract Fork --fork-url <base rpc>` (3 tests against the live router with real calldata, including an exit by the cold key).
+- Live: Base, `0x257543fec106428c550fd3c5b375eba8d71bda5e` — [Basescan](https://basescan.org/address/0x257543fec106428c550fd3c5b375eba8d71bda5e), [Sourcify exact match](https://sourcify.dev/server/v2/contract/8453/0x257543fec106428c550fd3c5b375eba8d71bda5e).
+- Tests: `forge test --no-match-path test/Fork.t.sol` (43 unit tests and 4 stateful invariants over random buy/sell/warp/unlock sequences) and `forge test --match-contract Fork --fork-url <base rpc>` (3 tests against the live router with real calldata, including an exit by the cold key).
 - Static analysis: Slither (v2–v11), nothing beyond the documented accepted items.

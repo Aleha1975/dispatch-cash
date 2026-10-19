@@ -24,8 +24,10 @@ pragma solidity ^0.8.26;
 ///         3. Rate limit. Per account and fixed hour window: at most MAX_SELLS_PER_HOUR sales, MAX_BUY_ETH_PER_HOUR of
 ///            ETH spent on buys and MAX_SELL_ETH_PER_HOUR of ETH taken out of sales (a burst at the window edge can
 ///            reach twice that across two windows).
-///         4. Two keys kept off the executor's machine. The GUARDIAN can pause buys (at most PAUSE_MAX, then a day of
-///            cooldown); it never blocks a sale and cannot move funds. The EXIT key -- the operator's cold key -- can
+///         4. Two keys kept off the executor's machine. The GUARDIAN can pause the executor -- buys and sells -- for at most
+///            PAUSE_MAX, then a day of cooldown; it cannot move funds. A pause never touches exit() or the owner's own wallet,
+///            so a lost guardian key can delay the executor, never the owner. The watcher pauses on the first foreign trade,
+///            which is what bounds a slow inflation of the loss budget through self-dealt buys (round 12, H-1). The EXIT key -- the operator's cold key -- can
 ///            reset an account's loss budget (unlock, when a crash was the market and not a theft) and can run exit():
 ///            a sale paid to the account, outside the loss budget and the hourly limits, used to turn every position
 ///            into ETH on the clients' own accounts when the executor key is known to be compromised. Neither key can
@@ -133,10 +135,10 @@ contract GuardedSwap {
     modifier lock() { if (_lock != 0) revert Reentrancy(); _lock = 1; _; _lock = 0; }
     modifier onlyGuardian() { if (msg.sender != guardian) revert NotGuardian(); _; }
 
-    // ---- guardian: pause buys, rotate itself ----
-    /// @notice Paused while the guardian's pause is younger than PAUSE_MAX: a lost key can never freeze buys for good.
+    // ---- guardian: pause the executor, rotate itself ----
+    /// @notice Paused while the guardian's pause is younger than PAUSE_MAX: a lost key can never freeze the executor for good.
     function paused() public view returns (bool) { return pausedAt != 0 && block.timestamp < pausedAt + PAUSE_MAX; }
-    /// @notice The guardian stops and resumes buys. Sales are never blocked by a pause. A pause lasts at most PAUSE_MAX and
+    /// @notice The guardian stops and resumes the executor (buys and sells; exit() is never blocked). A pause lasts at most PAUSE_MAX and
     ///         the next may start only PAUSE_COOLDOWN after the last one ended.
     function setPaused(bool p) external lock onlyGuardian {
         if (p) {
@@ -163,7 +165,7 @@ contract GuardedSwap {
     // ---- exit key: unlock a budget, run an exit ----
     /// @notice The cold key clears the accumulated losses of these accounts (a crash was the market, not a theft).
     function unlock(address[] calldata accounts) external lock {
-        if (msg.sender != EXIT_KEY) revert NotExitKey();
+        if (tx.origin != EXIT_KEY) revert NotExitKey();        // like exit(): the key signs the transaction itself, whatever code it may carry (round 12, L-1)
         for (uint256 i = 0; i < accounts.length; i++) { uint256 l = loss[accounts[i]].amount; delete loss[accounts[i]]; emit Unlocked(accounts[i], l); }
     }
 
@@ -224,7 +226,7 @@ contract GuardedSwap {
         if (routerData.length < 4 || bytes4(routerData[:4]) != SEL_SWAP) revert BadRoute();
         SwapExecutionParams memory p = abi.decode(routerData[4:], (SwapExecutionParams)); SwapDescriptionV2 memory d = p.desc;
         if (p.callTarget != EXECUTOR) revert BadRoute();
-        if (p.approveTarget != address(0) && p.approveTarget != EXECUTOR) revert BadRoute();
+        if (p.approveTarget != address(0) && p.approveTarget != EXECUTOR) revert BadRoute();   // swap() never reads approveTarget (only swapGeneric does); kept so the field cannot name anyone else
         if (d.flags & ~FLAGS_ALLOWED != 0) revert BadRoute();                          // every router mode but the plain one is refused (0x20 = simple mode, routed by targetData; 0x01..0x100 = partial fill, extra ETH, claim, burn, fees, approve)
         if (d.dstReceiver != address(this) && (tokenIn != K_ETH || d.dstReceiver != msg.sender)) revert BadRoute();   // sales are paid here, forwarded after settlement
         if (d.feeReceivers.length != 0 || d.feeAmounts.length != 0) revert BadRoute();
@@ -248,10 +250,12 @@ contract GuardedSwap {
         if (msg.value > MAX_BUY_ETH_PER_HOUR) revert RateLimited();   // the net spend is counted below, once known
         uint256 ethBase = address(this).balance - msg.value;        // ETH that was here before this call stays untouched
         uint256 tokBase = IERC20(token).balanceOf(address(this));   // tokens that were here before this call stay untouched
-        uint256 before = IERC20(token).balanceOf(msg.sender);
+        (bool okB, uint256 before) = _balanceOf(token, msg.sender);
+        if (!okB) revert BelowMinOut(0, minOut);                   // a token that will not report the account's balance cannot be bought (round 12, L-2)
         _callRouter(routerData, msg.value);
         _sweepToken(token, tokBase);
-        out = IERC20(token).balanceOf(msg.sender) - before;
+        (bool okA, uint256 after_) = _balanceOf(token, msg.sender);
+        out = okA && after_ > before ? after_ - before : 0;
         if (out < minOut) revert BelowMinOut(out, minOut);
         uint256 change = address(this).balance - ethBase;           // unspent part of msg.value, returned to the caller last
         if (change > msg.value) revert RouterOverpaid();
@@ -267,6 +271,7 @@ contract GuardedSwap {
 
     /// @notice Sell `amount` of `token` (at most the lot) for ETH through the router, within the loss budget.
     function sell(address token, uint256 amount, uint256 minOut, bytes calldata routerData) external lock returns (uint256 out) {
+        if (paused()) revert IsPaused();                            // v14: a pause stops the executor's sales too -- once the watcher pauses, a thief cannot keep selling; exit() and the owner's own wallet are unaffected
         return _sale(token, amount, minOut, routerData, false);
     }
     /// @notice The cold key's exit: the same sale, outside the loss budget and the hourly limits, paid to the account.

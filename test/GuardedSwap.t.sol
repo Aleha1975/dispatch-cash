@@ -209,7 +209,8 @@ contract GuardedSwapTest is Test {
         address[] memory a = new address[](1); a[0] = address(acct);
         vm.expectRevert(GuardedSwap.NotExitKey.selector); guard.unlock(a);                          // not the guardian (this test contract)
         vm.prank(address(acct)); vm.expectRevert(GuardedSwap.NotExitKey.selector); guard.unlock(a);  // not the account
-        vm.prank(cold); guard.unlock(a);
+        vm.prank(address(acct), cold); guard.unlock(a);                                                  // (round 12, L-1) the key as transaction origin through a contract: accepted, like exit()
+        vm.prank(cold, cold); guard.unlock(a);
         (uint256 lost, ) = guard.budgetOf(address(acct)); assertEq(lost, 0);
         uint256 out = _sell(100e18, 1); assertEq(out, 0.05 ether);
     }
@@ -237,12 +238,14 @@ contract GuardedSwapTest is Test {
     }
 
     // ---- pause, limits, guardian ----
-    function test_pause_blocks_buys_only_and_is_bounded() public {
+    function test_pause_stops_the_executor_not_the_exit_and_is_bounded() public {
         _buy(1 ether);
         vm.prank(address(acct)); vm.expectRevert(GuardedSwap.NotGuardian.selector); guard.setPaused(true);
         guard.setPaused(true);
         vm.prank(address(acct)); vm.expectRevert(GuardedSwap.IsPaused.selector); guard.buy{value: 0.1 ether}(address(tok), 1, route(K_ETH, address(tok), 0.1 ether, address(acct)));
-        router.set(1000, 5e14, address(0)); uint256 out = _sell(100e18, 1); assertEq(out, 0.05 ether);   // sales, even at a loss, are never paused
+        router.set(1000, 5e14, address(0)); _expectSell(100e18, abi.encodeWithSelector(GuardedSwap.IsPaused.selector));   // v14: the executor's sales stop too
+        { bytes memory d = route(address(tok), K_ETH, 100e18, address(guard));                        // ...but the cold key's exit does not
+          vm.startPrank(address(acct), cold); tok.approve(address(guard), 100e18); uint256 out = guard.exit(address(tok), 100e18, 1, d); vm.stopPrank(); assertEq(out, 0.05 ether); }
         vm.expectRevert(GuardedSwap.PauseCooldown.selector); guard.setPaused(true);
         vm.warp(block.timestamp + 7 days + 1); assertFalse(guard.paused());
         vm.expectRevert(GuardedSwap.PauseCooldown.selector); guard.setPaused(true);
@@ -251,7 +254,7 @@ contract GuardedSwapTest is Test {
     }
     function test_guardian_and_exit_key_cannot_touch_funds() public {
         _buy(1 ether); guard.setPaused(true); guard.setPaused(false);
-        address[] memory a = new address[](1); a[0] = address(acct); vm.prank(cold); guard.unlock(a);
+        address[] memory a = new address[](1); a[0] = address(acct); vm.prank(cold, cold); guard.unlock(a);
         assertEq(tok.balanceOf(address(acct)), 1000e18); assertEq(tok.balanceOf(address(this)), 0); assertEq(tok.balanceOf(cold), 0); assertEq(address(guard).balance, 0);
     }
     function test_guardian_rotation_two_step_with_rules_and_expiry() public {
@@ -331,6 +334,11 @@ contract GuardedSwapTest is Test {
         vm.warp(block.timestamp + 4.5 days);                                                         // the 0.2 loss has faded to 0.007 at the 0.3/week rate
         router.set(1000, 5e14, address(0)); _sell(10e18, 1);                                         // a new small loss (0.005): rate drops to today's budget
         (, uint256 rate, ) = guard.loss(address(acct)); assertLt(rate, 0.3 ether); assertEq(rate, 0.03 ether);
+    }
+    function test_buy_refuses_a_token_that_hides_the_account_balance() public {
+        tok.setBricked(address(acct), true);
+        vm.prank(address(acct)); vm.expectRevert(abi.encodeWithSelector(GuardedSwap.BelowMinOut.selector, 0, 1));
+        guard.buy{value: 1 ether}(address(tok), 1, route(K_ETH, address(tok), 1 ether, address(acct)));   // (round 12, L-2) a clean refusal, not a bare revert
     }
     function test_bricked_balance_does_not_block_sell_or_exit() public {
         _buy(1 ether); tok.setBricked(address(acct), true);                                          // the account can no longer be read (blacklist); the gate can
