@@ -188,3 +188,12 @@ Previous subjects: v11 `0xdbc4fca0cc48baf929685b1393c1c93436ddbc9a` (round 10), 
 | I-2 … I-7 (overflow under misconfigured parameters, `tx.origin` reachability of `exit`, L1→L2 aliasing, zero-cost rounding, opposite rounding directions, read-only reentrancy of views) | Documented | unchanged from the earlier rounds' dispositions |
 
 **Tests (v15):** 42 unit tests (new: a loss fades over a week whatever the base does, keeps fading after the lot closes, booking more resets the clock, the cold key replaces a guardian that holds the pause), 4 stateful invariants (now including: outstanding loss is zero within `REFILL` of its booking), 3 fork tests on the live router — all passing. Deployed as v15 at `0x2c894b3a726b49d9e68e71d548157964e5e0fbb6` (Base, block 52819182), Sourcify exact match.
+
+**Round 14 findings (v15, no code change)** — round 14 found **no Critical and no High**; one Medium that the report itself calls informational-grade, two Lows that re-confirm accepted residuals, five Informational. The audit cycle on the loss-budget design is closed with v15.
+
+| Finding | Status | Response |
+| --- | --- | --- |
+| M-1 `acceptGuardian()`'s `msg.sender == address(0)` branch is unreachable | Accepted / documented | dead defensive branch; no path depends on it |
+| L-1 `exit()` keeps a `tx.origin` gate (operator-side confused deputy) | Accepted / documented | `exit()` must run through the account's own delegation, so `msg.sender` is the account; it can only sell the account's lot and pay that account. The exit transaction is built on the operator's phone with an independent quote |
+| L-2 `_decayed` multiplication bound under extreme deployment parameters | Accepted / documented | production limits keep it far from overflow (`MAX_LOT`, hourly caps) |
+| I-1 … I-5 (7702 vs the constructor EOA check, `replaceGuardian` leaves the pause to the new guardian, fixed hourly windows, `MAX_LOT` vs `ethIn`, tests not re-run by the reviewer) | Documented | as designed |
