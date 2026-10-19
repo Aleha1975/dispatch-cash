@@ -1,4 +1,6 @@
-# GuardedSwap
+# Dispatch.cash — GuardedSwap
+
+The trade gate of [Dispatch.cash](https://dispatch.cash), the copy-trading engine on Base. Live contract: [`0xdbc4fca0cc48baf929685b1393c1c93436ddbc9a`](https://basescan.org/address/0xdbc4fca0cc48baf929685b1393c1c93436ddbc9a) (v11, source verified on [Sourcify](https://sourcify.dev/server/v2/contract/8453/0xdbc4fca0cc48baf929685b1393c1c93436ddbc9a)). Design: [DESIGN.md](DESIGN.md). Audit history and responses: [AUDIT.md](AUDIT.md).
 
 A one-purpose, immutable gate between a client's MetaMask smart account and the KyberSwap aggregator router on Base (chain id 8453).
 
