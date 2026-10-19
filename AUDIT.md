@@ -130,4 +130,14 @@ Previous subjects: v10 `0x72ac1cd4b96988b14b0a55b5bf962ba3eb314a39` (round 9), v
 | I-1 `cancelAnnounce` without the contract check, I-2 guardian == this, I-4 router == executor | Fixed | checks added |
 | I-3 lapsed proposal not cleared, I-5 read-only reentrancy, I-6 fee-on-transfer refund leg, I-7 router assumptions | Accepted / confirmed | as documented |
 
+**Round 10 findings (v11, no code change)** — round 10 found no Critical, High or Medium. The four Lows are recorded here with their disposition; none moves value and none is acted upon before the next call reconciles the lot. A further version is a product decision, not a security need.
+
+| Finding | Status | Response |
+| --- | --- | --- |
+| L-1 the leftover returned by a sale is measured by this contract's balance drop, not by what the account receives (a fee on the return leg) | Accepted / documented | only fee-on-transfer tokens are affected, and those are unsupported; the next call's reconciliation (`_trim`) corrects the lot from the live balance before anything acts on it |
+| L-2 the views have no read-only reentrancy guard and can quote a pre-settlement lot from inside an in-flight `sell()` | Accepted / documented | the contract never consumes its own views; integrators should treat `floorFor`/`slowFloorFor`/`lotOf` as valid only when no trade of theirs is in flight |
+| L-3 the returndata of a failed router call is copied unbounded into `RouterFailed` | Accepted | self-only gas cost for the caller who chose the token |
+| L-4 trailing bytes after the ABI-encoded `SwapExecutionParams` are not rejected | Accepted / verified | the router is Solidity: its `swap(SwapExecutionParams)` decodes its argument with the ABI decoder and never reads calldata beyond the tuple, so trailing bytes change nothing on either side |
+| I-1 first-buy reference, I-2 `targetData`/`clientData` unread, I-4 `approveTarget` validated but unused, I-5 best-effort `approve(0)`, I-6 lot not re-priced when the balance returns, I-7 `uint192` narrowing in `_capSlow` (bounded by `MAX_LOT`), I-3 `proposeGuardian(this)` lapses harmlessly | Accepted / documented | as in earlier rounds |
+
 **Tests:** `forge test --no-match-contract Fork --fuzz-runs 2000` (74 tests, the round-1 to round-9 PoCs included) and `forge test --match-contract Fork --fork-url <base rpc>` (2 tests against the live Kyber router with real calldata). All pass on Foundry 1.8.5 / solc 0.8.26.
