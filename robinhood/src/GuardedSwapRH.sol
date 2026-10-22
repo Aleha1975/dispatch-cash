@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-/// @title GuardedSwapRH (v2: round-1 response)
+/// @title GuardedSwapRH (v3: round-2 response)
 /// @notice GuardedSwap v15 ported to Robinhood Chain (chain id 4663): a one-purpose gate between a client's smart account and
 ///         the Robinhood swap router (selector 0x4d819a2a, structured hops). The account grants its executor the right to
 ///         call THIS contract instead of the router. Whatever a swap returns goes to the calling account and nobody else.
@@ -18,7 +18,7 @@ pragma solidity ^0.8.26;
 ///            booking -- nothing but time (or the cold key's unlock) moves it. Sales at or above cost never touch the budget.
 ///         2. Only the lot is for sale. sell() handles at most the tokens this contract saw bought for the account; the lot
 ///            shrinks by what the account gave up, never exceeds what the account holds and closes when the account holds none.
-///         3. Rate limit. Per account and fixed hour window: at most MAX_SELLS_PER_HOUR sales, MAX_BUY_ETH_PER_HOUR of ETH
+///         3. Rate limit. Per account and fixed hour window: at most MAX_SELLS_PER_HOUR sales, (v3) MAX_BUYS_PER_HOUR buys, MAX_BUY_ETH_PER_HOUR of ETH
 ///            spent on buys and MAX_SELL_ETH_PER_HOUR of ETH taken out of sales.
 ///         4. Two keys kept off the executor's machine. The GUARDIAN can pause the executor -- buys and sells -- for at most
 ///            PAUSE_MAX, then a day of cooldown; it cannot move funds and never blocks exit(). The EXIT key -- the operator's
@@ -87,9 +87,10 @@ contract GuardedSwapRH {
     mapping(address => Loss) public loss;
 
     uint256 public immutable MAX_SELLS_PER_HOUR;
+    uint256 public immutable MAX_BUYS_PER_HOUR;        // (v3, round 2 H-2) buys are counted as sales are: tiny buys cannot multiply router calls
     uint256 public immutable MAX_BUY_ETH_PER_HOUR;
     uint256 public immutable MAX_SELL_ETH_PER_HOUR;
-    struct Window { uint64 start; uint64 sells; uint128 buyEth; uint128 sellEth; }      // per account, resets when the hour is over
+    struct Window { uint64 start; uint64 sells; uint64 buys; uint128 buyEth; uint128 sellEth; }      // per account, resets when the hour is over
     mapping(address => Window) public window;
 
     address public guardian;
@@ -130,7 +131,7 @@ contract GuardedSwapRH {
     error NoDirectEth();
     error PartialFill();
 
-    constructor(address router, address weth, address poolManager, address[] memory v3Factories, bool[] memory tickKeyed, address guardian_, address exitKey, uint256 maxSellsPerHour, uint256 maxBuyEthPerHour, uint256 maxSellEthPerHour) {
+    constructor(address router, address weth, address poolManager, address[] memory v3Factories, bool[] memory tickKeyed, address guardian_, address exitKey, uint256 maxSellsPerHour, uint256 maxBuysPerHour, uint256 maxBuyEthPerHour, uint256 maxSellEthPerHour) {
         require(router != address(0) && weth != address(0) && poolManager != address(0) && guardian_ != address(0) && exitKey != address(0), "zero address");
         require(router != address(this) && weth != address(this) && poolManager != address(this), "self");
         require(router != weth && router != poolManager && weth != poolManager, "distinct");
@@ -148,11 +149,11 @@ contract GuardedSwapRH {
         require(guardian_ != router && guardian_ != weth && guardian_ != poolManager && guardian_ != address(this), "guardian");
         require(exitKey != router && exitKey != weth && exitKey != poolManager && exitKey != guardian_ && exitKey != address(this), "exit key");
         require(exitKey.code.length == 0, "exit key must be an EOA");    // it submits transactions itself: tx.origin is how exit() recognises it
-        require(maxSellsPerHour > 0 && maxBuyEthPerHour > 0 && maxSellEthPerHour > 0, "zero limit");
-        require(maxSellsPerHour <= type(uint64).max && maxBuyEthPerHour <= type(uint128).max && maxSellEthPerHour <= type(uint128).max, "limit too large");
+        require(maxSellsPerHour > 0 && maxBuysPerHour > 0 && maxBuyEthPerHour > 0 && maxSellEthPerHour > 0, "zero limit");
+        require(maxSellsPerHour < type(uint64).max && maxBuysPerHour < type(uint64).max && maxBuyEthPerHour <= type(uint128).max && maxSellEthPerHour <= type(uint128).max, "limit too large");   // (v3, round 2 I-4) a count can always take one more
         ROUTER = router; WETH = weth; POOL_MANAGER = poolManager; guardian = guardian_; EXIT_KEY = exitKey;
         F0 = f[0]; F1 = f[1]; F2 = f[2]; F3 = f[3]; TICK_KEYED = bits;
-        MAX_SELLS_PER_HOUR = maxSellsPerHour; MAX_BUY_ETH_PER_HOUR = maxBuyEthPerHour; MAX_SELL_ETH_PER_HOUR = maxSellEthPerHour;
+        MAX_SELLS_PER_HOUR = maxSellsPerHour; MAX_BUYS_PER_HOUR = maxBuysPerHour; MAX_BUY_ETH_PER_HOUR = maxBuyEthPerHour; MAX_SELL_ETH_PER_HOUR = maxSellEthPerHour;
     }
     function _readAddr(address target, bytes4 sel) private view returns (address a) {
         (bool ok, bytes memory r) = target.staticcall(abi.encodeWithSelector(sel));
@@ -209,9 +210,13 @@ contract GuardedSwapRH {
     // ---- windows, budget (identical to v15) ----
     function _window() private returns (Window storage w) {
         w = window[msg.sender];
-        if (block.timestamp >= w.start + 1 hours) { w.start = uint64(block.timestamp); w.sells = 0; w.buyEth = 0; w.sellEth = 0; }
+        if (block.timestamp >= w.start + 1 hours) { w.start = uint64(block.timestamp); w.sells = 0; w.buys = 0; w.buyEth = 0; w.sellEth = 0; }
     }
-    function _countBuy(uint256 spent) private { Window storage w = _window(); if (w.buyEth + spent > MAX_BUY_ETH_PER_HOUR) revert RateLimited(); w.buyEth += uint128(spent); }
+    function _countBuy(uint256 spent) private {
+        Window storage w = _window();
+        if (w.buys + 1 > MAX_BUYS_PER_HOUR || w.buyEth + spent > MAX_BUY_ETH_PER_HOUR) revert RateLimited();
+        w.buys += 1; w.buyEth += uint128(spent);
+    }
     function _countSell(uint256 ethOut) private {
         Window storage w = _window();
         if (ethOut == 0) { if (w.sells + 1 > MAX_SELLS_PER_HOUR) revert RateLimited(); w.sells += 1; return; }
@@ -288,7 +293,7 @@ contract GuardedSwapRH {
             if (TICK_KEYED & (1 << i) != 0) { if (key > uint24(type(int24).max)) continue; q = abi.encodeWithSelector(0x28af8d0b, a, b, int24(key)); }   // getPool(address,address,int24)
             else q = abi.encodeWithSelector(0x1698ee82, a, b, key);                                                                                    // getPool(address,address,uint24)
             (bool ok, bytes memory ret) = f[i].staticcall(q);
-            if (ok && ret.length >= 32 && abi.decode(ret, (address)) == pool) return true;
+            if (ok && ret.length >= 32 && uint256(bytes32(ret)) == uint256(uint160(pool))) return true;   // (v3, round 2 L-4) a dirty word is a mismatch, never a revert
         }
         return false;
     }
@@ -330,6 +335,10 @@ contract GuardedSwapRH {
     }
     /// @notice The cold key's exit: the same sale, outside the loss budget and the hourly limits, paid to the account.
     ///         Reached through the account's delegation to the exit key: the account is msg.sender, the key is tx.origin.
+    ///         Two parties, two checks: msg.sender binds the lot, the payee and every write to the calling account (exit takes
+    ///         no account argument), tx.origin proves the cold key started the transaction. unlock() and replaceGuardian() act
+    ///         on other accounts or on the whole gate, so they take the key as the direct caller instead (v15, round 13 F-1:
+    ///         tx.origin there was a confused deputy). The cold key must submit its own transactions (no relayer or bundler).
     function exit(address token, uint256 amount, uint256 minOut, Hop[] calldata hops) external lock returns (uint256 out) {
         if (tx.origin != EXIT_KEY) revert NotExitKey();
         return _sale(token, amount, minOut, hops, true);
@@ -366,10 +375,11 @@ contract GuardedSwapRH {
     function _settle(address token, uint256 sold, uint256 out, bool isExit) private {
         Basis storage b = basis[msg.sender][token];
         if (sold > b.tokens) revert NotInLot(b.tokens, sold);
-        uint256 cost = b.ethIn * sold / b.tokens;
+        uint256 cost = b.ethIn * sold / b.tokens;                    // released from the lot rounded down: the remainder's cost never zeroes (v15, round 5 C-2)
+        uint256 charged = _ceil(b.ethIn * sold, b.tokens);            // (v3, round 2 L-1) measured against the budget rounded up: a loss is never under-booked
         uint256 added;
-        if (!isExit && out < cost) {
-            added = cost - out;
+        if (!isExit && out < charged) {
+            added = charged - out;
             uint256 carried = _decayed(msg.sender); uint256 total = carried + added; uint256 budget = _budget(msg.sender);
             if (total > budget) revert BudgetExceeded(total, budget);
             loss[msg.sender] = Loss(total, uint64(block.timestamp));
@@ -384,7 +394,7 @@ contract GuardedSwapRH {
     function floorFor(address account, address token, uint256 amount) external view returns (uint256) {
         (uint256 tokens, uint256 ethIn) = _trimmed(account, token);
         if (tokens == 0 || amount > tokens) return 0;
-        uint256 cost = ethIn * amount / tokens; uint256 room = _budget(account); uint256 lost = _decayed(account);
+        uint256 cost = _ceil(ethIn * amount, tokens); uint256 room = _budget(account); uint256 lost = _decayed(account);   // cost as _settle charges it
         room = room > lost ? room - lost : 0;
         return cost > room ? cost - room : 0;
     }

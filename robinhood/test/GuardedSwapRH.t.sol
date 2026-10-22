@@ -12,10 +12,15 @@ contract GuardedSwapRHTest is Test {
     address thief = address(0x1111111111111111111111111111111111111111);
     address cold = address(0xC01D);
     address pool = address(0xB001);                    // a v3 pool the factory knows (WETH/tok, fee 10000)
-    function _deploy(uint256 sells, uint256 buyEth, uint256 sellEth) internal returns (GuardedSwapRH) {
+    function _deploy(uint256 sells, uint256 buyEth, uint256 sellEth) internal returns (GuardedSwapRH) { return _deployB(sells, 1000, buyEth, sellEth); }
+    function _deployB(uint256 sells, uint256 buys, uint256 buyEth, uint256 sellEth) internal returns (GuardedSwapRH) {
         address[] memory f = new address[](2); f[0] = address(fac); f[1] = address(facTick);
         bool[] memory k = new bool[](2); k[1] = true;
-        return new GuardedSwapRH(address(router), address(weth), pm, f, k, address(this), cold, sells, buyEth, sellEth);
+        return _deployWith(f, k, cold, sells, buys, buyEth, sellEth);
+    }
+    /// the one constructor call of this suite
+    function _deployWith(address[] memory f, bool[] memory k, address exitKey, uint256 sells, uint256 buys, uint256 buyEth, uint256 sellEth) internal returns (GuardedSwapRH) {
+        return new GuardedSwapRH(address(router), address(weth), pm, f, k, address(this), exitKey, sells, buys, buyEth, sellEth);
     }
     function setUp() public {
         tok = new MockToken(); weth = new MockToken(); pm = address(new Wallet()); router = new MockRouterRH(address(weth), pm);
@@ -192,7 +197,7 @@ contract GuardedSwapRHTest is Test {
     function test_a_sale_that_moves_nothing_is_refused() public {
         _buy(1 ether); router.setPullNone(true);
         _expectSell(100e18, abi.encodeWithSelector(GuardedSwapRH.PartialFill.selector));   // v2: the router took nothing of what it was given
-        (, uint64 sells,,) = guard.window(address(acct)); assertEq(sells, 0);
+        (, uint64 sells,,,) = guard.window(address(acct)); assertEq(sells, 0);
     }
     /// (round 1, F-4) v1 let a route take half and swept the rest back, leaving a standing router allowance on a token that
     /// refuses approve(0). v2 refuses any sale the router does not consume in full, so no allowance can survive the call.
@@ -306,19 +311,21 @@ contract GuardedSwapRHTest is Test {
     }
     function test_constructor_hygiene() public {
         address[] memory f = new address[](1); f[0] = address(fac); bool[] memory k = new bool[](1);
-        vm.expectRevert(bytes("exit key must be an EOA")); new GuardedSwapRH(address(router), address(weth), pm, f, k, address(this), address(tok), 12, 0.3 ether, 1 ether);
-        vm.expectRevert(bytes("exit key")); new GuardedSwapRH(address(router), address(weth), pm, f, k, cold, cold, 12, 0.3 ether, 1 ether);
-        vm.expectRevert(bytes("router WETH")); new GuardedSwapRH(address(router), address(tok), pm, f, k, address(this), cold, 12, 0.3 ether, 1 ether);           // the router's own WETH
-        vm.expectRevert(bytes("router PoolManager")); new GuardedSwapRH(address(router), address(weth), address(fac), f, k, address(this), cold, 12, 0.3 ether, 1 ether);   // the router's own PoolManager
-        vm.expectRevert(bytes("not a contract")); new GuardedSwapRH(address(router), address(weth), address(0xD00D), f, k, address(this), cold, 12, 0.3 ether, 1 ether);
+        vm.expectRevert(bytes("exit key must be an EOA")); new GuardedSwapRH(address(router), address(weth), pm, f, k, address(this), address(tok), 12, 12, 0.3 ether, 1 ether);
+        vm.expectRevert(bytes("exit key")); new GuardedSwapRH(address(router), address(weth), pm, f, k, cold, cold, 12, 12, 0.3 ether, 1 ether);
+        vm.expectRevert(bytes("router WETH")); new GuardedSwapRH(address(router), address(tok), pm, f, k, address(this), cold, 12, 12, 0.3 ether, 1 ether);           // the router's own WETH
+        vm.expectRevert(bytes("router PoolManager")); new GuardedSwapRH(address(router), address(weth), address(fac), f, k, address(this), cold, 12, 12, 0.3 ether, 1 ether);   // the router's own PoolManager
+        vm.expectRevert(bytes("not a contract")); new GuardedSwapRH(address(router), address(weth), address(0xD00D), f, k, address(this), cold, 12, 12, 0.3 ether, 1 ether);
         address[] memory f2 = new address[](2); f2[0] = address(fac); f2[1] = address(fac); bool[] memory k2 = new bool[](2);
-        vm.expectRevert(bytes("factory twice")); new GuardedSwapRH(address(router), address(weth), pm, f2, k2, address(this), cold, 12, 0.3 ether, 1 ether);
-        f2[1] = address(0xD00D); vm.expectRevert(bytes("factory")); new GuardedSwapRH(address(router), address(weth), pm, f2, k2, address(this), cold, 12, 0.3 ether, 1 ether);
+        vm.expectRevert(bytes("factory twice")); new GuardedSwapRH(address(router), address(weth), pm, f2, k2, address(this), cold, 12, 12, 0.3 ether, 1 ether);
+        f2[1] = address(0xD00D); vm.expectRevert(bytes("factory")); new GuardedSwapRH(address(router), address(weth), pm, f2, k2, address(this), cold, 12, 12, 0.3 ether, 1 ether);
         address[] memory f5 = new address[](5); bool[] memory k5 = new bool[](5);
-        vm.expectRevert(bytes("factories")); new GuardedSwapRH(address(router), address(weth), pm, f5, k5, address(this), cold, 12, 0.3 ether, 1 ether);
-        vm.expectRevert(bytes("factories")); new GuardedSwapRH(address(router), address(weth), pm, f, k2, address(this), cold, 12, 0.3 ether, 1 ether);
-        vm.expectRevert(bytes("guardian")); new GuardedSwapRH(address(router), address(weth), pm, f, k, address(router), cold, 12, 0.3 ether, 1 ether);
-        vm.expectRevert(bytes("zero limit")); new GuardedSwapRH(address(router), address(weth), pm, f, k, address(this), cold, 0, 0.3 ether, 1 ether);
+        vm.expectRevert(bytes("factories")); new GuardedSwapRH(address(router), address(weth), pm, f5, k5, address(this), cold, 12, 12, 0.3 ether, 1 ether);
+        vm.expectRevert(bytes("factories")); new GuardedSwapRH(address(router), address(weth), pm, f, k2, address(this), cold, 12, 12, 0.3 ether, 1 ether);
+        vm.expectRevert(bytes("guardian")); new GuardedSwapRH(address(router), address(weth), pm, f, k, address(router), cold, 12, 12, 0.3 ether, 1 ether);
+        vm.expectRevert(bytes("zero limit")); new GuardedSwapRH(address(router), address(weth), pm, f, k, address(this), cold, 12, 0, 0.3 ether, 1 ether);   // (v3) no buy count, no buys
+        vm.expectRevert(bytes("limit too large")); new GuardedSwapRH(address(router), address(weth), pm, f, k, address(this), cold, type(uint64).max, 12, 0.3 ether, 1 ether);   // (round 2 I-4)
+        vm.expectRevert(bytes("zero limit")); new GuardedSwapRH(address(router), address(weth), pm, f, k, address(this), cold, 0, 12, 0.3 ether, 1 ether);
     }
     function _tight() internal { guard = _deploy(12, 0.3 ether, 1 ether); }
     function test_rate_limits() public {
@@ -416,5 +423,79 @@ contract GuardedSwapRHTest is Test {
         vm.prank(address(acct)); vm.expectRevert(GuardedSwapRH.BadRoute.selector); guard.buy{value: 1 ether}(address(tok), 1, buyRoute());
         vm.prank(address(acct)); vm.expectRevert(GuardedSwapRH.BadRoute.selector); guard.buy{value: 1 ether}(address(tok), 1, one(v3(address(weth), address(tok), pool, 10000)));
         router.setWethOnBuy(0); _buy(1 ether);
+    }
+
+    // ---- round 2 (v3) ----
+    /// (round 2 H-2) buys are counted per hour as sales are: a stream of tiny buys cannot multiply router calls
+    function test_buys_are_counted_per_hour() public {
+        guard = _deployB(1000, 3, 1000 ether, 1000 ether);
+        for (uint256 i = 0; i < 3; i++) { vm.prank(address(acct)); guard.buy{value: 1000}(address(tok), 1, buyRoute()); }   // 1000 wei each: the ETH cap never moves
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwapRH.RateLimited.selector); guard.buy{value: 1000}(address(tok), 1, buyRoute());
+        (,, uint64 buys,,) = guard.window(address(acct)); assertEq(buys, 3);
+        vm.warp(block.timestamp + 1 hours); vm.prank(address(acct)); guard.buy{value: 1000}(address(tok), 1, buyRoute());
+        _sell(1e6, 1);                                                                                // sales keep their own count
+        Wallet other = new Wallet(); vm.deal(address(other), 1 ether);
+        for (uint256 i = 0; i < 3; i++) { vm.prank(address(other)); guard.buy{value: 1000}(address(tok), 1, buyRoute()); }   // per account
+    }
+    /// (round 2 L-1) the loss is charged rounded up: a sale 0.43 wei below cost books 1 wei (v2 booked nothing)
+    function test_a_loss_is_charged_rounded_up() public {
+        router.set(7e17, 1, address(0));                                                              // 100 wei buy 7e19 tokens; 1e18 tokens sell for 1 wei
+        vm.prank(address(acct)); guard.buy{value: 100}(address(tok), 1, buyRoute());
+        uint256 out = _sell(1e18, 1); assertEq(out, 1);                                               // cost 100 * 1e18 / 7e19 = 1.43 wei
+        (uint256 amt, ) = guard.loss(address(acct)); assertEq(amt, 1);
+        (uint256 tokens, uint256 ethIn) = guard.basis(address(acct), address(tok)); assertEq(tokens, 69e18); assertEq(ethIn, 99);   // released rounded down: the remainder keeps its cost
+        assertEq(guard.floorFor(address(acct), address(tok), 69e18), 71);                             // quoted as charged: cost 99, room 29 - 1 = 28
+    }
+    /// (round 2 L-4) a factory that answers with a dirty word is a mismatch, not a revert: the other factories still serve
+    function test_a_dirty_factory_cannot_brick_v3_hops() public {
+        DirtyFactory dirty = new DirtyFactory(pool);
+        address[] memory f = new address[](2); f[0] = address(dirty); f[1] = address(fac); bool[] memory k = new bool[](2);
+        guard = _deployWith(f, k, cold, 1000, 1000, 1000 ether, 1000 ether);
+        vm.prank(address(acct)); uint256 out = guard.buy{value: 1 ether}(address(tok), 1, one(v3(address(weth), address(tok), pool, 10000))); assertEq(out, 1000e18);
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwapRH.BadRoute.selector); guard.buy{value: 1 ether}(address(tok), 1, one(v3(address(weth), address(tok), address(0xB009), 10000)));
+    }
+    /// (round 2 M-1) the cold key's two kinds of check, from a plain EOA and from an EIP-7702-delegated EOA:
+    /// exit = msg.sender is the account + tx.origin is the key; unlock = the key is the direct caller.
+    function test_cold_key_paths_eoa_and_7702() public {
+        uint256 pk = 0xC0FFEE; address key = vm.addr(pk);
+        address[] memory f = new address[](0); bool[] memory k = new bool[](0);
+        guard = _deployWith(f, k, key, 1000, 1000, 1000 ether, 1000 ether);
+        SmartAccount sa = new SmartAccount(); vm.deal(address(sa), 1 ether);
+        vm.prank(address(sa)); guard.buy{value: 1 ether}(address(tok), 1, buyRoute());
+        sa.exec(address(tok), abi.encodeWithSelector(MockToken.approve.selector, address(guard), 1000e18));
+        bytes memory ex = abi.encodeWithSelector(GuardedSwapRH.exit.selector, address(tok), 100e18, uint256(1), sellRoute());
+        address[] memory a = new address[](1); a[0] = address(sa);
+        // plain EOA
+        vm.prank(key, key); sa.exec(address(guard), ex);                                              // the key started the transaction: exit runs
+        vm.prank(key); guard.unlock(a);                                                               // the key calls directly: unlock runs
+        // the same key after an EIP-7702 delegation
+        Wallet7702 impl = new Wallet7702(); vm.signAndAttachDelegation(address(impl), pk);
+        assertGt(key.code.length, 0);
+        vm.prank(key, key); sa.exec(address(guard), ex);                                              // exit: unchanged, tx.origin is still the key
+        vm.prank(key, key); Wallet7702(payable(key)).execute(address(guard), abi.encodeWithSelector(GuardedSwapRH.unlock.selector, a));   // unlock through the key's own 7702 code: msg.sender is the key
+        // what does not pass
+        address relayer = address(0x7E1A);
+        vm.prank(relayer, relayer); vm.expectRevert(GuardedSwapRH.NotExitKey.selector); sa.exec(address(guard), ex);   // relayed: tx.origin is not the key
+        vm.prank(address(sa), key); vm.expectRevert(GuardedSwapRH.NotExitKey.selector); guard.unlock(a);              // the key as origin with a contract between: refused (round 13 F-1)
+        Wallet other = new Wallet(); vm.deal(address(other), 1 ether);
+        vm.prank(address(other), key); vm.expectRevert(abi.encodeWithSelector(GuardedSwapRH.NotInLot.selector, 0, 100e18));
+        guard.exit(address(tok), 100e18, 1, sellRoute());                                             // a contract the key's transaction reaches can only exit its own (empty) lot
+        assertEq(tok.balanceOf(address(sa)), 800e18); assertEq(key.balance, 0);
+        // a key that is already 7702-delegated at deployment is refused by the constructor, as in v15 (round 14 I-1)
+        vm.expectRevert(bytes("exit key must be an EOA")); _deployWith(f, k, key, 1000, 1000, 1000 ether, 1000 ether);
+    }
+}
+
+/// answers getPool with the right pool in the low 160 bits and garbage above them
+contract DirtyFactory {
+    address immutable p; constructor(address p_) { p = p_; }
+    fallback(bytes calldata) external returns (bytes memory) { return abi.encode(uint256(uint160(p)) | (uint256(1) << 200)); }
+}
+/// a minimal EIP-7702 wallet: the EOA may call out through its own code
+contract Wallet7702 {
+    receive() external payable {}
+    function execute(address target, bytes calldata data) external returns (bytes memory r) {
+        require(msg.sender == address(this), "only the key itself");
+        bool ok; (ok, r) = target.call(data); if (!ok) assembly { revert(add(r, 32), mload(r)) }
     }
 }

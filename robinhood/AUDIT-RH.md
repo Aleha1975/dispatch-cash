@@ -27,3 +27,51 @@
 | I-6 | Info | Recipient-zero and the PoolManager pin read as guarantees in the comments | Fixed (documentation) | NatSpec now says: recipient zero is how the live router pays the gate, and every output is also measured against `minOut`; the PoolManager written into v4 hops is canonical encoding only (the router uses its own, equal by the constructor check). |
 
 **Tests (v2):** `forge test --no-match-path 'test/research/*'` — 44 unit tests (v15's suite ported, plus route, encoding, factory and the round-1 regressions; the five round-1 tests fail against v1), 7 stateful invariants over 256 runs × 500 calls (cost basis equals the lots; lot within balance; outstanding loss within booked and gone within `REFILL`; a booked loss never exceeds its budget; proceeds only to the account, nothing to a thief or left on the gate, no allowance left; no lot or cost underflow), 10 fork tests against the live router at the chain head. `forge test --match-path 'test/research/*'` — 17 router probes (P1–P17) with the evidence for every router fact in DESIGN-RH.md.
+
+## Round 2 (v2, commit `23ad9c6`) and what changed in v3
+
+0 Critical, 2 High, 1 Medium, 4 Low, 3 Informational.
+
+### H-1, with numbers
+
+The finding is round 1 F-1 mechanism (2) worked through: whatever ETH reaches `buy()` raises `costOf`, so the 30% sale-side budget does not add protection against an attacker who also buys. We agree with that statement and keep the disposition; the binding limits on this path are the buy limits, the delegation and the watcher, not the loss budget. What those limits allow, per account, with the proposed parameters:
+
+| Bound | Value | Where it lives |
+| --- | --- | --- |
+| ETH into buys per hour | 0.05 ETH | `MAX_BUY_ETH_PER_HOUR` (gate) |
+| buys per hour | 12 | `MAX_BUYS_PER_HOUR` (gate, new in v3) |
+| ETH per executor call | per-call cap (`valueLte`) | buy/sell delegation |
+| ETH into buys per 24 h | 0.15 ETH | `nativeTokenPeriodTransfer` caveat on the buy/sell delegation (Dispatch runs the same caveat at 0.5 ETH / 24 h) |
+| time to pause | ~5 min (operator-measured) | the RH watcher pauses the gate on any `Bought`/`Sold` with no entry in the engine's journal; since v14 a pause stops buys and sales |
+
+The report's example (a 100 ETH decoy buy) cannot happen: one hour admits 0.05 ETH, a day 0.15 ETH. Worst case for an account with honest cost basis C:
+
+- **Watcher working (pause within ~5 min).** A fixed window can be straddled, so at most 2 × 0.05 = 0.10 ETH goes into the thief's own pools before the pause, plus the budget it adds: 30% × 0.10 = 0.03 ETH, on top of the budget of 30% × C that a stolen key always has. Total ≤ 0.13 ETH + 0.3·C. After the pause no buy or sale runs. The cold key's `exit()` turns the rest into ETH on the account.
+- **Watcher down for a whole day.** The delegation stops buys at 0.15 ETH per 24 h, adding 0.045 ETH of budget. First day ≤ 0.195 ETH + 0.3·C. Each further day adds at most 0.15 ETH of buys plus what the outstanding loss refills (it fades over 7 days). The delegation itself expires after 30 days.
+- **For comparison:** the ticket in use is 0.004–0.006 ETH (about $10–15 at $2,500/ETH). At 0.05 ETH/h the cap is 8–12 tickets an hour, against a measured peak of 3 buys and 0.048 ETH in one hour on the owner's account over 308 h and 300 trades.
+
+Why the fix stays outside the contract:
+
+- **Excluding fresh buys from the budget's base (option A)** blocks the honest case the budget exists for. A new account's first ticket on a young token that rugs within the hour (the engine follows young tokens) must be sellable. At −90% the 0.004 ETH ticket books 0.0036 ETH of loss. With fresh cost excluded, the account's budget is 0, so the engine's sale reverts `BudgetExceeded` exactly when the position collapses, and only the cold key's `exit()` could get it out. Dispatch round 12 rejected the same mechanism for the same reason.
+- **A price oracle** does not exist for these long-tail Robinhood Chain tokens. Self-declared prices were removed in v8 (round 6) because the caller declared them.
+- **A long-window or lifetime ETH cap in the gate (option B)** is the delegation's `nativeTokenPeriodTransfer` already: per account, adjustable per account without a redeployment, and enforced before the gate is reached. A second counter in the gate would be a second source of truth for the same limit.
+- **A rolling window** needs per-account history (a ring buffer). Its gain — the at most 2× burst at a boundary — is already inside the 24-hour delegation cap and the 5-minute pause.
+
+### Round 2 table
+
+| ID | Severity | Finding | Disposition | What changed / why |
+| --- | --- | --- | --- | --- |
+| H-1 | High | `buy()` grows `costOf` unchecked, inflating the sale-side budget | Accepted (round 1 F-1; v15 round 12 H-1) — quantified above | No code change. Proposed `MAX_BUY_ETH_PER_HOUR` 0.05 ETH and the 0.15 ETH / 24 h delegation caveat are recorded in DESIGN-RH.md as deployment parameters. |
+| H-2 | High | Buys have no per-hour count, so tiny buys can multiply router calls | Fixed | `MAX_BUYS_PER_HOUR` (constructor parameter) and `Window.buys`, counted in `_countBuy` exactly as sales are counted in `_countSell`. The per-account hour window is the same, and no new timer or state lifecycle is added (one field in an existing struct). Proposed 12 per hour, 4× the measured peak of 3. No minimum buy size: the engine by default shrinks tickets on tokens younger than 24 h to 5% of what was deposited, so honest buys can be far below $10 and a floor would refuse them. The count bounds the multiplication without it. Mirror: honest flow is unaffected (peak 3/h); sales keep their own count. Test: `test_buys_are_counted_per_hour` (fails on v2). |
+| M-1 | Medium | `exit()` authenticates by `tx.origin`, the other cold-key functions by `msg.sender` | Accepted / documented (v15 design; v15 round 12 L-1 → round 13 F-1) | The difference is deliberate. `exit()` must run with the account as `msg.sender`: the lot, every write and the payee are the caller's own, and `exit` takes no account argument. `tx.origin` is the second factor. `unlock()` and `replaceGuardian()` act on other accounts or on the whole gate, so the key itself must be the direct caller. The history is the reason not to unify them: round 12 L-1 moved `unlock()` to `tx.origin` "for consistency with exit", and round 13 F-1 showed that was a confused deputy; v15 moved it back. The suggested two-step authorization (the key records an approval the account then consumes) adds per-account state and a second lifecycle, the pattern behind rounds 2–7. A call that the key's transaction reaches through a foreign contract can only exit that contract's own lot (tested). Requirement: the key submits its own transactions, never through a relayer or bundler; this is in the runbook. Test `test_cold_key_paths_eoa_and_7702`: from a plain EOA and from the same key after an EIP-7702 delegation, `exit` passes when the key originates the transaction and `unlock` passes when the key's own 7702 code calls; a relayed exit, the key as origin behind a contract for `unlock`, and a foreign contract's exit are refused. A key already delegated at deployment is refused by the constructor, as in v15 (round 14 I-1). |
+| L-1 | Low | Cost is floor-divided in `_settle`/`floorFor`, so a loss can be under-booked by under 1 wei | Fixed, without moving the lot | `_settle` now charges the budget `charged = ceil(ethIn·sold / tokens)`; the lot still releases the floor (`cost`), so the remainder's cost never zeroes (v15 round 5 C-2, which the floor exists for) and cost basis stays equal to the lots. `floorFor` quotes the ceiling, as charged. Mirror: an at-cost sale whose true cost lies between two wei can now book 1 wei, which is the conservative direction asked for. Test: `test_a_loss_is_charged_rounded_up` (fails on v2: books 0). |
+| L-2 | Low | `token` not checked against the router, PoolManager or factories | Accepted (as round 1 L-2) | No state-changing call can reach such a `token`. In `buy()` the first call on `token` is a strict `balanceOf` staticcall, and all five addresses revert on `balanceOf(address)` (verified on chain), so the buy reverts there. In a sale there is no lot (`NotInLot`) before any `transferFrom`/`approve`. A future router upgrade that added an ERC-20 surface would still need a lot bought through the gate first. |
+| L-3 | Low | The router deadline is `block.timestamp` | Accepted (v15 round 4 L-3, round 7 L-6) | `minOut`, measured by the gate, is the staleness defence, and NatSpec says so. A caller-supplied deadline would change the external interface for a guarantee `minOut` already gives: the executor submits directly with a fresh quote. |
+| L-4 | Low | `abi.decode` of a factory answer can revert on a dirty word and brick every v3 hop | Fixed | The answer is compared as a full word with the clean pool address (`uint256(bytes32(ret)) == uint160(pool)`), so a dirty answer is a mismatch and the next factory is asked. Test: `test_a_dirty_factory_cannot_brick_v3_hops` (fails on v2). |
+| I-1 | Info | Unbounded revert data copied into `RouterFailed` | Accepted (v15 round 10 L-3) | Self-only gas cost; no funds move. |
+| I-2 | Info | v4 hops are validated by the PoolManager only | Accepted (documented residual, DESIGN-RH.md item 2) | Bounded by `minOut` and the budget. |
+| I-3 | Info | `_settle` debits `amount`, `_pull` measures `got` | Accepted (v15) | Conservative for fee-on-transfer tokens; a token crediting more than `amount` only benefits the account. |
+| (r1) I-4 | Info | `maxSellsPerHour == 2^64−1` overflow | Fixed in passing | The constructor now requires both hourly counts below `2^64−1`. |
+| Lead | — | the approve retry assumes a spent allowance reads zero | Accepted (v15 round 6 M-1) | Liveness for a non-standard token only; that token is sold from the owner's wallet. |
+
+**Tests (v3):** 48 unit tests (the three round-2 regressions for H-2, L-1 and L-4 fail against v2, and the cold-key test covers EOA and EIP-7702 paths), 7 stateful invariants over 256 runs × 500 calls, 10 fork tests against the live router with the proposed parameters (24 sales / 12 buys / 0.05 ETH / 0.5 ETH per hour), and 17 router probes. All pass.

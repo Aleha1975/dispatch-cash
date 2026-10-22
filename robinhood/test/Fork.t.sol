@@ -45,7 +45,7 @@ contract ForkTest is Test {
         if (blk == 0) vm.createSelectFork(rpc); else vm.createSelectFork(rpc, blk);
         address[] memory f = new address[](3); f[0] = UNI_V3; f[1] = CL_E0C4; f[2] = CL_1AC9;
         bool[] memory k = new bool[](3); k[1] = true; k[2] = true;
-        g = new GuardedSwapRH(ROUTER, WETH, PM, f, k, address(this), COLD, 24, 0.1 ether, 0.5 ether);   // proposed production limits
+        g = new GuardedSwapRH(ROUTER, WETH, PM, f, k, address(this), COLD, 24, 12, 0.05 ether, 0.5 ether);   // proposed production limits
         acct = new SmartAccount(); vm.deal(address(acct), 1 ether);
     }
     // ---- hops ----

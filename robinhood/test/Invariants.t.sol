@@ -48,7 +48,7 @@ contract GuardedSwapRHInvariants is Test {
     function setUp() public {
         tok = new MockToken(); weth = new MockToken(); address pm = address(new Wallet()); router = new MockRouterRH(address(weth), pm);
         address[] memory f = new address[](0); bool[] memory k = new bool[](0);
-        g = new GuardedSwapRH(address(router), address(weth), pm, f, k, address(this), cold, 1000, 1000 ether, 1000 ether); acct = new SmartAccount();
+        g = new GuardedSwapRH(address(router), address(weth), pm, f, k, address(this), cold, 1000, 1000, 1000 ether, 1000 ether); acct = new SmartAccount();
         vm.deal(address(router), 1e9 ether); router.set(1000, 1e15, address(0));
         h = new Handler(g, tok, router, cold, acct); targetContract(address(h));
         bytes4[] memory s = new bytes4[](5); s[0] = Handler.buy.selector; s[1] = Handler.sell.selector; s[2] = Handler.warp.selector; s[3] = Handler.unlock.selector; s[4] = Handler.ownerMovesOut.selector;
