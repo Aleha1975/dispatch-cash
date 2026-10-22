@@ -47,3 +47,8 @@ No owner, no upgrade path, no funds kept between calls.
 `constructor(address router, address executor, address guardian, address exitKey, uint256 maxSellsPerHour, uint256 maxBuyEthPerHour, uint256 maxSellEthPerHour)`
 
 Production: router `0x6131b5fae19ea4f9d964eac0408e4408b66337b5` (KyberSwap MetaAggregationRouterV2), guardian = the operator's pause key, limits 12, 0.3 ether and 1 ether.
+
+
+## Robinhood Chain gate (draft, not deployed)
+
+`robinhood/` holds GuardedSwapRH: the same gate ported to the Robinhood Chain router (structured routes, the gate builds the router call itself). See `robinhood/DESIGN-RH.md`.
