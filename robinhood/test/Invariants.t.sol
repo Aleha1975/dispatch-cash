@@ -20,10 +20,10 @@ contract Handler is Test {
         eth = bound(eth, 0.001 ether, 5 ether); vm.deal(address(acct), address(acct).balance + eth);
         vm.prank(address(acct)); try g.buy{value: eth}(address(tok), 1, _buyHops()) { buys++; } catch (bytes memory e) { _panic(e); }   // a pranked direct call: the gate sees the account
     }
-    function sell(uint256 frac, uint256 priceBps, bool asExit, bool dishonest) external {
+    function sell(uint256 frac, uint256 priceBps, bool asExit, bool dishonest, bool partialFill) external {
         (uint256 lot, ) = g.lotOf(address(acct), address(tok)); if (lot == 0) return;
         uint256 amount = bound(frac, 1, lot); priceBps = bound(priceBps, 100, 30000);
-        router.set(1000, 1e15 * priceBps / 10000, dishonest ? thief : address(0));
+        router.set(1000, 1e15 * priceBps / 10000, dishonest ? thief : address(0)); router.setPullLess(partialFill);   // v2: a partial fill must be refused
         (, uint256 budget) = g.budgetOf(address(acct)); (uint256 amtBefore, uint64 atBefore) = g.loss(address(acct));
         uint256 ethBefore = address(acct).balance;
         acct.exec(address(tok), abi.encodeWithSelector(MockToken.approve.selector, address(g), amount));
@@ -36,7 +36,7 @@ contract Handler is Test {
             (uint256 amt, uint64 at) = g.loss(address(acct));
             if (amt != amtBefore || at != atBefore) { bookings++; if (amt > budget) overBudget++; }
         } catch (bytes memory e) { refused++; _panic(e); }
-        router.set(1000, 1e15, address(0));
+        router.set(1000, 1e15, address(0)); router.setPullLess(false);
     }
     function ownerMovesOut(uint256 frac) external { uint256 b = tok.balanceOf(address(acct)); if (b == 0) return; vm.prank(address(acct)); tok.transfer(address(0xdead), bound(frac, 1, b)); }
     function warp(uint256 dt) external { vm.warp(block.timestamp + bound(dt, 1, 10 days)); }

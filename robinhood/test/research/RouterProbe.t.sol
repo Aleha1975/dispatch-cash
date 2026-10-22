@@ -218,3 +218,28 @@ contract RouterProbe4 is RouterProbe {
         emit log_named_uint("recipient = caller itself ok", ok2 ? 1 : 0); emit log_bytes(e2);
     }
 }
+
+/// Round 1 F-2: which v3 field does the router key its callback check on -- fee or tickSpacing?
+contract RouterProbe5 is RouterProbe {
+    function _try(string memory tag, Hop memory h) internal {
+        (bool ok, bytes memory e) = c.go(address(R), 0.001 ether, data(one(h), address(0), 0.001 ether, 1));
+        emit log_named_uint(string.concat(tag, " ok"), ok ? 1 : 0); if (!ok) emit log_bytes(e);
+    }
+    function test_P17_v3_tickSpacing_field() public {
+        // fee-keyed Uniswap v3 pool (fee 10000, real tick spacing 200)
+        _try("uni ts=200 (real)", v3(WETH, BONER, BONER_POOL, 10000, 200));
+        _try("uni ts=0", v3(WETH, BONER, BONER_POOL, 10000, 0));
+        _try("uni ts=60", v3(WETH, BONER, BONER_POOL, 10000, 60));
+        _try("uni ts=-7", v3(WETH, BONER, BONER_POOL, 10000, -7));
+        // tick-keyed CL pool (E0c4, tick spacing 50; live routes carry fee 50, ts 50)
+        address P = 0xf2A0bE59AB76b96f957bd5E5b967F2B75e8dB269; address PONS = 0x39dBED3a2bd333467115dE45665cC57F813C4571;
+        Hop[] memory h = new Hop[](2); h[0] = v3(WETH, USDG, 0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca, 100, 1);
+        int24[4] memory tss = [int24(50), int24(0), int24(1), int24(200)]; uint24[3] memory fees = [uint24(50), uint24(1300), uint24(0)];
+        for (uint256 i = 0; i < 3; i++) for (uint256 j = 0; j < 4; j++) {
+            h[1] = v3(USDG, PONS, P, fees[i], tss[j]);
+            (bool ok, bytes memory e) = c.go(address(R), 0.001 ether, data(h, address(0), 0.001 ether, 1));
+            emit log_named_string("CL", string.concat("fee=", vm.toString(fees[i]), " ts=", vm.toString(tss[j]), ok ? " OK" : " revert"));
+            if (!ok) emit log_bytes(e);
+        }
+    }
+}

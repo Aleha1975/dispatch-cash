@@ -35,7 +35,7 @@ contract MockFactory {
 /// (or WETH when `payWeth`). Records the last call for the encoding tests.
 contract MockRouterRH {
     address public WETH; address public V4_POOL_MANAGER;
-    uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo; bool public reenter; address public guard; bool public reenterOk; uint256 public overpay; bool public pullLess; bool public pullNone; uint256 public refund; bool public payWeth;
+    uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo; bool public reenter; address public guard; bool public reenterOk; uint256 public overpay; bool public pullLess; bool public pullNone; uint256 public refund; bool public payWeth; uint256 public wethOnBuy;
     // last call
     uint256 public lastN; address public lastRecipient; uint256 public lastAmountIn; uint256 public lastMinOut; uint256 public lastDeadline; uint256 public lastValue;
     GuardedSwapRH.RouterHop[] internal _last;
@@ -46,6 +46,7 @@ contract MockRouterRH {
     function setOverpay(uint256 w) external { overpay = w; }
     function setPullLess(bool b) external { pullLess = b; }
     function setPayWeth(bool b) external { payWeth = b; }
+    function setWethOnBuy(uint256 w) external { wethOnBuy = w; }   // leaves WETH dust on the caller during a buy (round 1, L-1)
     receive() external payable {}
     function set(uint256 tpe, uint256 ept, address to) external { tokensPerEth = tpe; ethPerToken = ept; payTo = to; }
     function setReenter(address g) external { reenter = true; guard = g; }
@@ -58,6 +59,7 @@ contract MockRouterRH {
         address tin = hops[0].tokenIn; address tout = hops[hops.length - 1].tokenOut;
         if (tin == address(0) || tin == WETH) {
             MockToken(tout).mint(to, msg.value * tokensPerEth);
+            if (wethOnBuy > 0) MockToken(WETH).mint(msg.sender, wethOnBuy);
             if (overpay > 0) { (bool okp, ) = msg.sender.call{value: msg.value + overpay}(""); require(okp, "overpay"); }
             if (refund > 0) { (bool okr, ) = msg.sender.call{value: refund}(""); require(okr, "refund"); }
             if (reenter) { GuardedSwapRH.Hop[] memory h = new GuardedSwapRH.Hop[](0); (bool ok, ) = guard.call(abi.encodeWithSelector(GuardedSwapRH.sell.selector, tout, uint256(1), uint256(1), h)); reenterOk = ok; }

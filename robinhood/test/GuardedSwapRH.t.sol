@@ -191,15 +191,20 @@ contract GuardedSwapRHTest is Test {
     }
     function test_a_sale_that_moves_nothing_is_refused() public {
         _buy(1 ether); router.setPullNone(true);
-        _expectSell(100e18, abi.encodeWithSelector(GuardedSwapRH.ZeroAmount.selector));
+        _expectSell(100e18, abi.encodeWithSelector(GuardedSwapRH.PartialFill.selector));   // v2: the router took nothing of what it was given
         (, uint64 sells,,) = guard.window(address(acct)); assertEq(sells, 0);
     }
-    function test_zero_first_token_with_a_leftover_allowance_still_sells() public {
+    /// (round 1, F-4) v1 let a route take half and swept the rest back, leaving a standing router allowance on a token that
+    /// refuses approve(0). v2 refuses any sale the router does not consume in full, so no allowance can survive the call.
+    function test_partial_fill_refused_and_no_allowance_survives() public {
         _buy(1 ether); tok.setZeroFirst(true); router.setPullLess(true); tok.setRevertOnZeroApprove(true);
-        uint256 out = _sell(100e18, 1); assertEq(out, 0.1 ether); assertGt(tok.allowance(address(guard), address(router)), 0);   // the route took half; half came back
-        _expectSell(100e18, abi.encodeWithSelector(GuardedSwapRH.TransferFailed.selector));
-        tok.setRevertOnZeroApprove(false); vm.prank(address(acct)); tok.approve(address(guard), 0);
-        out = _sell(100e18, 1); assertEq(out, 0.1 ether);
+        _expectSell(100e18, abi.encodeWithSelector(GuardedSwapRH.PartialFill.selector));
+        assertEq(tok.allowance(address(guard), address(router)), 0); assertEq(tok.balanceOf(address(acct)), 1000e18);
+        router.setPullLess(false);
+        tok.setRevertOnZeroApprove(false); vm.prank(address(acct)); tok.approve(address(guard), 0); tok.setRevertOnZeroApprove(true);   // the account's own leftover approval to the gate (the reverted attempt's)
+        uint256 out = _sell(100e18, 1); assertEq(out, 0.1 ether);                                      // a full fill sells, approve(0) reverting changes nothing
+        assertEq(tok.allowance(address(guard), address(router)), 0);
+        out = _sell(100e18, 1); assertEq(out, 0.1 ether);                                              // and the zero-first token still sells next time
     }
 
     // ---- loss budget (numbers identical to v15) ----
@@ -389,14 +394,27 @@ contract GuardedSwapRHTest is Test {
         tok.setBricked(address(acct), true);
         vm.prank(address(acct)); vm.expectRevert(abi.encodeWithSelector(GuardedSwapRH.BelowMinOut.selector, 0, 1)); guard.buy{value: 1 ether}(address(tok), 1, buyRoute());
     }
-    function test_tokens_lost_to_a_fee_on_the_way_back_count_as_given_up() public {
+    /// v15 round 11 M-1 (a fee on the leftover's way back) cannot arise in v2: there is no way back -- a partial route is refused.
+    function test_fee_token_partial_route_refused() public {
         _buy(1 ether); router.setPullLess(true); tok.setFee(1000);
-        router.set(1000, 1e15, address(0));
-        vm.startPrank(address(acct)); tok.approve(address(guard), 400e18);
-        guard.sell(address(tok), 400e18, 1, sellRoute());     // 400 leave the account, 360 arrive; the route pulls 180; 180 go back as 162
-        vm.stopPrank();
-        (uint256 lot, uint256 cost) = guard.lotOf(address(acct), address(tok));
-        assertEq(tok.balanceOf(address(acct)), 600e18 + 162e18);
-        assertEq(lot, 762e18); assertEq(cost, 0.762 ether);
+        _expectSell(400e18, abi.encodeWithSelector(GuardedSwapRH.PartialFill.selector));
+        (uint256 lot, ) = guard.lotOf(address(acct), address(tok)); assertEq(lot, 1000e18);
+    }
+    /// (round 1, F-2) the router keys a v3 callback on `fee` alone; v2 sends tickSpacing 0 (and no hooks) on every v3 hop,
+    /// so the one field the gate does not check never reaches the router. v4 hops keep their PoolKey.
+    function test_v3_tick_spacing_never_reaches_the_router() public {
+        GuardedSwapRH.Hop memory h = v3(address(weth), address(tok), pool, 10000); h.tickSpacing = 12345;
+        vm.prank(address(acct)); guard.buy{value: 1 ether}(address(tok), 1, one(h));
+        GuardedSwapRH.RouterHop memory r = router.lastHop(0); assertEq(r.tickSpacing, 0); assertEq(r.fee, 10000); assertEq(r.pool, pool); assertEq(r.hooks, address(0));
+        GuardedSwapRH.Hop memory x = v4(NATIVE, address(tok)); x.tickSpacing = 77;
+        vm.prank(address(acct)); guard.buy{value: 1 ether}(address(tok), 1, one(x));
+        r = router.lastHop(0); assertEq(r.tickSpacing, 77);
+    }
+    /// (round 1, L-1) WETH left on the gate by a buy is refused, as on a sale (one check, at the one router call site)
+    function test_weth_left_on_a_buy_refused() public {
+        router.setWethOnBuy(1);
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwapRH.BadRoute.selector); guard.buy{value: 1 ether}(address(tok), 1, buyRoute());
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwapRH.BadRoute.selector); guard.buy{value: 1 ether}(address(tok), 1, one(v3(address(weth), address(tok), pool, 10000)));
+        router.setWethOnBuy(0); _buy(1 ether);
     }
 }

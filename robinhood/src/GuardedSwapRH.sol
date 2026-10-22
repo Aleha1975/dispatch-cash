@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-/// @title GuardedSwapRH
+/// @title GuardedSwapRH (v2: round-1 response)
 /// @notice GuardedSwap v15 ported to Robinhood Chain (chain id 4663): a one-purpose gate between a client's smart account and
 ///         the Robinhood swap router (selector 0x4d819a2a, structured hops). The account grants its executor the right to
 ///         call THIS contract instead of the router. Whatever a swap returns goes to the calling account and nobody else.
@@ -25,20 +25,30 @@ pragma solidity ^0.8.26;
 ///            cold key -- can unlock() an account's loss budget, replaceGuardian(), and run exit(): a sale paid to the
 ///            account, outside the loss budget and the hourly limits.
 ///         5. Only this call's funds. Token and ETH balances are measured as deltas around the router call. A sale is paid
-///            to this contract and forwarded after settlement, so state is written before any ETH leaves.
+///            to this contract and forwarded after settlement, so state is written before any ETH leaves. (RH v2) A sale must
+///            consume exactly what it was given: the gate's balance of the sold token is back at its base after the router
+///            call (PartialFill otherwise), so the exact allowance is spent in full and no allowance survives the call even for
+///            a token that refuses approve(0). No WETH may arrive on the gate in any router call, buy or sale.
 ///         6. (RH) Route rule. 1..MAX_HOPS hops, each version 1 (v3-style pool) or 2 (Uniswap v4); a buy starts at the ETH
 ///            side (native or WETH) and ends at `token`, a sale the reverse; every hop starts where the previous one ended;
 ///            no intermediate token is the ETH side or the traded token. A v3 hop's pool must be the pool an allowed factory
-///            returns for (tokenIn, tokenOut, fee) -- the gate asks the factory, never the pool. A v4 hop names no pool;
-///            the router uses its own PoolManager (verified), and this contract pins POOL_MANAGER in the encoding anyway.
+///            returns for (tokenIn, tokenOut, fee) -- the gate asks the factory, never the pool. `fee` is the one key: the
+///            router validates its v3 callback on it alone (verified: any tickSpacing passes, a wrong fee fails), and (v2) the
+///            gate sends tickSpacing 0 on v3 hops, so no unchecked v3 field reaches the router. A v4 hop names no pool; its
+///            fee/tickSpacing/hooks are the PoolKey the PoolManager itself resolves (an unknown key reverts there). The live
+///            router ignores the hop's poolManager field and uses its own (verified, equal to POOL_MANAGER by the constructor
+///            check); the gate writes POOL_MANAGER there only so the encoding is canonical -- it is not a guarantee.
+///            Recipient: the gate always encodes zero, which makes the live router pay msg.sender (a non-zero recipient
+///            reverts BAD_ARGS, verified). The gate does not rely on that alone: every output is measured on this contract or
+///            the account and checked against minOut, so a router that paid elsewhere would revert the call.
 ///         7. (RH) Residual, by design: v4 hooks and v3 pools are permissionless -- anyone can open a genuine pool (any
 ///            hook, any price) on an allowed factory or on the PoolManager. Such a pool is a sink that cannot be told apart
 ///            on-chain from a thin market; what it can take is bounded by minOut, measured here, and by the loss budget,
 ///            exactly as the Kyber gate's srcReceivers residual. The router charges 1% of every swap (feeRate 100 / 10000)
 ///            to its feeCollector; that fee is part of the price the account pays and the loss budget sees.
 ///         8. (RH) The router is an upgradeable proxy whose admin and owner is one EOA (verified on chain). Nothing here
-///            trusts it: allowance is granted for the exact amount and reset, output is measured on this contract and on
-///            the account, and a router that pays less than minOut reverts the whole call. A malicious upgrade can deny
+///            trusts it: allowance is granted for the exact amount and must be spent in full within the call (v2), output is
+///            measured on this contract and on the account, and a router that pays less than minOut reverts the whole call. A malicious upgrade can deny
 ///            service (including exit()), never move more than the one trade's input.
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
@@ -118,6 +128,7 @@ contract GuardedSwapRH {
     error TooLarge();
     error NotPendingGuardian();
     error NoDirectEth();
+    error PartialFill();
 
     constructor(address router, address weth, address poolManager, address[] memory v3Factories, bool[] memory tickKeyed, address guardian_, address exitKey, uint256 maxSellsPerHour, uint256 maxBuyEthPerHour, uint256 maxSellEthPerHour) {
         require(router != address(0) && weth != address(0) && poolManager != address(0) && guardian_ != address(0) && exitKey != address(0), "zero address");
@@ -261,7 +272,9 @@ contract GuardedSwapRH {
             } else if (h.version == 2) {
                 if (h.pool != address(0)) revert BadRoute();
             } else revert BadRoute();                                                        // 0, 3, 4 (Virtuals), ... dispatch to other code in the router
-            r[i] = RouterHop(h.version, h.tokenIn, h.tokenOut, h.pool, h.fee, h.tickSpacing, h.hooks, "", h.version == 2 ? POOL_MANAGER : address(0), bytes32(0));
+            r[i] = h.version == 2
+                ? RouterHop(2, h.tokenIn, h.tokenOut, address(0), h.fee, h.tickSpacing, h.hooks, "", POOL_MANAGER, bytes32(0))
+                : RouterHop(1, h.tokenIn, h.tokenOut, h.pool, h.fee, int24(0), address(0), "", address(0), bytes32(0));   // v3: only `fee` (checked above) keys the pool (round 1, F-2)
         }
         return abi.encodeWithSelector(SEL_SWAP, r, address(0), amountIn, minOut, block.timestamp);
     }
@@ -331,24 +344,22 @@ contract GuardedSwapRH {
         if (!isExit) _countSell(0);
         uint256 tokBase = IERC20(token).balanceOf(address(this));
         uint256 got = _pull(token, msg.sender, amount);
-        out = _swapForEth(token, got, minOut, hops);
-        uint256 back = _sweepToken(token, tokBase);
+        out = _swapForEth(token, got, tokBase, minOut, hops);
         if (out < minOut) revert BelowMinOut(out, minOut);
         if (!isExit) _countSell(out);
-        if (back >= amount) revert ZeroAmount();
-        _settle(token, amount - back, out, isExit);
+        _settle(token, amount, out, isExit);                        // the router took all of it: the lot shrinks by what left the account
         if (out > 0) _sendEth(msg.sender, out);
     }
 
-    /// @dev Approve exactly `got`, run the route the gate encoded, reset the allowance; returns the native ETH this call added here.
-    function _swapForEth(address token, uint256 got, uint256 minOut, Hop[] calldata hops) private returns (uint256) {
+    /// @dev Approve exactly `got`, run the route the gate encoded, require that all of it was taken, reset the allowance;
+    ///      returns the native ETH this call added here.
+    function _swapForEth(address token, uint256 got, uint256 tokBase, uint256 minOut, Hop[] calldata hops) private returns (uint256) {
         bytes memory data = _route(hops, token, false, got, minOut);
         _approveForRouter(token, got);
         uint256 ethBase = address(this).balance;
-        uint256 wethBase = IERC20(WETH).balanceOf(address(this));
         _callRouter(data, 0);
-        _approveSoft(token, ROUTER, 0);                             // cleanup only; a token that rejects approve(0) must not undo the sale
-        if (IERC20(WETH).balanceOf(address(this)) != wethBase) revert BadRoute();   // the router pays sales in native ETH (verified); WETH arriving here would be stranded
+        if (IERC20(token).balanceOf(address(this)) != tokBase) revert PartialFill();   // (round 1, F-4) all of `got` was taken, so the exact allowance is spent
+        _approveSoft(token, ROUTER, 0);                             // belt and braces only: after a full fill a standard token's allowance is already zero
         return address(this).balance - ethBase;
     }
 
@@ -378,9 +389,13 @@ contract GuardedSwapRH {
         return cost > room ? cost - room : 0;
     }
 
+    /// @dev The one router call site. No WETH may arrive here on any call (round 1, L-1): the router pays sales in native ETH
+    ///      and buys in the token (verified); WETH left here would be stranded, so such a call is refused.
     function _callRouter(bytes memory data, uint256 value) private {
+        uint256 wethBase = IERC20(WETH).balanceOf(address(this));
         (bool ok, bytes memory err) = ROUTER.call{value: value}(data);
         if (!ok) revert RouterFailed(err);
+        if (IERC20(WETH).balanceOf(address(this)) != wethBase) revert BadRoute();
     }
     function _sweepToken(address token, uint256 base) private returns (uint256 delivered) {
         uint256 bal = IERC20(token).balanceOf(address(this));

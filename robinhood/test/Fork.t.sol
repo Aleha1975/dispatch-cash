@@ -40,7 +40,9 @@ contract ForkTest is Test {
     GuardedSwapRH g; SmartAccount acct;
 
     function setUp() public {
-        vm.createSelectFork(vm.envOr("RH_RPC", string("https://rpc.mainnet.chain.robinhood.com")), vm.envOr("RH_BLOCK", uint256(94996000)));
+        string memory rpc = vm.envOr("RH_RPC", string("https://rpc.mainnet.chain.robinhood.com"));
+        uint256 blk = vm.envOr("RH_BLOCK", uint256(0));                                   // the public RPC keeps little history: default to the head
+        if (blk == 0) vm.createSelectFork(rpc); else vm.createSelectFork(rpc, blk);
         address[] memory f = new address[](3); f[0] = UNI_V3; f[1] = CL_E0C4; f[2] = CL_1AC9;
         bool[] memory k = new bool[](3); k[1] = true; k[2] = true;
         g = new GuardedSwapRH(ROUTER, WETH, PM, f, k, address(this), COLD, 24, 0.1 ether, 0.5 ether);   // proposed production limits
@@ -100,6 +102,17 @@ contract ForkTest is Test {
         h[1] = v3(USDG, PONS, 0xf2A0bE59AB76b96f957bd5E5b967F2B75e8dB269, 50);
         uint256 got = _buy(PONS, 0.001 ether, h); assertGt(got, 0);
     }
+    /// (round 1, F-2) whatever tickSpacing the executor names on a v3 hop, the gate sends 0 and the live router keys on `fee`
+    function test_fork_v3_tick_spacing_is_not_forwarded() public {
+        GuardedSwapRH.Hop memory u = v3(WETH, BONER, BONER_POOL, 10000); u.tickSpacing = -12345;
+        _roundTrip(BONER, arr(u));
+        GuardedSwapRH.Hop[] memory h = new GuardedSwapRH.Hop[](2);
+        h[0] = v3(WETH, USDG, 0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca, 100); h[0].tickSpacing = 777;
+        h[1] = v3(USDG, PONS, 0xf2A0bE59AB76b96f957bd5E5b967F2B75e8dB269, 50); h[1].tickSpacing = 1;
+        vm.prank(address(acct)); assertGt(g.buy{value: 0.001 ether}(PONS, 1, h), 0);
+        h[1].fee = 1300;                                                                  // the pool's live fee is not its key on this factory
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwapRH.BadRoute.selector); g.buy{value: 0.001 ether}(PONS, 1, h);
+    }
     function test_fork_exit_by_the_cold_key() public {
         GuardedSwapRH.Hop[] memory h = arr(v3(WETH, BONER, BONER_POOL, 10000));
         uint256 got = _buy(BONER, 0.01 ether, h);
@@ -107,9 +120,9 @@ contract ForkTest is Test {
         vm.expectRevert(GuardedSwapRH.NotExitKey.selector);
         acct.exec(address(g), abi.encodeWithSelector(GuardedSwapRH.exit.selector, BONER, got, uint256(1), rev(h)));   // the account (executor path) alone cannot exit
         g.setPaused(true);                                                                                               // and the guardian's pause does not stop the cold key
-        uint256 e0 = address(acct).balance;
+        uint256 e0 = address(acct).balance; uint256 c0 = COLD.balance;
         uint256 out = _sell(BONER, got, 1, rev(h), true);
-        assertGt(out, 0); assertEq(address(acct).balance - e0, out); assertEq(address(COLD).balance, 0);
+        assertGt(out, 0); assertEq(address(acct).balance - e0, out); assertEq(COLD.balance, c0);   // nothing to the key
     }
     function test_fork_malicious_hops_revert() public {
         GuardedSwapRH.Hop[] memory h = arr(v3(WETH, BONER, BONER_POOL, 10000));
