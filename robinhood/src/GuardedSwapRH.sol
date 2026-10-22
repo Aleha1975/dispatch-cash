@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-/// @title GuardedSwapRH (v3: round-2 response)
+/// @title GuardedSwapRH (v4: round-3 response)
 /// @notice GuardedSwap v15 ported to Robinhood Chain (chain id 4663): a one-purpose gate between a client's smart account and
 ///         the Robinhood swap router (selector 0x4d819a2a, structured hops). The account grants its executor the right to
 ///         call THIS contract instead of the router. Whatever a swap returns goes to the calling account and nobody else.
@@ -19,11 +19,18 @@ pragma solidity ^0.8.26;
 ///         2. Only the lot is for sale. sell() handles at most the tokens this contract saw bought for the account; the lot
 ///            shrinks by what the account gave up, never exceeds what the account holds and closes when the account holds none.
 ///         3. Rate limit. Per account and fixed hour window: at most MAX_SELLS_PER_HOUR sales, (v3) MAX_BUYS_PER_HOUR buys, MAX_BUY_ETH_PER_HOUR of ETH
-///            spent on buys and MAX_SELL_ETH_PER_HOUR of ETH taken out of sales.
+///            spent on buys and MAX_SELL_ETH_PER_HOUR of ETH taken out of sales. The window opens at the account's first call
+///            after the last one closed, so any 60 minutes can see at most twice each cap (as in v15; calendar-aligned buckets
+///            have the same bound). The delegation's 24-hour cap bounds the total.
 ///         4. Two keys kept off the executor's machine. The GUARDIAN can pause the executor -- buys and sells -- for at most
-///            PAUSE_MAX, then a day of cooldown; it cannot move funds and never blocks exit(). The EXIT key -- the operator's
+///            PAUSE_MAX (168 h), then PAUSE_COOLDOWN (24 h) before the next; it cannot move funds and never blocks exit(). A
+///            hostile guardian's pause cycle lasts until the cold key's replaceGuardian() (one transaction) and the new
+///            guardian's setPaused(false) (no cooldown on lifting). The EXIT key -- the operator's
 ///            cold key -- can unlock() an account's loss budget, replaceGuardian(), and run exit(): a sale paid to the
-///            account, outside the loss budget and the hourly limits.
+///            account, outside the loss budget and the hourly limits. Not blocked by a pause; like every sale it needs the
+///            token to answer balanceOf for this contract (v15, round 13 F-2) -- a token that stops answering is sold from the
+///            owner's wallet.
+///         Every trade carries a deadline (v4): past it the call reverts before anything moves.
 ///         5. Only this call's funds. Token and ETH balances are measured as deltas around the router call. A sale is paid
 ///            to this contract and forwarded after settlement, so state is written before any ETH leaves. (RH v2) A sale must
 ///            consume exactly what it was given: the gate's balance of the sold token is back at its base after the router
@@ -130,6 +137,7 @@ contract GuardedSwapRH {
     error NotPendingGuardian();
     error NoDirectEth();
     error PartialFill();
+    error Expired();
 
     constructor(address router, address weth, address poolManager, address[] memory v3Factories, bool[] memory tickKeyed, address guardian_, address exitKey, uint256 maxSellsPerHour, uint256 maxBuysPerHour, uint256 maxBuyEthPerHour, uint256 maxSellEthPerHour) {
         require(router != address(0) && weth != address(0) && poolManager != address(0) && guardian_ != address(0) && exitKey != address(0), "zero address");
@@ -281,7 +289,7 @@ contract GuardedSwapRH {
                 ? RouterHop(2, h.tokenIn, h.tokenOut, address(0), h.fee, h.tickSpacing, h.hooks, "", POOL_MANAGER, bytes32(0))
                 : RouterHop(1, h.tokenIn, h.tokenOut, h.pool, h.fee, int24(0), address(0), "", address(0), bytes32(0));   // v3: only `fee` (checked above) keys the pool (round 1, F-2)
         }
-        return abi.encodeWithSelector(SEL_SWAP, r, address(0), amountIn, minOut, block.timestamp);
+        return abi.encodeWithSelector(SEL_SWAP, r, address(0), amountIn, minOut, block.timestamp);   // the caller's deadline is enforced by the gate on entry (v4); the router's own field is then moot
     }
     /// @dev `pool` is the pool an allowed factory returns for (a, b, key). The factory is asked; the pool is never asked.
     function _isFactoryPool(address pool, address a, address b, uint24 key) private view returns (bool) {
@@ -292,14 +300,22 @@ contract GuardedSwapRH {
             bytes memory q;
             if (TICK_KEYED & (1 << i) != 0) { if (key > uint24(type(int24).max)) continue; q = abi.encodeWithSelector(0x28af8d0b, a, b, int24(key)); }   // getPool(address,address,int24)
             else q = abi.encodeWithSelector(0x1698ee82, a, b, key);                                                                                    // getPool(address,address,uint24)
-            (bool ok, bytes memory ret) = f[i].staticcall(q);
-            if (ok && ret.length >= 32 && uint256(bytes32(ret)) == uint256(uint160(pool))) return true;   // (v3, round 2 L-4) a dirty word is a mismatch, never a revert
+            if (_askFactory(f[i], q) == uint256(uint160(pool))) return true;   // (v3, round 2 L-4) a dirty word is a mismatch, never a revert
         }
         return false;
     }
 
-    /// @notice Spend msg.value of ETH on `token` along `hops`. Output goes to msg.sender.
-    function buy(address token, uint256 minOut, Hop[] calldata hops) external payable lock returns (uint256 out) {
+    /// @dev The factory's first answer word, copying at most 32 bytes of return data (round 3, F8); 0 when it fails or is short.
+    function _askFactory(address f, bytes memory q) private view returns (uint256 word) {
+        assembly {
+            let ok := staticcall(gas(), f, add(q, 32), mload(q), 0, 0)
+            if and(ok, iszero(lt(returndatasize(), 32))) { let m := mload(0x40) returndatacopy(m, 0, 32) word := mload(m) }
+        }
+    }
+
+    /// @notice Spend msg.value of ETH on `token` along `hops`, not after `deadline`. Output goes to msg.sender.
+    function buy(address token, uint256 minOut, uint256 deadline, Hop[] calldata hops) external payable lock returns (uint256 out) {
+        if (block.timestamp > deadline) revert Expired();           // (v4, round 3 F5) a transaction held back past its deadline does not run
         if (paused()) revert IsPaused();
         if (msg.value == 0) revert ZeroAmount();
         if (minOut == 0) revert MinOutZero();
@@ -308,13 +324,7 @@ contract GuardedSwapRH {
         _trim(token);
         if (msg.value > MAX_BUY_ETH_PER_HOUR) revert RateLimited();
         uint256 ethBase = address(this).balance - msg.value;
-        uint256 tokBase = IERC20(token).balanceOf(address(this));
-        (bool okB, uint256 before) = _balanceOf(token, msg.sender);
-        if (!okB) revert BelowMinOut(0, minOut);
-        _callRouter(_route(hops, token, true, msg.value, minOut), msg.value);   // the route is checked and encoded here, never taken from the caller
-        _sweepToken(token, tokBase);                                // the router pays this contract (recipient must be zero); forwarded to the caller
-        (bool okA, uint256 after_) = _balanceOf(token, msg.sender);
-        out = okA && after_ > before ? after_ - before : 0;
+        out = _swapForToken(token, minOut, hops);
         if (out < minOut) revert BelowMinOut(out, minOut);
         uint256 change = address(this).balance - ethBase;           // the live router spends all of msg.value (verified); kept as in v15
         if (change > msg.value) revert RouterOverpaid();
@@ -328,8 +338,20 @@ contract GuardedSwapRH {
         if (change > 0) _sendEth(msg.sender, change);
     }
 
+    /// @dev Run the route the gate encoded with msg.value and forward what arrived; returns what the account received (as v15's buy measures it).
+    function _swapForToken(address token, uint256 minOut, Hop[] calldata hops) private returns (uint256) {
+        uint256 tokBase = IERC20(token).balanceOf(address(this));
+        (bool okB, uint256 before) = _balanceOf(token, msg.sender);
+        if (!okB) revert BelowMinOut(0, minOut);
+        _callRouter(_route(hops, token, true, msg.value, minOut), msg.value);   // the route is checked and encoded here, never taken from the caller
+        _sweepToken(token, tokBase);                                // the router pays this contract (recipient must be zero); forwarded to the caller
+        (bool okA, uint256 after_) = _balanceOf(token, msg.sender);
+        return okA && after_ > before ? after_ - before : 0;
+    }
+
     /// @notice Sell `amount` of `token` (at most the lot) for ETH along `hops`, within the loss budget.
-    function sell(address token, uint256 amount, uint256 minOut, Hop[] calldata hops) external lock returns (uint256 out) {
+    function sell(address token, uint256 amount, uint256 minOut, uint256 deadline, Hop[] calldata hops) external lock returns (uint256 out) {
+        if (block.timestamp > deadline) revert Expired();
         if (paused()) revert IsPaused();
         return _sale(token, amount, minOut, hops, false);
     }
@@ -339,8 +361,9 @@ contract GuardedSwapRH {
     ///         no account argument), tx.origin proves the cold key started the transaction. unlock() and replaceGuardian() act
     ///         on other accounts or on the whole gate, so they take the key as the direct caller instead (v15, round 13 F-1:
     ///         tx.origin there was a confused deputy). The cold key must submit its own transactions (no relayer or bundler).
-    function exit(address token, uint256 amount, uint256 minOut, Hop[] calldata hops) external lock returns (uint256 out) {
+    function exit(address token, uint256 amount, uint256 minOut, uint256 deadline, Hop[] calldata hops) external lock returns (uint256 out) {
         if (tx.origin != EXIT_KEY) revert NotExitKey();
+        if (block.timestamp > deadline) revert Expired();
         return _sale(token, amount, minOut, hops, true);
     }
 
@@ -403,7 +426,15 @@ contract GuardedSwapRH {
     ///      and buys in the token (verified); WETH left here would be stranded, so such a call is refused.
     function _callRouter(bytes memory data, uint256 value) private {
         uint256 wethBase = IERC20(WETH).balanceOf(address(this));
-        (bool ok, bytes memory err) = ROUTER.call{value: value}(data);
+        address router = ROUTER; bool ok; bytes memory err;
+        assembly {                                                  // (v4, round 3 F8) no return data is copied on success, at most 256 bytes of a revert
+            ok := call(gas(), router, value, add(data, 32), mload(data), 0, 0)
+            if iszero(ok) {
+                let n := returndatasize() if gt(n, 256) { n := 256 }
+                err := mload(0x40) mstore(err, n) returndatacopy(add(err, 32), 0, n)
+                mstore(0x40, add(add(err, 32), and(add(n, 31), not(31))))
+            }
+        }
         if (!ok) revert RouterFailed(err);
         if (IERC20(WETH).balanceOf(address(this)) != wethBase) revert BadRoute();
     }

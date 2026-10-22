@@ -1,4 +1,4 @@
-# GuardedSwapRH — the v15 gate on Robinhood Chain (v3, round-2 response; not deployed)
+# GuardedSwapRH — the v15 gate on Robinhood Chain (v4, round-3 response; not deployed)
 
 **What it is.** GuardedSwap v15 (Dispatch, Base, `0x2c894b3a726b49d9e68e71d548157964e5e0fbb6`) ported to the AlphaCatch engine on Robinhood Chain (chain id 4663). The client's MetaMask smart account lets the executor call this gate instead of the Robinhood router `0x65050a9b7e5075a2ba5ced7b1b64ee66262c40dc`. Source: `src/GuardedSwapRH.sol`. Nothing has been deployed. Audit log: `AUDIT-RH.md`.
 
@@ -38,6 +38,8 @@ Everything that is not the route: loss budget (30% of cost basis, `Loss{amount, 
 | — | route rule: 1..3 hops, versions 1/2 only, buy ETH-side→token, sale token→ETH-side, contiguous, no intermediate ETH side or traded token, v3 never native, v4 names no pool | Fail closed on everything the router dispatches elsewhere (version 4 = Virtuals). |
 | sales counted per hour | buys counted per hour too (`MAX_BUYS_PER_HOUR`, v3, round 2 H-2) | Tiny buys cannot multiply router calls. |
 | loss charged at floor(cost) | charged at ceil(cost), lot released at floor (v3, round 2 L-1) | A loss is never under-booked; the remainder's cost never zeroes. |
+| no deadline (v15) | `buy`/`sell`/`exit` take a `deadline`, checked on entry (v4, round 3 F5) | A transaction held back past its deadline does not run. |
+| full return data copied | at most 256 bytes of a router revert, 32 bytes of a factory answer (v4, round 3 F8) | No return-data bomb from the router or a factory. |
 | — | no WETH may arrive on the gate in any router call (v2: one check at the single call site, buys and sales) | The router pays native (verified); WETH arriving would be stranded. |
 | executor's v3 `tickSpacing` forwarded (v1) | v3 hops are encoded with `tickSpacing 0`, `hooks 0` (v2, round 1 F-2) | The router keys on `fee`, which the gate checks; no unchecked v3 field reaches the router. |
 | partial fill swept back to the account; `approve(0)` best-effort | a sale must consume exactly what the gate received, else `PartialFill` (v2, round 1 F-4) | A full fill spends the exact allowance whatever `approve(0)` does; the sale-side sweep is gone. Cost: a partially filled route reverts; sales are sized to the route. |
@@ -76,4 +78,4 @@ Everything that is not the route: loss budget (30% of cost basis, `Loss{amount, 
 
 ## Tests
 
-`forge test --no-match-path 'test/research/*'` — 48 unit tests (v15's suite ported with the same scenarios and numbers, plus route/encoding/factory/WETH tests, the round-1 and round-2 regressions and the cold-key EOA/EIP-7702 paths), 7 invariants over 256 runs × 500 calls (cost basis = lot; lot ≤ balance; outstanding ≤ booked and gone within REFILL; **a booked loss never exceeds the budget**; **proceeds only to the account, the thief and the gate get nothing, no allowance left**; **no lot/cost underflow**; the handler mixes in partial fills, exits, owner transfers and a router that pays a thief), 10 fork tests against the live router at the chain head (the public RPC keeps little history; `RH_BLOCK` pins a block). Mutation check: doubling the budget, or skimming 1% of proceeds, each make the corresponding invariant fail.
+`forge test --no-match-path 'test/research/*'` — 52 unit tests (v15's suite ported with the same scenarios and numbers, plus route/encoding/factory/WETH tests, the round-1, round-2 and round-3 regressions and the cold-key EOA/EIP-7702 paths), 7 invariants over 256 runs × 500 calls (cost basis = lot; lot ≤ balance; outstanding ≤ booked and gone within REFILL; **a booked loss never exceeds the budget**; **proceeds only to the account, the thief and the gate get nothing, no allowance left**; **no lot/cost underflow**; the handler mixes in partial fills, exits, owner transfers and a router that pays a thief), 10 fork tests against the live router at the chain head (the public RPC keeps little history; `RH_BLOCK` pins a block). Mutation check: doubling the budget, or skimming 1% of proceeds, each make the corresponding invariant fail.

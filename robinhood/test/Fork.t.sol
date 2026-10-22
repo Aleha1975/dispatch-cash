@@ -54,15 +54,17 @@ contract ForkTest is Test {
     function arr(GuardedSwapRH.Hop memory a) internal pure returns (GuardedSwapRH.Hop[] memory h) { h = new GuardedSwapRH.Hop[](1); h[0] = a; }
     /// the sale route: the buy route reversed, as a copy (the buy route stays intact)
     function rev(GuardedSwapRH.Hop[] memory h) internal pure returns (GuardedSwapRH.Hop[] memory r) { r = new GuardedSwapRH.Hop[](h.length); for (uint256 i = 0; i < h.length; i++) { GuardedSwapRH.Hop memory x = h[h.length - 1 - i]; r[i] = GuardedSwapRH.Hop(x.version, x.tokenOut, x.tokenIn, x.pool, x.fee, x.tickSpacing, x.hooks); } }
+    /// a sale with minOut 1 and a deadline of now, as the account would send it
+    function _sd(address t, uint256 amt, GuardedSwapRH.Hop[] memory h) internal view returns (bytes memory) { return abi.encodeWithSelector(GuardedSwapRH.sell.selector, t, amt, uint256(1), block.timestamp, h); }
     function bal(address t, address w) internal view returns (uint256) { return IERC20(t).balanceOf(w); }
     // ---- the account's own calls (what a delegation redemption runs) ----
     function _buy(address token, uint256 eth, GuardedSwapRH.Hop[] memory h) internal returns (uint256) {
         // the account sends value: fund it through a payable path -- the SmartAccount forwards with value 0, so call the gate as the account directly
-        vm.prank(address(acct)); return g.buy{value: eth}(token, 1, h);
+        vm.prank(address(acct)); return g.buy{value: eth}(token, 1, block.timestamp, h);
     }
     function _sell(address token, uint256 amount, uint256 minOut, GuardedSwapRH.Hop[] memory h, bool asExit) internal returns (uint256) {
         acct.exec(token, abi.encodeWithSelector(0x095ea7b3, address(g), amount));
-        bytes memory c = abi.encodeWithSelector(asExit ? GuardedSwapRH.exit.selector : GuardedSwapRH.sell.selector, token, amount, minOut, h);
+        bytes memory c = abi.encodeWithSelector(asExit ? GuardedSwapRH.exit.selector : GuardedSwapRH.sell.selector, token, amount, minOut, block.timestamp, h);
         if (asExit) vm.prank(COLD, COLD);
         return abi.decode(acct.exec(address(g), c), (uint256));
     }
@@ -109,16 +111,16 @@ contract ForkTest is Test {
         GuardedSwapRH.Hop[] memory h = new GuardedSwapRH.Hop[](2);
         h[0] = v3(WETH, USDG, 0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca, 100); h[0].tickSpacing = 777;
         h[1] = v3(USDG, PONS, 0xf2A0bE59AB76b96f957bd5E5b967F2B75e8dB269, 50); h[1].tickSpacing = 1;
-        vm.prank(address(acct)); assertGt(g.buy{value: 0.001 ether}(PONS, 1, h), 0);
+        vm.prank(address(acct)); assertGt(g.buy{value: 0.001 ether}(PONS, 1, block.timestamp, h), 0);
         h[1].fee = 1300;                                                                  // the pool's live fee is not its key on this factory
-        vm.prank(address(acct)); vm.expectRevert(GuardedSwapRH.BadRoute.selector); g.buy{value: 0.001 ether}(PONS, 1, h);
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwapRH.BadRoute.selector); g.buy{value: 0.001 ether}(PONS, 1, block.timestamp, h);
     }
     function test_fork_exit_by_the_cold_key() public {
         GuardedSwapRH.Hop[] memory h = arr(v3(WETH, BONER, BONER_POOL, 10000));
         uint256 got = _buy(BONER, 0.01 ether, h);
         acct.exec(BONER, abi.encodeWithSelector(0x095ea7b3, address(g), got));
         vm.expectRevert(GuardedSwapRH.NotExitKey.selector);
-        acct.exec(address(g), abi.encodeWithSelector(GuardedSwapRH.exit.selector, BONER, got, uint256(1), rev(h)));   // the account (executor path) alone cannot exit
+        acct.exec(address(g), abi.encodeWithSelector(GuardedSwapRH.exit.selector, BONER, got, uint256(1), block.timestamp, rev(h)));   // the account (executor path) alone cannot exit
         g.setPaused(true);                                                                                               // and the guardian's pause does not stop the cold key
         uint256 e0 = address(acct).balance; uint256 c0 = COLD.balance;
         uint256 out = _sell(BONER, got, 1, rev(h), true);
@@ -131,18 +133,18 @@ contract ForkTest is Test {
         bytes4 BAD = GuardedSwapRH.BadRoute.selector;
         // 1. a contract posing as the pool
         address fake = address(new NotAPool());
-        vm.prank(address(acct)); vm.expectRevert(BAD); g.buy{value: 0.01 ether}(BONER, 1, arr(v3(WETH, BONER, fake, 10000)));
-        vm.expectRevert(BAD); acct.exec(address(g), abi.encodeWithSelector(GuardedSwapRH.sell.selector, BONER, got, uint256(1), arr(v3(BONER, WETH, fake, 10000))));
+        vm.prank(address(acct)); vm.expectRevert(BAD); g.buy{value: 0.01 ether}(BONER, 1, block.timestamp, arr(v3(WETH, BONER, fake, 10000)));
+        vm.expectRevert(BAD); acct.exec(address(g), _sd(BONER, got, arr(v3(BONER, WETH, fake, 10000))));
         // 2. a router code path other than v3/v4 (version 4 = the router's Virtuals library)
         GuardedSwapRH.Hop memory x = v3(BONER, WETH, BONER_POOL, 10000); x.version = 4;
-        vm.expectRevert(BAD); acct.exec(address(g), abi.encodeWithSelector(GuardedSwapRH.sell.selector, BONER, got, uint256(1), arr(x)));
+        vm.expectRevert(BAD); acct.exec(address(g), _sd(BONER, got, arr(x)));
         // 3. a sale that ends in another token (it would land on the gate, not the account)
-        vm.expectRevert(BAD); acct.exec(address(g), abi.encodeWithSelector(GuardedSwapRH.sell.selector, BONER, got, uint256(1), arr(v4(BONER, USDG, 3000, 60, address(0)))));
+        vm.expectRevert(BAD); acct.exec(address(g), _sd(BONER, got, arr(v4(BONER, USDG, 3000, 60, address(0)))));
         // 4. a real pool for another pair named for this one
-        vm.expectRevert(BAD); acct.exec(address(g), abi.encodeWithSelector(GuardedSwapRH.sell.selector, BONER, got, uint256(1), arr(v3(BONER, WETH, 0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca, 10000))));
+        vm.expectRevert(BAD); acct.exec(address(g), _sd(BONER, got, arr(v3(BONER, WETH, 0x52e65B17fB6E5BA00Ed806f37Afcd2DaA50271Ca, 10000))));
         // 5. a thief-chosen minOut below what the route pays is fine for the gate, but nothing lands anywhere but the account
         uint256 e0 = address(acct).balance; uint256 t0 = THIEF.balance;
-        uint256 out = abi.decode(acct.exec(address(g), abi.encodeWithSelector(GuardedSwapRH.sell.selector, BONER, got / 10, uint256(1), rev(h))), (uint256));
+        uint256 out = abi.decode(acct.exec(address(g), _sd(BONER, got / 10, rev(h))), (uint256));
         assertEq(address(acct).balance - e0, out); assertEq(THIEF.balance, t0); assertEq(bal(BONER, THIEF), 0);
     }
     /// The residual, measured: a stolen executor key routes the account's lot into the thief's own genuine Uniswap v3 pool
@@ -158,12 +160,12 @@ contract ForkTest is Test {
         acct.exec(BONER, abi.encodeWithSelector(0x095ea7b3, address(g), got));
         (, uint256 budget) = g.budgetOf(address(acct)); assertEq(budget, 0.003 ether);
         vm.expectPartialRevert(GuardedSwapRH.BudgetExceeded.selector);                   // the whole lot into the sink: BudgetExceeded (loss ~0.01 > 0.003)
-        acct.exec(address(g), abi.encodeWithSelector(GuardedSwapRH.sell.selector, BONER, got, uint256(1), s));
-        uint256 out = abi.decode(acct.exec(address(g), abi.encodeWithSelector(GuardedSwapRH.sell.selector, BONER, got / 5, uint256(1), s)), (uint256));   // a fifth fits the budget
+        acct.exec(address(g), _sd(BONER, got, s));
+        uint256 out = abi.decode(acct.exec(address(g), _sd(BONER, got / 5, s)), (uint256));   // a fifth fits the budget
         (uint256 lost, ) = g.budgetOf(address(acct)); assertGt(lost, 0.0019 ether); assertLe(lost, 0.002 ether); emit log_named_uint("sink paid for a fifth of the lot", out);
         acct.exec(BONER, abi.encodeWithSelector(0x095ea7b3, address(g), got / 5));
         vm.expectPartialRevert(GuardedSwapRH.BudgetExceeded.selector);                   // the next fifth does not: 0.004 > 30% of the 0.008 left
-        acct.exec(address(g), abi.encodeWithSelector(GuardedSwapRH.sell.selector, BONER, got / 5, uint256(1), s));
+        acct.exec(address(g), _sd(BONER, got / 5, s));
         assertEq(address(g).balance, 0); assertEq(bal(BONER, address(g)), 0);
     }
     /// What the router does with the fields the gate pins: a non-zero recipient is refused, the PoolManager field is ignored.

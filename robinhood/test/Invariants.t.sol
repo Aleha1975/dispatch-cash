@@ -18,7 +18,7 @@ contract Handler is Test {
     function _panic(bytes memory e) internal { if (e.length >= 4 && bytes4(e) == bytes4(0x4e487b71)) panics++; }
     function buy(uint256 eth) external {
         eth = bound(eth, 0.001 ether, 5 ether); vm.deal(address(acct), address(acct).balance + eth);
-        vm.prank(address(acct)); try g.buy{value: eth}(address(tok), 1, _buyHops()) { buys++; } catch (bytes memory e) { _panic(e); }   // a pranked direct call: the gate sees the account
+        vm.prank(address(acct)); try g.buy{value: eth}(address(tok), 1, block.timestamp, _buyHops()) { buys++; } catch (bytes memory e) { _panic(e); }   // a pranked direct call: the gate sees the account
     }
     function sell(uint256 frac, uint256 priceBps, bool asExit, bool dishonest, bool partialFill) external {
         (uint256 lot, ) = g.lotOf(address(acct), address(tok)); if (lot == 0) return;
@@ -27,8 +27,8 @@ contract Handler is Test {
         (, uint256 budget) = g.budgetOf(address(acct)); (uint256 amtBefore, uint64 atBefore) = g.loss(address(acct));
         uint256 ethBefore = address(acct).balance;
         acct.exec(address(tok), abi.encodeWithSelector(MockToken.approve.selector, address(g), amount));
-        bytes memory call_ = asExit ? abi.encodeWithSelector(GuardedSwapRH.exit.selector, address(tok), amount, uint256(1), _sellHops())
-                                    : abi.encodeWithSelector(GuardedSwapRH.sell.selector, address(tok), amount, uint256(1), _sellHops());
+        bytes memory call_ = asExit ? abi.encodeWithSelector(GuardedSwapRH.exit.selector, address(tok), amount, uint256(1), block.timestamp, _sellHops())
+                                    : abi.encodeWithSelector(GuardedSwapRH.sell.selector, address(tok), amount, uint256(1), block.timestamp, _sellHops());
         if (asExit) vm.prank(cold, cold);                 // the account runs the call; the cold key is the transaction's origin
         try acct.exec(address(g), call_) returns (bytes memory r) {
             uint256 out = abi.decode(r, (uint256)); sells++;

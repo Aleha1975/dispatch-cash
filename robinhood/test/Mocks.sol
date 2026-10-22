@@ -35,7 +35,7 @@ contract MockFactory {
 /// (or WETH when `payWeth`). Records the last call for the encoding tests.
 contract MockRouterRH {
     address public WETH; address public V4_POOL_MANAGER;
-    uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo; bool public reenter; address public guard; bool public reenterOk; uint256 public overpay; bool public pullLess; bool public pullNone; uint256 public refund; bool public payWeth; uint256 public wethOnBuy;
+    uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo; bool public reenter; address public guard; bool public reenterOk; uint256 public overpay; bool public pullLess; bool public pullNone; uint256 public refund; bool public payWeth; uint256 public wethOnBuy; uint256 public revertBytes;
     // last call
     uint256 public lastN; address public lastRecipient; uint256 public lastAmountIn; uint256 public lastMinOut; uint256 public lastDeadline; uint256 public lastValue;
     GuardedSwapRH.RouterHop[] internal _last;
@@ -46,11 +46,13 @@ contract MockRouterRH {
     function setOverpay(uint256 w) external { overpay = w; }
     function setPullLess(bool b) external { pullLess = b; }
     function setPayWeth(bool b) external { payWeth = b; }
-    function setWethOnBuy(uint256 w) external { wethOnBuy = w; }   // leaves WETH dust on the caller during a buy (round 1, L-1)
+    function setWethOnBuy(uint256 w) external { wethOnBuy = w; }
+    function setRevertBytes(uint256 n) external { revertBytes = n; }   // reverts with n bytes of data (round 3, F8)   // leaves WETH dust on the caller during a buy (round 1, L-1)
     receive() external payable {}
     function set(uint256 tpe, uint256 ept, address to) external { tokensPerEth = tpe; ethPerToken = ept; payTo = to; }
     function setReenter(address g) external { reenter = true; guard = g; }
     function swap(GuardedSwapRH.RouterHop[] calldata hops, address recipient, uint256 amountIn, uint256 minOut, uint256 deadline) external payable {
+        if (revertBytes > 0) { bytes memory big = new bytes(revertBytes); assembly { revert(add(big, 32), mload(big)) } }
         require(recipient == address(0), "BAD_ARGS");
         require(deadline == 0 || deadline >= block.timestamp, "Transaction too old");
         lastN = hops.length; lastRecipient = recipient; lastAmountIn = amountIn; lastMinOut = minOut; lastDeadline = deadline; lastValue = msg.value;
@@ -62,7 +64,7 @@ contract MockRouterRH {
             if (wethOnBuy > 0) MockToken(WETH).mint(msg.sender, wethOnBuy);
             if (overpay > 0) { (bool okp, ) = msg.sender.call{value: msg.value + overpay}(""); require(okp, "overpay"); }
             if (refund > 0) { (bool okr, ) = msg.sender.call{value: refund}(""); require(okr, "refund"); }
-            if (reenter) { GuardedSwapRH.Hop[] memory h = new GuardedSwapRH.Hop[](0); (bool ok, ) = guard.call(abi.encodeWithSelector(GuardedSwapRH.sell.selector, tout, uint256(1), uint256(1), h)); reenterOk = ok; }
+            if (reenter) { GuardedSwapRH.Hop[] memory h = new GuardedSwapRH.Hop[](0); (bool ok, ) = guard.call(abi.encodeWithSelector(GuardedSwapRH.sell.selector, tout, uint256(1), uint256(1), block.timestamp, h)); reenterOk = ok; }
             return;
         }
         if (!pullNone) MockToken(tin).transferFrom(msg.sender, address(this), pullLess ? amountIn / 2 : amountIn);
@@ -79,8 +81,8 @@ contract SpyWallet {
     GuardedSwapRH public g; address public tok; uint256 public seenTokens; uint256 public hooks;
     function set(GuardedSwapRH g_, address t) external { g = g_; tok = t; }
     receive() external payable { hooks += 1; (seenTokens, ) = g.basis(address(this), tok); }
-    function buy(uint256 eth, uint256 minOut, GuardedSwapRH.Hop[] calldata h) external returns (uint256) { return g.buy{value: eth}(tok, minOut, h); }
-    function sell(uint256 amount, uint256 minOut, GuardedSwapRH.Hop[] calldata h) external returns (uint256) { MockToken(tok).approve(address(g), amount); return g.sell(tok, amount, minOut, h); }
+    function buy(uint256 eth, uint256 minOut, GuardedSwapRH.Hop[] calldata h) external returns (uint256) { return g.buy{value: eth}(tok, minOut, block.timestamp, h); }
+    function sell(uint256 amount, uint256 minOut, GuardedSwapRH.Hop[] calldata h) external returns (uint256) { MockToken(tok).approve(address(g), amount); return g.sell(tok, amount, minOut, block.timestamp, h); }
 }
 
 /// A smart-account stand-in: forwards a call and bubbles its revert (what a delegation redemption does, minus the caveats).
