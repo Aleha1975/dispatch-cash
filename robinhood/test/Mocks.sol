@@ -5,20 +5,25 @@ import "../src/GuardedSwapRH.sol";
 contract MockToken {
     string public name = "Mock"; string public symbol = "MOCK"; uint8 public decimals = 18;
     mapping(address => uint256) internal _bal; mapping(address => mapping(address => uint256)) internal _allow;
-    mapping(address => bool) public bricked;                 // balanceOf(a) reverts for a bricked address (round-11 H-1)
+    mapping(address => bool) public bricked;                 // balanceOf(a) reverts for a bricked address
     function setBricked(address a, bool b) external { bricked[a] = b; }
-    function balanceOf(address a) public view returns (uint256) { if (bricked[a]) revert("bricked"); return _bal[a]; }
+    function balanceOf(address a) public view virtual returns (uint256) { if (bricked[a]) revert("bricked"); return _bal[a]; }
     function allowance(address o, address s) external view returns (uint256) { return _allow[o][s]; }
-    uint256 public feeBps; bool public revertOnZeroApprove; bool public zeroFirst;
-    function setZeroFirst(bool b) external { zeroFirst = b; }
-    function setRevertOnZeroApprove(bool b) external { revertOnZeroApprove = b; }
+    uint256 public feeBps;
     function setFee(uint256 b) external { feeBps = b; }
     function mint(address to, uint256 a) external { _bal[to] += a; }
-    function approve(address s, uint256 a) external returns (bool) { if (revertOnZeroApprove && a == 0) revert("zero"); if (zeroFirst && a != 0 && _allow[msg.sender][s] != 0) revert("zero first"); _allow[msg.sender][s] = a; return true; }
+    function approve(address s, uint256 a) external returns (bool) { _allow[msg.sender][s] = a; return true; }
     function transfer(address to, uint256 a) external returns (bool) { _move(msg.sender, to, a); return true; }
     function transferFrom(address f, address to, uint256 a) external returns (bool) {
         uint256 al = _allow[f][msg.sender]; require(al >= a, "allowance"); _allow[f][msg.sender] = al - a; _move(f, to, a); return true; }
-    function _move(address f, address to, uint256 a) internal { require(_bal[f] >= a, "balance"); _bal[f] -= a; uint256 fee = a * feeBps / 10000; _bal[to] += a - fee; }
+    function _move(address f, address to, uint256 a) internal virtual { require(_bal[f] >= a, "balance"); _bal[f] -= a; uint256 fee = a * feeBps / 10000; _bal[to] += a - fee; }
+}
+
+/// WETH stand-in: deposit/withdraw against real ETH held here.
+contract MockWETH is MockToken {
+    function deposit() external payable { _bal[msg.sender] += msg.value; }
+    function withdraw(uint256 a) external { require(_bal[msg.sender] >= a, "balance"); _bal[msg.sender] -= a; (bool ok, ) = msg.sender.call{value: a}(""); require(ok, "eth"); }
+    receive() external payable { _bal[msg.sender] += msg.value; }
 }
 
 /// A v3 factory stand-in answering both getPool shapes: (a,b,uint24 fee) and (a,b,int24 tickSpacing).
@@ -29,54 +34,110 @@ contract MockFactory {
     function getPool(address a, address b, int24 ts) external view returns (address) { return pools[keccak256(abi.encode(a, b, uint24(ts)))]; }
 }
 
-/// A Robinhood-router stand-in: the same ABI (swap(RouterHop[],address,uint256,uint256,uint256)), pays msg.sender, refuses a
-/// non-zero recipient (BAD_ARGS, as the live router). Buy (first tokenIn native or WETH): mints tokensPerEth per ETH of the last
-/// tokenOut to msg.sender (or `payTo`). Sale: pulls amountIn of the first tokenIn from msg.sender and pays ETH at ethPerToken
-/// (or WETH when `payWeth`). Records the last call for the encoding tests.
-contract MockRouterRH {
-    address public WETH; address public V4_POOL_MANAGER;
-    uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo; bool public reenter; address public guard; bool public reenterOk; uint256 public overpay; bool public pullLess; bool public pullNone; uint256 public refund; bool public payWeth; uint256 public wethOnBuy; uint256 public revertBytes;
-    // last call
-    uint256 public lastN; address public lastRecipient; uint256 public lastAmountIn; uint256 public lastMinOut; uint256 public lastDeadline; uint256 public lastValue;
-    GuardedSwapRH.RouterHop[] internal _last;
-    constructor(address weth, address pm) { WETH = weth; V4_POOL_MANAGER = pm; }
-    function lastHop(uint256 i) external view returns (GuardedSwapRH.RouterHop memory) { return _last[i]; }
-    function setPullNone(bool b) external { pullNone = b; }
-    function setRefund(uint256 w) external { refund = w; }
-    function setOverpay(uint256 w) external { overpay = w; }
-    function setPullLess(bool b) external { pullLess = b; }
-    function setPayWeth(bool b) external { payWeth = b; }
-    function setWethOnBuy(uint256 w) external { wethOnBuy = w; }
-    function setRevertBytes(uint256 n) external { revertBytes = n; }   // reverts with n bytes of data (round 3, F8)   // leaves WETH dust on the caller during a buy (round 1, L-1)
-    receive() external payable {}
-    function set(uint256 tpe, uint256 ept, address to) external { tokensPerEth = tpe; ethPerToken = ept; payTo = to; }
-    function setReenter(address g) external { reenter = true; guard = g; }
-    function swap(GuardedSwapRH.RouterHop[] calldata hops, address recipient, uint256 amountIn, uint256 minOut, uint256 deadline) external payable {
-        if (revertBytes > 0) { bytes memory big = new bytes(revertBytes); assembly { revert(add(big, 32), mload(big)) } }
-        require(recipient == address(0), "BAD_ARGS");
-        require(deadline == 0 || deadline >= block.timestamp, "Transaction too old");
-        lastN = hops.length; lastRecipient = recipient; lastAmountIn = amountIn; lastMinOut = minOut; lastDeadline = deadline; lastValue = msg.value;
-        delete _last; for (uint256 i = 0; i < hops.length; i++) _last.push(hops[i]);
-        address to = payTo != address(0) ? payTo : msg.sender;
-        address tin = hops[0].tokenIn; address tout = hops[hops.length - 1].tokenOut;
-        if (tin == address(0) || tin == WETH) {
-            MockToken(tout).mint(to, msg.value * tokensPerEth);
-            if (wethOnBuy > 0) MockToken(WETH).mint(msg.sender, wethOnBuy);
-            if (overpay > 0) { (bool okp, ) = msg.sender.call{value: msg.value + overpay}(""); require(okp, "overpay"); }
-            if (refund > 0) { (bool okr, ) = msg.sender.call{value: refund}(""); require(okr, "refund"); }
-            if (reenter) { GuardedSwapRH.Hop[] memory h = new GuardedSwapRH.Hop[](0); (bool ok, ) = guard.call(abi.encodeWithSelector(GuardedSwapRH.sell.selector, tout, uint256(1), uint256(1), block.timestamp, h)); reenterOk = ok; }
-            return;
-        }
-        if (!pullNone) MockToken(tin).transferFrom(msg.sender, address(this), pullLess ? amountIn / 2 : amountIn);
-        uint256 eth = amountIn * ethPerToken / 1e18;
-        if (payWeth) { MockToken(WETH).mint(to, eth); return; }
-        (bool ok2, ) = to.call{value: eth}(""); require(ok2, "pay");
-    }
+/// Prices shared by the pool and PoolManager stand-ins: `ethSide` in -> `rateBuy` out per unit (1e18-scaled);
+/// any other token in -> `rateSell` out per unit (1e18-scaled). Outputs are minted (tokens) or paid from held ETH.
+abstract contract Priced {
+    address public ethSide; uint256 public rateBuy = 1000e18; uint256 public rateSell = 1e15;
+    function setRates(uint256 b, uint256 s) external { rateBuy = b; rateSell = s; }
+    function _out(address tin, uint256 amt) internal view returns (uint256) { return tin == ethSide || tin == address(0) ? amt * rateBuy / 1e18 : amt * rateSell / 1e18; }
 }
+
+/// A Uniswap-v3-style pool stand-in (token0 < token1): exact input only, pays `recipient`, then asks the caller to pay in
+/// the callback and checks it was paid. Misbehaviours for the tests are switches.
+contract MockV3Pool is Priced {
+    address public token0; address public token1; address public weth;
+    address public payTo; bool public consumeHalf; bool public skipCallback; uint256 public askMore; bool public askBoth; bool public askWrongSide; address public reenterTarget; bytes public reenterData; bool public reenterOk; uint256 public calls;
+    constructor(address a, address b, address weth_, address eth_) { (token0, token1) = a < b ? (a, b) : (b, a); weth = weth_; ethSide = eth_; }
+    function setPayTo(address t) external { payTo = t; }
+    function setConsumeHalf(bool b) external { consumeHalf = b; }
+    function setSkipCallback(bool b) external { skipCallback = b; }
+    function setAskMore(uint256 x) external { askMore = x; }
+    function setAskBoth(bool b) external { askBoth = b; }
+    function setAskWrongSide(bool b) external { askWrongSide = b; }
+    function setReenter(address t, bytes calldata d) external { reenterTarget = t; reenterData = d; }
+    function swap(address recipient, bool zeroForOne, int256 amountSpecified, uint160, bytes calldata) external returns (int256 a0, int256 a1) {
+        calls++;
+        require(amountSpecified > 0, "exact input only");
+        uint256 inAmt = uint256(amountSpecified); if (consumeHalf) inAmt /= 2;
+        address tin = zeroForOne ? token0 : token1;
+        uint256 out = _out(tin, inAmt);
+        _pay(zeroForOne ? token1 : token0, payTo != address(0) ? payTo : recipient, out);
+        if (reenterTarget != address(0)) { (reenterOk, ) = reenterTarget.call(reenterData); }
+        if (skipCallback) return (0, 0);
+        (a0, a1) = _deltas(zeroForOne, inAmt + askMore, out);
+        uint256 before = MockToken(tin).balanceOf(address(this));
+        GuardedSwapRH(payable(msg.sender)).uniswapV3SwapCallback(a0, a1, "");
+        require(MockToken(tin).balanceOf(address(this)) >= before + inAmt, "IIA");
+    }
+    function _deltas(bool zeroForOne, uint256 owed, uint256 out) internal view returns (int256 a0, int256 a1) {
+        (a0, a1) = zeroForOne ? (int256(owed), -int256(out)) : (-int256(out), int256(owed));
+        if (askBoth) { a0 = int256(owed); a1 = int256(owed); }
+        if (askWrongSide) (a0, a1) = (a1, a0);
+    }
+    function _pay(address t, address to, uint256 a) internal { MockToken(t).mint(to, a); }
+    receive() external payable {}
+}
+
+/// A Uniswap v4 PoolManager stand-in: unlock -> unlockCallback; swap books deltas for msg.sender; sync/settle/take as v4.
+/// Every currency's delta must be zero when unlock returns.
+contract MockPoolManager is Priced {
+    struct Key { address c0; address c1; uint24 fee; int24 ts; address hooks; }
+    struct Params { bool zeroForOne; int256 amountSpecified; uint160 limit; }
+    bool public unlocked; address public locker; mapping(address => int256) public delta; address[] internal touched;
+    address public synced; uint256 public reserves; address public weth;
+    // misbehaviours
+    bool public consumeHalf; int256 public outOverride; bool public hookSkim; bool public skipCallback; bool public flipSign; address public reenterTarget; bytes public reenterData; bool public reenterOk;
+    Key public lastKey; Params public lastParams; bytes public lastHookData; uint256 public swaps;
+    mapping(bytes32 => bool) public initialized;
+    constructor(address weth_) { weth = weth_; }
+    function init(address c0, address c1, uint24 fee, int24 ts, address hooks) external { initialized[keccak256(abi.encode(c0, c1, fee, ts, hooks))] = true; }
+    function setEthSide(address e) external { ethSide = e; }
+    function setConsumeHalf(bool b) external { consumeHalf = b; }
+    function setOutOverride(int256 x) external { outOverride = x; }
+    function setHookSkim(bool b) external { hookSkim = b; }
+    function setSkipCallback(bool b) external { skipCallback = b; }
+    function setReenter(address t, bytes calldata d) external { reenterTarget = t; reenterData = d; }
+    function _touch(address c) internal { touched.push(c); }
+    function unlock(bytes calldata data) external returns (bytes memory r) {
+        require(!unlocked, "AlreadyUnlocked"); unlocked = true; locker = msg.sender; delete touched;
+        if (!skipCallback) r = IUnlockCallback(msg.sender).unlockCallback(data);
+        for (uint256 i = 0; i < touched.length; i++) require(delta[touched[i]] == 0, "CurrencyNotSettled");
+        unlocked = false;
+    }
+    function swap(Key calldata key, Params calldata p, bytes calldata hookData) external returns (int256) {
+        require(unlocked && msg.sender == locker, "ManagerLocked");
+        require(initialized[keccak256(abi.encode(key.c0, key.c1, key.fee, key.ts, key.hooks))], "PoolNotInitialized");
+        swaps++; lastKey = key; lastParams = p; lastHookData = hookData;
+        require(p.amountSpecified < 0, "exact input only");
+        uint256 inAmt = uint256(-p.amountSpecified); if (consumeHalf) inAmt /= 2;
+        (address tin, address tout) = p.zeroForOne ? (key.c0, key.c1) : (key.c1, key.c0);
+        int256 out = int256(_out(tin, inAmt)); if (outOverride != 0) out = outOverride; if (hookSkim) out = out * 97 / 100;
+        if (reenterTarget != address(0)) { (reenterOk, ) = reenterTarget.call(reenterData); }
+        delta[tin] -= int256(inAmt); delta[tout] += out; _touch(tin); _touch(tout);
+        int128 dIn = -int128(int256(inAmt)); int128 dOut = int128(out);
+        (int128 a0, int128 a1) = p.zeroForOne ? (dIn, dOut) : (dOut, dIn);
+        return (int256(a0) << 128) | int256(uint256(uint128(a1)));
+    }
+    function sync(address c) external { synced = c; reserves = c == address(0) ? 0 : MockToken(c).balanceOf(address(this)); }
+    function settle() external payable returns (uint256 paid) {
+        require(unlocked, "ManagerLocked");
+        if (synced == address(0)) { paid = msg.value; delta[address(0)] += int256(paid); _touch(address(0)); }
+        else { require(msg.value == 0, "NonzeroNativeValue"); paid = MockToken(synced).balanceOf(address(this)) - reserves; delta[synced] += int256(paid); _touch(synced); }
+        synced = address(0); reserves = 0;
+    }
+    function take(address c, address to, uint256 amt) external {
+        require(unlocked, "ManagerLocked");
+        delta[c] -= int256(amt); _touch(c);
+        if (c == address(0)) { (bool ok, ) = to.call{value: amt}(""); require(ok, "native"); }
+        else MockToken(c).mint(to, amt);
+    }
+    receive() external payable {}
+}
+interface IUnlockCallback { function unlockCallback(bytes calldata) external returns (bytes memory); }
 
 contract Wallet { receive() external payable {} }
 
-/// A caller that reads the guard's view of its own lot from inside the ETH-refund hook (round-6 L-2: state must be final by then).
+/// A caller that reads the gate's view of its own lot from inside the ETH payment (state must be final by then).
 contract SpyWallet {
     GuardedSwapRH public g; address public tok; uint256 public seenTokens; uint256 public hooks;
     function set(GuardedSwapRH g_, address t) external { g = g_; tok = t; }

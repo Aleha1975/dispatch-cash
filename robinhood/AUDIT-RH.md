@@ -108,3 +108,21 @@ Why the fix stays outside the contract:
 | LOW-4 | Low | `token` not excluded against router/PoolManager/factories | Accepted (round 1 L-2, round 2 L-2) | All five revert on `balanceOf(address)` (verified on chain), so no state-changing call is reached. |
 | LOW-5 | Low | A dirty boolean return word panics in `abi.decode` instead of reaching `TransferFailed` / the approve retry | Accepted | The trade reverts either way and no state changes; the token is unsupported, as are other non-standard return conventions (Dispatch round 2 L-9). |
 | LOW-6 | Low | No cap on `costOf`/`ethIn` analogous to `MAX_LOT` | Accepted | Unreachable: checked arithmetic, and buys are capped at 0.05 ETH/h per account. |
+
+## v5 — a product change, not an audit response (round 5 scope)
+
+The owner's decision of 23 Oct 2026: stop paying the Robinhood router's 1% on every swap in and out (~2% per round trip, the whole edge of most copied trades and ten times the pool cost of a tokenized-stock round trip). v5 removes the router and swaps against the pools directly. Two changes, nothing else:
+
+| | v4 | v5 |
+| --- | --- | --- |
+| Execution | the gate encodes one call to the router (`0x65050a9b…`, an upgradeable proxy), approves it the exact input on a sale, measures what came back | the gate calls each hop itself: a v3 pool's `swap` with the gate's own `uniswapV3SwapCallback` (only the pool in flight, once, only the input token, at most the input — transient storage), or the PoolManager's `unlock` → the gate's `unlockCallback` (only the PoolManager, only during the gate's own unlock) → `swap` exact-input → `sync`/`settle` → `take`. Every hop must consume exactly its input; the PoolManager's answer must be exactly "input owed in full, output positive". No allowance is ever granted. |
+| Hooks | any (the router did not filter) | zero, or no swap-time return-delta permission, or one of ≤ 4 hooks fixed at deployment (`BadHook` otherwise) |
+| Budget base | `costOf` (open lots at cost) | `costOf + account.balance`, read once when the sale starts — Base v16's correction, for the same reason (an account holding mostly ETH could not sell one crashed position) |
+| Interface | `buy(token, minOut, deadline, hops)`, `sell(...)`, `exit(...)` with the 7-field `Hop` | unchanged (the engine's encoding is reused); constructor `(weth, poolManager, v3Factories, tickKeyed, hooks, guardian, exitKey, limits…)` |
+| Gone with the router | round 1 F-4 (allowance survival), round 3 F7 (non-1:1 allowance), round 3 F8 router revert data, router upgrade/pause/fee residuals | — |
+
+Kept from v4 exactly: lots and `_trim`/`_settle` rounding, the hourly windows, the guardian and its bounds, the cold key's three powers and their caller checks, the deadline, the factory check (`getPool`, first word only), the WETH-residue check, state final before ETH leaves. Revert data: a pool's or the PoolManager's revert is passed on as it came, cut to 256 bytes (so the gate's own errors raised inside a callback reach the caller); success data is cut to 64 bytes.
+
+Seams examined before submission: a third contract (a token's transfer hook, a v4 hook) calling either callback mid-swap — refused by caller and transient checks (tests); a pool calling the callback early and again — the first call consumes the permission, the second reverts; ETH sent to the gate mid-buy — returned to the account and lowers the recorded cost, or, during a native-input hop, breaks the full-fill measure and reverts; a partially filled middle hop — `PartialFill` (the per-hop check is the only one that catches it; mutation-tested); a fee-on-transfer token — cannot be paid into a pool or the PoolManager in full, the sale reverts, the lot stays (sold from the wallet, as before).
+
+**Tests (v5):** 51 unit tests, 11 invariants (two suites, 256 runs × 500 calls), 13 fork tests at the Robinhood Chain head (round trips through all three v3 factories, a native v4 pool with an allowed hook, a 3-hop v3→v3→v4 route through the launchpad hook, NVDA and TSLA via USDG; exit under pause; fake and wrong pools; callbacks from outside; limits; the genuine sink). Mutation checks listed in DESIGN-RH.md. Measured on the fork, same block, same pools, 0.01 ETH ticket: the round trip costs 1.99% vs 3.94% through the router (BONER), 0.12% vs 2.11% (NVDA), 0.62% vs 2.60% (TSLA), 3.09% vs 5.02% (QUBIT, 3 hops).
