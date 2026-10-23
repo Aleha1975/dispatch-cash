@@ -4,13 +4,13 @@
 
 **Threat model.** The executor key leaks. The attacker can call `buy`/`sell`/`announce` on behalf of every client account and can build any router calldata. The attacker cannot change the delegation, cannot withdraw and cannot call the router directly. The guardian key (pause only) may also leak. The router and its executor are trusted infrastructure; the tokens are not.
 
-## Rules (v15)
+## Rules (v16)
 
 | Rule | What it enforces |
 | --- | --- |
 | Recipient | Everything a swap returns — tokens, ETH, change — is paid to the calling account. There is no recipient parameter; the router calldata is decoded on-chain and must name the account (buy) or this contract (sale, forwarded after settlement). |
 | Route check | Only `swap(SwapExecutionParams)` of the pinned router, run by the pinned executor; of the router's `flags` only bit `0x200` may be set (every bit the router dispatches on is refused); no fee receivers, no `permit`; declared tokens and amounts must match; a buy may not hand its input to any `srcReceivers`. |
-| Loss budget | Every buy is recorded at cost. Selling below cost is a loss; losses per account must stay within 30% of the account's cost basis, and what is outstanding fades linearly over a week from its last booking — nothing but time or the cold key's unlock moves it. A sale beyond the budget does not go through. Sales at or above cost are never limited: taking profit is never delayed, one position crashing is far inside the budget, a thief dumping everything hits it within minutes. |
+| Loss budget | Every buy is recorded at cost. Selling below cost is a loss; losses per account must stay within 30% of the account's value at cost (its ETH plus the cost of its open lots), and what is outstanding fades linearly over a week from its last booking — nothing but time or the cold key's unlock moves it. A sale beyond the budget does not go through. Sales at or above cost are never limited: taking profit is never delayed, one position crashing is inside the budget while it is a small part of the account, a thief dumping everything at once books at most about 23% of the account. |
 | Only the lot | A sale can cover at most the tokens this contract saw bought for the account; the lot is reconciled with the balance at every call and closes when the account holds nothing. |
 | Rate limits | Per account and hour: 12 sales, 0.3 ETH into buys, 1 ETH out of sales. The delegation adds 0.5 ETH per 24 h. |
 | Guardian | Pause the executor — buys and sells — for at most 7 days, then a day's cooldown. Never blocks `exit()` or the owner's own wallet. No other power. |
@@ -24,7 +24,7 @@ Two watchers — one next to the engine, one on separate infrastructure with a m
 
 ## What a stolen key can still do (documented residuals)
 
-- Trade badly within the loss budget and the hourly budgets: at most 0.3 ETH per hour into buys with no price reference for a buy (0.5 ETH per 24 h in the delegation), and sales below cost up to 30% of the account's cost basis per week.
+- Trade badly within the loss budget and the hourly budgets: at most 0.3 ETH per hour into buys with no price reference for a buy (0.5 ETH per 24 h in the delegation), and sales below cost up to 30% of the account's value at cost (ETH plus open lots) per week. On an account that holds mostly ETH this budget exceeds the cost of its positions, so the positions themselves are not protected beyond the share of the account; the watchers' pause is what ends such a drain.
 - The budget is relative to what was paid, not to the market: a position that has appreciated can be sold at cost without touching it.
 - A route may deliver the sold tokens to a pool the aggregator chose; a planted sink cannot be told apart on-chain, and is bounded by the loss budget. An `exit` runs outside the budget, so the exit transaction is built on the operator's side with an independent quote and is not signed below 90% of it.
 - A token whose balance stops answering keeps its last known lot; the gate never takes an unreadable balance as empty.
@@ -41,7 +41,7 @@ The client-facing wording. It names only what a client can verify on chain or in
 
 > **Your funds never leave your account.** Dispatch does not take custody. Each client runs their own smart account; the engine receives a narrowly scoped permission to trade on it — never to withdraw. Withdrawals are signed only by the client.
 >
-> **Every trade passes through an on-chain gate.** Dispatch trades through its own verified contract, GuardedSwap, which sits between the client account and the DEX aggregator. The gate enforces, on chain, what a trading key is allowed to do: swap proceeds can only be paid to the account that owns the position, only positions the gate saw bought can be sold, and every account has a loss budget — a bounded share of its cost basis per week that trades can lose. A trade outside these rules does not execute, regardless of who signed it. Even a full compromise of the trading key is therefore limited to a known, bounded loss — the gate limits damage; it does not promise there can be none. The source is public and verified; the current deployment is linked from the app.
+> **Every trade passes through an on-chain gate.** Dispatch trades through its own verified contract, GuardedSwap, which sits between the client account and the DEX aggregator. The gate enforces, on chain, what a trading key is allowed to do: swap proceeds can only be paid to the account that owns the position, only positions the gate saw bought can be sold, and every account has a loss budget — a bounded share of the account per week that trades can lose. A trade outside these rules does not execute, regardless of who signed it. Even a full compromise of the trading key is therefore limited to a known, bounded loss — the gate limits damage; it does not promise there can be none. The source is public and verified; the current deployment is linked from the app.
 >
 > **Independent review.** The gate has gone through repeated rounds of independent security review, with every finding either fixed or documented; the audit log, including what was found and how it was answered, is published alongside the code.
 >

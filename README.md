@@ -6,11 +6,11 @@ A one-purpose, immutable gate between a client's MetaMask smart account and the 
 
 The client grants its trading executor the right to call this contract instead of the router. Whatever a swap returns goes to the calling account and nobody else: there is no recipient parameter.
 
-## Rules (v15)
+## Rules (v16)
 
 1. **Recipient.** All swap output, change and unsold input are swept to `msg.sender`. Output is measured as the caller's balance change (buy) or the ETH that reached this contract (sale, forwarded after settlement) and must be at least `minOut` (> 0). ETH is accepted only while a trade is in progress.
 2. **Route check.** Only `swap(SwapExecutionParams)` of the pinned router, run by the pinned executor; of `flags` only bit `0x200` may be set (the one bit live routes carry and the router's verified source never reads; every bit the router dispatches on is refused); `approveTarget` zero or the executor, `dstReceiver` this contract (a buy may also name the caller), no fee receivers, no `permit`, declared tokens and amounts must match, the router's `minReturnAmount` at least our `minOut`; a buy may not name any `srcReceivers`, a sale's `srcReceivers` (at most 8) must be contracts other than the caller and this contract with amounts summing to at most the input. Anything else reverts `BadRoute`.
-3. **Loss budget.** Every buy is recorded in the account's lot for that token at cost. A sale that returns less than the cost of the tokens it gives up is a loss; losses accumulate per account and must stay within 30% (`BUDGET_BPS`) of the account's total cost basis, refilling linearly over a week (`REFILL`). A sale that would exceed the budget does not go through (`BudgetExceeded`). Sales at or above cost never touch the budget, so taking profit is never delayed; a crash of one position is far inside the budget; a thief dumping everything hits it within minutes.
+3. **Loss budget.** Every buy is recorded in the account's lot for that token at cost. A sale that returns less than the cost of the tokens it gives up is a loss; losses accumulate per account and must stay within 30% (`BUDGET_BPS`) of the account's value at cost — the native ETH it holds plus the cost of its open lots, read when the sale starts — refilling linearly over a week (`REFILL`). A sale that would exceed the budget does not go through (`BudgetExceeded`). Sales at or above cost never touch the budget, so taking profit is never delayed; a crash of one position that is a small part of the account is inside the budget; a thief dumping everything at once books at most 30%/1.3 ≈ 23% of the account, because each loss also shrinks the base. (v15 measured the budget against the open lots alone, so an account holding mostly ETH could not sell its one small position after an ordinary crash.)
 4. **Only the lot is for sale.** `sell()` handles at most the tokens this contract saw bought for the account (`NotInLot`). Tokens that reached the account any other way are the owner's to sell directly. The lot shrinks by what the account gave up, never exceeds what the account holds (tokens the owner moved out leave the lot pro rata, as if sold at cost) and closes when the account holds none of the token.
 5. **Rate limit.** Per account and fixed hour window: at most 12 sales, 0.3 ETH of net ETH spent on buys and 1 ETH taken out of sales (deployment parameters). A burst at the window edge can reach twice the limit across two windows. The delegation adds 0.5 ETH per 24 h.
 6. **Guardian.** Pause the executor — buys and sells — for at most 7 days, then a day of cooldown. Never blocks `exit()` or the owner's own wallet. No other power.
@@ -25,6 +25,7 @@ No owner, no upgrade path, no funds kept between calls.
 
 | | |
 | --- | --- |
+| GuardedSwap v16 | not deployed (audit round 15) |
 | GuardedSwap v15 (current) | `0x2c894b3a726b49d9e68e71d548157964e5e0fbb6` |
 | GuardedSwap v14 | `0x257543fec106428c550fd3c5b375eba8d71bda5e` |
 | GuardedSwap v13 | `0xdbeeec5d37e7f73360e344b8fe24139232a112e6` |

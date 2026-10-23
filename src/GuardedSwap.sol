@@ -11,11 +11,16 @@ pragma solidity ^0.8.26;
 ///         Guards on top of the recipient rule, because an executor key that is stolen could still trade badly:
 ///         1. Loss budget. Every buy is recorded in the account's lot for that token at cost. A sale that returns less
 ///            than the cost of the tokens it gives up is a LOSS; losses accumulate per account and must stay within
-///            BUDGET_BPS of the account's total cost basis, refilling linearly over REFILL. A sale beyond the budget does
-///            not go through. What is outstanding fades linearly over REFILL from the last booking -- nothing but time (or the
+///            BUDGET_BPS of the account's value at cost -- the native ETH it holds plus the cost of its open lots, read
+///            when the sale starts -- refilling linearly over REFILL. A sale beyond the budget does not go through.
+///            (v16: the base was the cost of the open lots alone, so an account holding mostly ETH and one small position
+///            could not sell that position after an ordinary crash; the gate's own trades move value between the two terms
+///            and leave the base unchanged, a loss lowers it by exactly the loss.) What is outstanding fades linearly over REFILL from the last booking -- nothing but time (or the
 ///            cold key's unlock) moves it: new buys, closed lots or a changed base neither speed it up nor freeze it.
 ///            Sales at or above cost never touch the budget, so taking profit is never delayed; a market
-///            crash of one position is far inside the budget; a thief dumping everything hits it within minutes.
+///            crash of one position is inside the budget whenever the position is a small part of the account; a thief
+///            dumping everything at once books at most BUDGET_BPS / (1 + BUDGET_BPS) of the base, because every loss also
+///            shrinks the base it is measured against.
 ///         2. Only the lot is for sale. sell() handles at most the tokens this contract saw bought for the account;
 ///            tokens that reached the account any other way (airdrops, positions opened before this gate) are not the
 ///            executor's to sell -- the account owner sells them directly. The lot shrinks by what the account gave up,
@@ -40,7 +45,10 @@ pragma solidity ^0.8.26;
 ///         7. Residual, by design: a sale's srcReceivers are chosen by the aggregator (often the first pool) and cannot be
 ///            told apart from a planted sink on-chain; what such a sink can take is bounded by the loss budget. A buy has
 ///            no price reference other than the hourly ETH budget. The budget is relative to what was paid, not to the
-///            market: a position that has appreciated can be sold at cost without touching the budget.
+///            market: a position that has appreciated can be sold at cost without touching the budget. Because the base
+///            includes the account's ETH, an account that holds mostly ETH exposes its positions in full to a stolen
+///            executor key (the budget then exceeds their cost); the bound is a share of the account, not of each position.
+///            ETH sent to the account raises the base; only the owner can take ETH out, so whoever sends it leaves it there.
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
 }
@@ -56,7 +64,7 @@ contract GuardedSwap {
     address public immutable ROUTER;
     address public immutable EXECUTOR;                // the router's aggregation executor the calldata must call
     address public immutable EXIT_KEY;                // the operator's cold key: unlock and exit, nothing else
-    uint256 public constant BUDGET_BPS = 3000;      // losses may reach 30% of the account's cost basis...
+    uint256 public constant BUDGET_BPS = 3000;      // losses may reach 30% of the account's value at cost (ETH + open lots)...
     uint256 public constant REFILL = 7 days;        // ...and that room comes back linearly over a week
     uint256 public constant PAUSE_MAX = 7 days;     // a pause lifts itself after this
     uint256 public constant PAUSE_COOLDOWN = 1 days; // and a new pause may start only this long after the last one ended
@@ -67,8 +75,8 @@ contract GuardedSwap {
 
     struct Basis { uint256 tokens; uint256 ethIn; }     // the lot: tokens held and their running cost
     mapping(address => mapping(address => Basis)) public basis;
-    mapping(address => uint256) public costOf;        // the account's total cost basis across lots (the budget's base)
-    struct Loss { uint256 amount; uint64 at; }         // losses outstanding as of `at`; the whole amount fades linearly over REFILL from then (v15: no
+    mapping(address => uint256) public costOf;        // the account's total cost basis across lots (with its ETH: the budget's base)
+    struct Loss { uint256 amount; uint64 at; }         // losses outstanding as of `at`; the whole amount fades linearly over REFILL from then (since v15: no
                                                         // rate, no budget in the decay -- a later buy, sale or closed lot cannot speed it up or freeze it)
     mapping(address => Loss) public loss;
 
@@ -194,8 +202,13 @@ contract GuardedSwap {
         if (w.sellEth + ethOut > MAX_SELL_ETH_PER_HOUR) revert RateLimited(); w.sellEth += uint128(ethOut);
     }
     function _ceil(uint256 a, uint256 b) private pure returns (uint256) { return (a + b - 1) / b; }
-    /// @dev The account's budget: BUDGET_BPS of its cost basis. Losses decay towards zero at budget / REFILL per second.
-    function _budget(address account) private view returns (uint256) { return costOf[account] * BUDGET_BPS / 10000; }
+    /// @dev The budget's base, the one definition every reader uses: the account's native ETH plus the cost of its open
+    ///      lots. A buy moves ETH into a lot at cost and a sale at cost moves it back, so the gate's own trades leave the
+    ///      base where it was; a loss lowers it by the loss, a profit raises it by the profit, a deposit or a withdrawal
+    ///      (the owner's alone) by its amount.
+    function _base(address account) private view returns (uint256) { return costOf[account] + account.balance; }
+    /// @dev The account's budget: BUDGET_BPS of its base. What is outstanding decays on its own clock (_decayed), not the budget's.
+    function _budget(address account) private view returns (uint256) { return _base(account) * BUDGET_BPS / 10000; }
     function _decayed(address account) private view returns (uint256) {
         Loss storage l = loss[account];
         if (l.amount == 0) return 0;
@@ -297,6 +310,7 @@ contract GuardedSwap {
         if (minOut == 0) revert MinOutZero();
         if (token.code.length == 0) revert NotAContract();
         { uint256 lot = _trim(token).tokens; if (amount > lot) revert NotInLot(lot, amount); }   // only what this gate saw bought, and still holds
+        uint256 budget = isExit ? 0 : _budget(msg.sender);          // v16: measured once, on the reconciled lot, before anything moves (the router call cannot raise it)
         if (!isExit) _countSell(0);
         uint256 tokBase = IERC20(token).balanceOf(address(this));   // tokens that were here before this call stay untouched
         uint256 got = _pull(token, msg.sender, amount);             // what actually arrived (fee-on-transfer aware)
@@ -310,20 +324,20 @@ contract GuardedSwap {
         if (out < minOut) revert BelowMinOut(out, minOut);
         if (!isExit) _countSell(out);
         if (back >= amount) revert ZeroAmount();                    // nothing was sold: no cost released, no slot spent
-        _settle(token, amount - back, out, isExit);                 // the lot shrinks by what the account gave up (pull-side fees included)
+        _settle(token, amount - back, out, isExit, budget);         // the lot shrinks by what the account gave up (pull-side fees included)
         if (out > 0) _sendEth(msg.sender, out);                     // state is final before any ETH leaves
     }
 
     /// @dev Release the cost of what was sold; a sale below that cost is a loss charged to the account's budget (unless it
     ///      is the cold key's exit). The lot is reduced pro rata and closed when the account holds none of the token.
-    function _settle(address token, uint256 sold, uint256 out, bool isExit) private {
+    function _settle(address token, uint256 sold, uint256 out, bool isExit, uint256 budget) private {
         Basis storage b = basis[msg.sender][token];
         if (sold > b.tokens) revert NotInLot(b.tokens, sold);      // cannot happen (checked on entry); kept as the invariant
         uint256 cost = b.ethIn * sold / b.tokens;                   // released cost rounded DOWN: the remainder's average never drops, never zeroes
         uint256 added;
         if (!isExit && out < cost) {
             added = cost - out;
-            uint256 carried = _decayed(msg.sender); uint256 total = carried + added; uint256 budget = _budget(msg.sender);   // the budget is measured before this sale's cost leaves the base
+            uint256 carried = _decayed(msg.sender); uint256 total = carried + added;   // against the budget measured when the sale started
             if (total > budget) revert BudgetExceeded(total, budget);
             // what is outstanding now fades over REFILL from now: booking more resets the clock on a larger amount (slower overall),
             // nothing else moves it -- not new buys, not closed lots, not a shrinking base (round 11 C-1, round 13 F-4)
