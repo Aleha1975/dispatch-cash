@@ -45,6 +45,9 @@ contract ForkTest is Test {
     address constant QUBIT = 0xd1E92BA7c7355c2698addD894919Cba198601E18; address constant X2E08 = 0x2e0847E8910a9732eB3fb1bb4b70a580ADAD4FE3; address constant HOOK_4E34 = 0x4e3468951D49f2EEa976eD0D6e75fFCb44a9a544;
     address constant PONS = 0x39dBED3a2bd333467115dE45665cC57F813C4571;
     address constant HOOK_48B8 = 0x48B8F6AD3A1b4aA477314c9a23035b8F84dDe8cc;   // return-delta hook, not on the list
+    address constant EXECUTOR = 0x049c1F8e823078F175C0E316cf5050F5B5b1C20b;   // the AlphaCatch executor: tx.origin of every engine trade
+    address constant LAUNCH_TOKEN = 0x41BE7C29550BD82aF52F416E9628817a6c4813fb; address constant LAUNCH_HOOK = 0x63BAA44E25C7d290aC0AbBe85e83b1f7AEe6c144;   // RH Launch: per-token hook, registry-gated sale tax
+    address constant LAUNCH_REGISTRY = 0x035eFBa8A38757438eD439C07337a81A709e7811;
     GuardedSwapRH g; SmartAccount acct;
 
     struct RouterHop { uint8 version; address tokenIn; address tokenOut; address pool; uint24 fee; int24 tickSpacing; address hooks; bytes hookData; address poolManager; bytes32 extra; }
@@ -149,6 +152,33 @@ contract ForkTest is Test {
     function test_fork_stock_nvda_ticket_sizes() public {
         _compare("NVDA at 0.002 ETH", NVDA, 0.002 ether, arr2(v3(WETH, USDG, WETH_USDG_001, 100), v3(USDG, NVDA, NVDA_USDG_005, 500)));
         _compare("NVDA at 0.05 ETH", NVDA, 0.05 ether, arr2(v3(WETH, USDG, WETH_USDG_001, 100), v3(USDG, NVDA, NVDA_USDG_005, 500)));
+    }
+
+    /// (24.10) RH Launch tokens sit in v4 pools whose per-token hook (address bits ...144: afterSwap + afterSwapReturnsDelta)
+    /// checks tx.origin against a registry after a sale and keeps ~99.9% of the proceeds from unlisted wallets. The
+    /// executor is not listed. v5 refuses such hooks by the hook rule (return-delta bit, not on the deployed list).
+    function test_fork_rh_launch_taxing_hook_refused() public {
+        (bool ok, bytes memory r) = LAUNCH_REGISTRY.staticcall(abi.encodeWithSelector(0xc683630d, EXECUTOR));
+        assertTrue(ok); assertEq(abi.decode(r, (uint256)), 0);                                           // the executor is not on the list
+        assertGt(uint160(LAUNCH_HOOK) & 0x4, 0);                                                          // AFTER_SWAP_RETURNS_DELTA
+        vm.prank(address(acct), EXECUTOR); vm.expectRevert(GuardedSwapRH.BadHook.selector);
+        g.buy{value: 0.001 ether}(LAUNCH_TOKEN, 1, block.timestamp, arr(v4(WETH, LAUNCH_TOKEN, 100, 1, LAUNCH_HOOK)));
+    }
+    /// the same check for the two hooks on the deployed list, with the executor as tx.origin (as in production): the
+    /// round trip keeps what the pool fee and the hook's own fee leave, nothing like 99.9% is taken
+    function _originRoundTrip(address token, GuardedSwapRH.Hop[] memory h) internal returns (uint256 out) {
+        vm.prank(address(acct), EXECUTOR); uint256 got = g.buy{value: 0.01 ether}(token, 1, block.timestamp, h);
+        acct.exec(token, abi.encodeWithSelector(0x095ea7b3, address(g), got));
+        vm.prank(EXECUTOR, EXECUTOR); out = abi.decode(acct.exec(address(g), _sd(token, got, rev(h))), (uint256));
+    }
+    function test_fork_listed_hooks_do_not_tax_the_executor() public {
+        uint256 a = _originRoundTrip(SGT, arr(v4(address(0), SGT, 0, 200, HOOK_E5)));
+        GuardedSwapRH.Hop[] memory q = new GuardedSwapRH.Hop[](3);
+        q[0] = v3(WETH, USDG, WETH_USDG_001, 100); q[1] = v3(USDG, X2E08, 0x34D0dC122CF9A8Eb296fC5e0D3A233625D7d19b7, 500); q[2] = v4(X2E08, QUBIT, 8388608, 8, HOOK_4E34);
+        uint256 b = _originRoundTrip(QUBIT, q);
+        emit log_named_decimal_uint("SGT round trip back, executor as origin (of 0.01)", a, 18);
+        emit log_named_decimal_uint("QUBIT round trip back, executor as origin (of 0.01)", b, 18);
+        assertGt(a, 0.009 ether); assertGt(b, 0.009 ether);
     }
 
     // ---- exit, attacks ----
