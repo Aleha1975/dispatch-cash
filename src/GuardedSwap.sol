@@ -49,6 +49,12 @@ pragma solidity ^0.8.26;
 ///            includes the account's ETH, an account that holds mostly ETH exposes its positions in full to a stolen
 ///            executor key (the budget then exceeds their cost); the bound is a share of the account, not of each position.
 ///            ETH sent to the account raises the base; only the owner can take ETH out, so whoever sends it leaves it there.
+///         8. v17: the base is the account's ETH plus the cost of ALL its open lots, each reconciled with what the account still
+///            holds before the budget is read (v16 reconciled only the token being traded, so the stale cost of a lot the owner
+///            had moved out still counted). The open lots are kept in a per-account registry of at most MAX_LOTS tokens. A buy
+///            is charged only what left the account for good: ETH that came back to the account itself during the buy is not
+///            cost. Residual: a lot whose token stops answering balanceOf (or needs more than BALANCE_GAS to) keeps its last
+///            reconciled cost in the base until it answers again.
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
 }
@@ -72,6 +78,8 @@ contract GuardedSwap {
     uint256 public constant MAX_RECEIVERS = 8;      // srcReceivers a sale route may name
     uint256 public constant MAX_UNLOCK = 64;        // accounts one unlock() may clear
     uint256 public constant MAX_LOT = 1e40;         // raw token units a lot may hold (keeps the arithmetic far from overflow)
+    uint256 public constant MAX_LOTS = 32;          // v17: open lots per account (every sale reconciles all of them before it reads the base)
+    uint256 public constant BALANCE_GAS = 100_000;  // v17: gas one balanceOf read may use; a token that needs more (or burns it) reads as unreadable
 
     struct Basis { uint256 tokens; uint256 ethIn; }     // the lot: tokens held and their running cost
     mapping(address => mapping(address => Basis)) public basis;
@@ -93,6 +101,8 @@ contract GuardedSwap {
     uint256 public pauseEnd;                           // when the last pause ended (0 = never paused, or paused now)
 
     uint256 private _lock;
+    mapping(address => address[]) private _lots;      // v17: the tokens of the account's open lots (basis tokens > 0), unordered (declared last: earlier slots keep v16's layout)
+    mapping(address => mapping(address => uint256)) private _lotIdx;   // position in _lots + 1 (0 = no open lot)
 
     event Bought(address indexed account, address indexed token, uint256 ethIn, uint256 tokensOut);
     event Sold(address indexed account, address indexed token, uint256 tokensIn, uint256 ethOut, uint256 lossAdded, bool exit);
@@ -122,6 +132,7 @@ contract GuardedSwap {
     error TooLarge();
     error NotPendingGuardian();
     error NoDirectEth();
+    error TooManyLots();
 
     constructor(address router, address executor, address guardian_, address exitKey, uint256 maxSellsPerHour, uint256 maxBuyEthPerHour, uint256 maxSellEthPerHour) {
         require(router != address(0) && executor != address(0) && guardian_ != address(0) && exitKey != address(0), "zero address");
@@ -202,13 +213,18 @@ contract GuardedSwap {
         if (w.sellEth + ethOut > MAX_SELL_ETH_PER_HOUR) revert RateLimited(); w.sellEth += uint128(ethOut);
     }
     function _ceil(uint256 a, uint256 b) private pure returns (uint256) { return (a + b - 1) / b; }
-    /// @dev The budget's base, the one definition every reader uses: the account's native ETH plus the cost of its open
-    ///      lots. A buy moves ETH into a lot at cost and a sale at cost moves it back, so the gate's own trades leave the
-    ///      base where it was; a loss lowers it by the loss, a profit raises it by the profit, a deposit or a withdrawal
-    ///      (the owner's alone) by its amount.
+    /// @dev The budget's base: the account's native ETH plus the cost of its open lots, every lot reconciled with what the
+    ///      account holds. A buy moves ETH into a lot at cost and a sale at cost moves it back, so the gate's own trades leave
+    ///      the base where it was; a loss lowers it by the loss, a profit raises it by the profit, a deposit or a withdrawal
+    ///      (the owner's alone) by its amount, tokens the owner moved out by their cost. A sale reads it from storage right
+    ///      after _trimAll, when costOf is exactly that sum; the views compute the same sum through _trimmed without writing.
     function _base(address account) private view returns (uint256) { return costOf[account] + account.balance; }
-    /// @dev The account's budget: BUDGET_BPS of its base. What is outstanding decays on its own clock (_decayed), not the budget's.
-    function _budget(address account) private view returns (uint256) { return _base(account) * BUDGET_BPS / 10000; }
+    function _quotedBase(address account) private view returns (uint256 b) {
+        b = account.balance; address[] storage a = _lots[account];
+        for (uint256 i = 0; i < a.length; i++) { (, uint256 ethIn) = _trimmed(account, a[i]); b += ethIn; }
+    }
+    /// @dev The budget on a base: BUDGET_BPS of it. What is outstanding decays on its own clock (_decayed), not the budget's.
+    function _budgetOn(uint256 base) private pure returns (uint256) { return base * BUDGET_BPS / 10000; }
     function _decayed(address account) private view returns (uint256) {
         Loss storage l = loss[account];
         if (l.amount == 0) return 0;
@@ -217,18 +233,37 @@ contract GuardedSwap {
         return back >= l.amount ? 0 : l.amount - back;
     }
     /// @notice Losses on the account's record right now, and the budget they must stay within.
-    function budgetOf(address account) external view returns (uint256 lost, uint256 budget) { return (_decayed(account), _budget(account)); }
+    function budgetOf(address account) external view returns (uint256 lost, uint256 budget) { return (_decayed(account), _budgetOn(_quotedBase(account))); }
 
     /// @dev The lot never exceeds what the account holds: tokens the owner moved out (or a negative rebase) leave the lot
     ///      pro rata, as if sold at cost (rounded so the average never drops). An empty balance closes the lot. Tokens that
     ///      arrive before the next call are indistinguishable from the lot and carried at its cost.
-    function _trim(address token) private returns (Basis storage b) {
-        b = basis[msg.sender][token];
-        if (b.tokens == 0) return b;
-        (bool ok, uint256 bal) = _balanceOf(token, msg.sender);
-        if (!ok) return b;                                          // unreadable balance: keep the last lot; the sale or the cold key's exit must not die here (round 11, H-1)
-        if (bal == 0) { costOf[msg.sender] -= b.ethIn; delete basis[msg.sender][token]; return b; }
-        if (bal < b.tokens) { uint256 keep = _ceil(b.ethIn * bal, b.tokens); costOf[msg.sender] -= b.ethIn - keep; b.ethIn = keep; b.tokens = bal; }
+    function _trim(address account, address token) private {
+        Basis storage b = basis[account][token];
+        if (b.tokens == 0) return;
+        (bool ok, uint256 bal) = _balanceOf(token, account);
+        if (!ok) return;                                            // unreadable balance: keep the last lot; the sale or the cold key's exit must not die here (round 11, H-1)
+        if (bal == 0) { _closeLot(account, token); return; }
+        if (bal < b.tokens) { uint256 keep = _ceil(b.ethIn * bal, b.tokens); costOf[account] -= b.ethIn - keep; b.ethIn = keep; b.tokens = bal; }
+    }
+    /// @dev v17: every open lot of the account reconciled, so the base a sale reads carries no cost of tokens the account no
+    ///      longer holds (round 15, H). Walked from the end: closing a lot moves the last entry, which is already done.
+    ///      Bounded by MAX_LOTS reads of at most BALANCE_GAS each; a token that does not answer is skipped, never fatal.
+    function _trimAll(address account) private {
+        address[] storage a = _lots[account];
+        for (uint256 i = a.length; i > 0; i--) _trim(account, a[i - 1]);
+    }
+    /// @dev The registry follows the lots: an entry is added when a lot opens and removed wherever one is deleted.
+    function _openLot(address account, address token) private {
+        if (_lotIdx[account][token] != 0) return;
+        if (_lots[account].length >= MAX_LOTS) { _trimAll(account); if (_lots[account].length >= MAX_LOTS) revert TooManyLots(); }   // lots the owner emptied free their slots first
+        _lots[account].push(token); _lotIdx[account][token] = _lots[account].length;
+    }
+    function _closeLot(address account, address token) private {
+        costOf[account] -= basis[account][token].ethIn; delete basis[account][token];
+        uint256 i = _lotIdx[account][token]; if (i == 0) return;
+        address[] storage a = _lots[account]; address last = a[a.length - 1];
+        a[i - 1] = last; _lotIdx[account][last] = i; a.pop(); delete _lotIdx[account][token];
     }
     /// @dev What _trim would make of the lot, without writing: the views quote the reconciled lot.
     function _trimmed(address account, address token) private view returns (uint256 tokens, uint256 ethIn) {
@@ -269,21 +304,24 @@ contract GuardedSwap {
         if (msg.value == 0) revert ZeroAmount();
         if (minOut == 0) revert MinOutZero();
         if (token.code.length == 0) revert NotAContract();
-        _trim(token);                                               // the lot is reconciled with what the account holds before this buy
+        _trim(msg.sender, token);                                   // the lot is reconciled with what the account holds before this buy
+        if (basis[msg.sender][token].tokens == 0) _openLot(msg.sender, token);   // a new lot takes a registry slot (TooManyLots past MAX_LOTS)
         _checkRoute(routerData, K_ETH, token, msg.value, minOut);
         if (msg.value > MAX_BUY_ETH_PER_HOUR) revert RateLimited();   // the net spend is counted below, once known
         uint256 ethBase = address(this).balance - msg.value;        // ETH that was here before this call stays untouched
         uint256 tokBase = IERC20(token).balanceOf(address(this));   // tokens that were here before this call stay untouched
         (bool okB, uint256 before) = _balanceOf(token, msg.sender);
         if (!okB) revert BelowMinOut(0, minOut);                   // a token that will not report the account's balance cannot be bought (round 12, L-2)
+        uint256 home = msg.sender.balance;                          // v17: the account's ETH once msg.value has left it...
         _callRouter(routerData, msg.value);
         _sweepToken(token, tokBase);
-        (bool okA, uint256 after_) = _balanceOf(token, msg.sender);
-        out = okA && after_ > before ? after_ - before : 0;
+        home = msg.sender.balance > home ? msg.sender.balance - home : 0;   // ...and what came back to it during the router call and the token transfer, before any change is forwarded
+        { (bool okA, uint256 after_) = _balanceOf(token, msg.sender); out = okA && after_ > before ? after_ - before : 0; }
         if (out < minOut) revert BelowMinOut(out, minOut);
         uint256 change = address(this).balance - ethBase;           // unspent part of msg.value, returned to the caller last
         if (change > msg.value) revert RouterOverpaid();
         uint256 spent = msg.value - change;
+        spent = home >= spent ? 0 : spent - home;                   // v17: ETH that came straight back to the account was not spent (round 15, M)
         if (spent == 0) revert ZeroAmount();                        // a free lot would have no cost to protect
         _countBuy(spent);                                           // hourly budget counts what was actually spent
         Basis storage b = basis[msg.sender][token];
@@ -309,8 +347,9 @@ contract GuardedSwap {
         if (amount == 0) revert ZeroAmount();
         if (minOut == 0) revert MinOutZero();
         if (token.code.length == 0) revert NotAContract();
-        { uint256 lot = _trim(token).tokens; if (amount > lot) revert NotInLot(lot, amount); }   // only what this gate saw bought, and still holds
-        uint256 budget = isExit ? 0 : _budget(msg.sender);          // v16: measured once, on the reconciled lot, before anything moves (the router call cannot raise it)
+        _trimAll(msg.sender);                                       // v17: every lot reconciled -- the exit too, so the books stay true; it still ignores the budget
+        { uint256 lot = basis[msg.sender][token].tokens; if (amount > lot) revert NotInLot(lot, amount); }   // only what this gate saw bought, and still holds
+        uint256 budget = isExit ? 0 : _budgetOn(_base(msg.sender)); // measured once, on the reconciled lots, before anything moves (the router call cannot raise it)
         if (!isExit) _countSell(0);
         uint256 tokBase = IERC20(token).balanceOf(address(this));   // tokens that were here before this call stay untouched
         uint256 got = _pull(token, msg.sender, amount);             // what actually arrived (fee-on-transfer aware)
@@ -345,17 +384,19 @@ contract GuardedSwap {
         }
         b.ethIn -= cost; b.tokens -= sold; costOf[msg.sender] -= cost;
         (bool okb, uint256 left) = _balanceOf(token, msg.sender);
-        if (b.tokens == 0 || (okb && left == 0)) { costOf[msg.sender] -= b.ethIn; delete basis[msg.sender][token]; }   // full exit (an unreadable balance is not taken as empty)
+        if (b.tokens == 0 || (okb && left == 0)) _closeLot(msg.sender, token);   // full exit (an unreadable balance is not taken as empty)
         emit Sold(msg.sender, token, sold, out, added, isExit);
     }
 
     /// @notice The lot as the next call will see it: tokens still held and their cost.
     function lotOf(address account, address token) external view returns (uint256 tokens, uint256 ethIn) { return _trimmed(account, token); }
+    /// @notice The tokens of the account's open lots as recorded (a lot the next call would find empty is still listed).
+    function lotsOf(address account) external view returns (address[] memory) { return _lots[account]; }
     /// @notice The lowest ETH a sale of `amount` of `token` would accept right now without exceeding the budget (0 = any, or not in the lot).
     function floorFor(address account, address token, uint256 amount) external view returns (uint256) {
         (uint256 tokens, uint256 ethIn) = _trimmed(account, token);
         if (tokens == 0 || amount > tokens) return 0;
-        uint256 cost = ethIn * amount / tokens; uint256 room = _budget(account); uint256 lost = _decayed(account);
+        uint256 cost = ethIn * amount / tokens; uint256 room = _budgetOn(_quotedBase(account)); uint256 lost = _decayed(account);   // v17: the base a sale would read (round 15, L)
         room = room > lost ? room - lost : 0;
         return cost > room ? cost - room : 0;
     }
@@ -375,11 +416,17 @@ contract GuardedSwap {
         (bool ok2, uint256 after_) = _balanceOf(token, msg.sender);
         delivered = ok2 && after_ >= before ? after_ - before : held;   // measured on the account, as buy() does (round 11, M-1): a fee on the way out shrinks what came back
     }
-    /// @dev balanceOf that reports whether the token answered instead of reverting the whole call.
+    /// @dev balanceOf that reports whether the token answered instead of reverting the whole call. v17: at most BALANCE_GAS and
+    ///      32 bytes of answer copied, so a token in the registry cannot make the walk over all lots run out of gas (by burning
+    ///      it or by returning a huge answer) and thereby block every sale and exit of the account.
     function _balanceOf(address token, address who) private view returns (bool ok, uint256 bal) {
-        (bool s_, bytes memory r) = token.staticcall(abi.encodeWithSelector(0x70a08231, who));
-        if (!s_ || r.length < 32) return (false, 0);
-        return (true, abi.decode(r, (uint256)));
+        assembly ("memory-safe") {
+            let p := mload(0x40)
+            mstore(p, shl(224, 0x70a08231)) mstore(add(p, 4), who)
+            let s_ := staticcall(BALANCE_GAS, token, p, 36, p, 32)
+            ok := and(s_, gt(returndatasize(), 31))
+            if ok { bal := mload(p) }
+        }
     }
 
     // ---- token helpers: low-level calls so tokens that return nothing (USDT-style) work too ----

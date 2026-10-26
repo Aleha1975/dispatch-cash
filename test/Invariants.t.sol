@@ -4,49 +4,73 @@ import "forge-std/Test.sol";
 import "../src/GuardedSwap.sol";
 import "./Mocks.sol";
 
-/// Drives one account through random buys, sales at random prices, time jumps and unlocks; records the largest budget
-/// ever in force when a loss was booked.
+/// Drives one account through random buys, sales at random prices, owner withdrawals of tokens, time jumps and unlocks, over
+/// three tokens (v17: lots of several tokens, reconciled together); records the largest budget ever in force when a loss was booked.
 contract Handler is Test {
     address constant K_ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
-    GuardedSwap public g; MockToken public tok; MockRouter public router; address public exec; address public cold; Wallet public acct;
-    uint256 public maxRateSeen; uint256 public lastAmount; uint256 public bookings; uint256 public buys; uint256 public sells; uint256 public refused;
-    constructor(GuardedSwap g_, MockToken t_, MockRouter r_, address exec_, address cold_, Wallet a_) { g = g_; tok = t_; router = r_; exec = exec_; cold = cold_; acct = a_; }
+    GuardedSwap public g; MockToken[3] public toks; MockRouter public router; address public exec; address public cold; Wallet public acct;
+    uint256 public maxRateSeen; uint256 public lastAmount; uint256 public bookings; uint256 public buys; uint256 public sells; uint256 public refused; uint256 public moves;
+    constructor(GuardedSwap g_, MockToken[3] memory t_, MockRouter r_, address exec_, address cold_, Wallet a_) { g = g_; toks = t_; router = r_; exec = exec_; cold = cold_; acct = a_; }
+    function tok(uint256 i) external view returns (MockToken) { return toks[i]; }
     function _route(address tin, address tout, uint256 amount, address to) internal view returns (bytes memory) {
         GuardedSwap.SwapDescriptionV2 memory d; d.srcToken = tin; d.dstToken = tout; d.dstReceiver = to; d.amount = amount; d.minReturnAmount = 1;
         GuardedSwap.SwapExecutionParams memory p; p.desc = d; p.callTarget = exec; return abi.encodeWithSelector(0xe21fd0e9, p);
     }
-    function buy(uint256 eth) external {
-        eth = bound(eth, 0.001 ether, 5 ether); vm.deal(address(acct), eth);
+    function buy(uint256 which, uint256 eth) external {
+        MockToken tok = toks[which % 3]; eth = bound(eth, 0.001 ether, 5 ether); vm.deal(address(acct), address(acct).balance + eth);
         vm.prank(address(acct)); try g.buy{value: eth}(address(tok), 1, _route(K_ETH, address(tok), eth, address(acct))) { buys++; } catch {}
     }
-    function sell(uint256 frac, uint256 priceBps) external {
+    function sell(uint256 which, uint256 frac, uint256 priceBps) external {
+        MockToken tok = toks[which % 3];
         (uint256 lot, ) = g.lotOf(address(acct), address(tok)); if (lot == 0) return;
         uint256 amount = bound(frac, 1, lot); priceBps = bound(priceBps, 100, 30000);               // 1% .. 300% of entry
         router.set(1000, 1e15 * priceBps / 10000, address(0));
-        (uint256 carried, uint256 budget) = g.budgetOf(address(acct)); (uint256 amtBefore, uint64 atBefore) = g.loss(address(acct));
+        (, uint256 budget) = g.budgetOf(address(acct)); (uint256 amtBefore, uint64 atBefore) = g.loss(address(acct));
         vm.startPrank(address(acct)); tok.approve(address(g), amount);
         try g.sell(address(tok), amount, 1, _route(address(tok), K_ETH, amount, address(g))) { sells++;
             (uint256 amt, uint64 at) = g.loss(address(acct));
-            if (amt != amtBefore || at != atBefore) { bookings++; assertLe(amt, budget); assertEq(at, uint64(block.timestamp)); }   // a booked loss never exceeds the budget it was checked against; the clock restarts at booking
+            if (amt != amtBefore || at != atBefore) { bookings++; assertLe(amt, budget); assertEq(at, uint64(block.timestamp)); }   // a booked loss never exceeds the budget quoted before the sale (v17: the quote is the reconciled base)
         } catch { refused++; }
         vm.stopPrank(); router.set(1000, 1e15, address(0));
+    }
+    /// The owner moves some or all of a token out of the account (a withdrawal outside the gate).
+    function ownerMoves(uint256 which, uint256 frac) external {
+        MockToken tok = toks[which % 3]; uint256 bal = tok.balanceOf(address(acct)); if (bal == 0) return;
+        uint256 amount = bound(frac, 1, bal); vm.prank(address(acct)); tok.transfer(address(0xdead), amount); moves++;
     }
     function warp(uint256 dt) external { vm.warp(block.timestamp + bound(dt, 1, 10 days)); }
     function unlock() external { address[] memory a = new address[](1); a[0] = address(acct); vm.prank(cold); g.unlock(a); }
 }
 
 contract GuardedSwapInvariants is Test {
-    GuardedSwap g; MockToken tok; MockRouter router; Handler h; Wallet acct; address cold = address(0xC01D);
+    GuardedSwap g; MockToken[3] toks; MockRouter router; Handler h; Wallet acct; address cold = address(0xC01D);
     function setUp() public {
-        tok = new MockToken(); router = new MockRouter(); address exec = address(new Wallet());
+        for (uint256 i = 0; i < 3; i++) toks[i] = new MockToken();
+        router = new MockRouter(); address exec = address(new Wallet());
         g = new GuardedSwap(address(router), exec, address(this), cold, 1000, 1000 ether, 1000 ether); acct = new Wallet();
         vm.deal(address(router), 10000 ether); router.set(1000, 1e15, address(0));
-        h = new Handler(g, tok, router, exec, cold, acct); targetContract(address(h));
+        h = new Handler(g, toks, router, exec, cold, acct); targetContract(address(h));
     }
-    /// I-1: the account's cost basis is exactly the sum of its lots (one token here)
-    function invariant_cost_basis_equals_the_lot() public view { (, uint256 ethIn) = g.basis(address(acct), address(tok)); assertEq(g.costOf(address(acct)), ethIn); }
+    /// I-1 (v17): the account's cost basis is exactly the sum of the lots in its registry
+    function invariant_cost_basis_equals_the_registered_lots() public view {
+        address[] memory l = g.lotsOf(address(acct)); uint256 sum;
+        for (uint256 i = 0; i < l.length; i++) { (, uint256 ethIn) = g.basis(address(acct), l[i]); sum += ethIn; }
+        assertEq(g.costOf(address(acct)), sum);
+    }
+    /// v17: a token is in the registry exactly when its lot is open, once, and nothing else is listed
+    function invariant_registry_is_the_open_lots() public view {
+        address[] memory l = g.lotsOf(address(acct)); uint256 open;
+        for (uint256 i = 0; i < 3; i++) {
+            (uint256 tokens, ) = g.basis(address(acct), address(toks[i])); uint256 seen;
+            for (uint256 j = 0; j < l.length; j++) if (l[j] == address(toks[i])) seen++;
+            assertEq(seen, tokens > 0 ? 1 : 0); if (tokens > 0) open++;
+        }
+        assertEq(l.length, open);
+    }
     /// I-2: the lot never exceeds what the account holds
-    function invariant_lot_within_balance() public view { (uint256 lot, ) = g.lotOf(address(acct), address(tok)); assertLe(lot, tok.balanceOf(address(acct))); }
+    function invariant_lot_within_balance() public view {
+        for (uint256 i = 0; i < 3; i++) { (uint256 lot, ) = g.lotOf(address(acct), address(toks[i])); assertLe(lot, toks[i].balanceOf(address(acct))); }
+    }
     /// C-1: what is outstanding never exceeds what was booked, and the booked amount never exceeded a budget in force
     function invariant_outstanding_never_exceeds_booked() public view { (uint256 amt, ) = g.loss(address(acct)); (uint256 lost, ) = g.budgetOf(address(acct)); assertLe(lost, amt); }
     /// C-1/F-4: what is outstanding is never more than what was booked, and is gone within REFILL of the booking

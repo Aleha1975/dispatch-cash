@@ -27,8 +27,17 @@ contract ForkCbPiggyTest is Test {
         (ok, ret) = V15.call(abi.encodeWithSelector(GuardedSwap.sell.selector, token, amount, minOut, data));
         vm.stopPrank();
     }
-    function _v16here() internal {   // v16 runtime at the v15 address, built with v15's own constructor arguments (production limits)
+    function _v16here() internal {   // the current runtime (v16, now v17) at the v15 address, built with v15's own constructor arguments (production limits)
         deployCodeTo("GuardedSwap.sol:GuardedSwap", abi.encode(ROUTER, EXECUTOR, GUARDIAN, COLD, uint256(12), uint256(0.3 ether), uint256(1 ether)), V15);
+        _register(account, token);
+    }
+    /// v17 keeps the earlier storage layout and adds the lot registry after it (slots 10 and 11): the lot v15 recorded is
+    /// registered here as a fresh v17 would have registered it on the buy.
+    function _register(address acct, address tok) internal {
+        bytes32 arr = keccak256(abi.encode(acct, uint256(10))); uint256 n = uint256(vm.load(V15, arr));
+        vm.store(V15, bytes32(uint256(keccak256(abi.encode(arr))) + n), bytes32(uint256(uint160(tok)))); vm.store(V15, arr, bytes32(n + 1));
+        vm.store(V15, keccak256(abi.encode(tok, keccak256(abi.encode(acct, uint256(11))))), bytes32(n + 1));
+        GuardedSwap g = GuardedSwap(payable(V15)); assertEq(g.lotsOf(acct).length, n + 1); assertEq(g.lotsOf(acct)[n], tok);
     }
 
     function test_fork_cbpiggy_v15_refuses_v16_sells() public {

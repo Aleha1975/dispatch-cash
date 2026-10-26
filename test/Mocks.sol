@@ -7,7 +7,9 @@ contract MockToken {
     mapping(address => uint256) internal _bal; mapping(address => mapping(address => uint256)) internal _allow;
     mapping(address => bool) public bricked;                 // balanceOf(a) reverts for a bricked address (blacklist that also kills reads, round-11 H-1)
     function setBricked(address a, bool b) external { bricked[a] = b; }
-    function balanceOf(address a) public view returns (uint256) { if (bricked[a]) revert("bricked"); return _bal[a]; }
+    bool public burnsGas;                                    // balanceOf that burns every unit of gas it is given (v17: a registry entry must not block the walk)
+    function setBurnsGas(bool b) external { burnsGas = b; }
+    function balanceOf(address a) public view returns (uint256) { if (bricked[a]) revert("bricked"); if (burnsGas) { uint256 i; while (true) { i++; } } return _bal[a]; }
     function allowance(address o, address s) external view returns (uint256) { if (allowanceReverts) revert("no"); return _allow[o][s]; }
     uint256 public feeBps;                                  // fee-on-transfer, burned
     bool public revertOnZeroApprove;                        // BNB-style approve(spender, 0) revert
@@ -22,7 +24,18 @@ contract MockToken {
     function transfer(address to, uint256 a) external returns (bool) { _move(msg.sender, to, a); return true; }
     function transferFrom(address f, address to, uint256 a) external returns (bool) {
         uint256 al = _allow[f][msg.sender]; require(al >= a, "allowance"); _allow[f][msg.sender] = al - a; _move(f, to, a); return true; }
-    function _move(address f, address to, uint256 a) internal { require(_bal[f] >= a, "balance"); _bal[f] -= a; uint256 fee = a * feeBps / 10000; _bal[to] += a - fee; }
+    function _move(address f, address to, uint256 a) internal virtual { require(_bal[f] >= a, "balance"); _bal[f] -= a; uint256 fee = a * feeBps / 10000; _bal[to] += a - fee; }
+}
+
+/// v17: a token that pays ETH to `home` whenever tokens are transferred to it (an ETH refund hidden in the token transfer).
+contract RefundingToken is MockToken {
+    address public home; uint256 public refundWei;
+    receive() external payable {}
+    function setRefund(address h, uint256 w) external { home = h; refundWei = w; }
+    function _move(address f, address to, uint256 a) internal override {
+        super._move(f, to, a);
+        if (to == home && refundWei > 0) { (bool ok, ) = home.call{value: refundWei}(""); require(ok, "refund"); }
+    }
 }
 
 /// A token whose balanceOf lies: reports `fake` for `victim` after `arm()` (H-1 proof of concept helper).
@@ -38,7 +51,8 @@ contract LyingToken {
 /// desc.srcToken from msg.sender and pays ETH at ethPerToken to desc.dstReceiver (or `payTo`). Optional re-entrancy.
 contract MockRouter {
     address constant K_ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
-    uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo; bool public reenter; address public guard; bool public reenterOk; uint256 public overpay; bool public pullLess; bool public pullNone; uint256 public refund;
+    uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo; bool public reenter; address public guard; bool public reenterOk; uint256 public overpay; bool public pullLess; bool public pullNone; uint256 public refund; address public kickTo; uint256 public kickWei;
+    function setKickback(address to, uint256 w) external { kickTo = to; kickWei = w; }   // v17: on a buy, pays `w` of the input straight to `to` (the account), past the gate
     function setPullNone(bool b) external { pullNone = b; }
     function setRefund(uint256 w) external { refund = w; }
     function setOverpay(uint256 w) external { overpay = w; }
@@ -55,6 +69,7 @@ contract MockRouter {
             MockToken(d.dstToken).mint(to, msg.value * tokensPerEth);
             if (overpay > 0) { (bool okp, ) = msg.sender.call{value: msg.value + overpay}(""); require(okp, "overpay"); }   // refunds more than it was sent
             if (refund > 0) { (bool okr, ) = msg.sender.call{value: refund}(""); require(okr, "refund"); }                   // returns part of the input as change
+            if (kickWei > 0) { (bool okk, ) = kickTo.call{value: kickWei}(""); require(okk, "kick"); }                        // returns part of the input to the account itself
             if (reenter) { (bool ok, ) = guard.call(abi.encodeWithSignature("sell(address,uint256,uint256,bytes)", d.dstToken, uint256(1), uint256(1), bytes(""))); reenterOk = ok; }
             return (msg.value * tokensPerEth, 0);
         }

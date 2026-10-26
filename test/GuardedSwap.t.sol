@@ -434,6 +434,136 @@ contract GuardedSwapTest is Test {
         uint256 out = _exit(1000e18); assertEq(out, 0.1 ether);                                      // the cold key's exit is the remedy for an all-in account
     }
 
+    // ---- v17 (round 15): every lot reconciled before the base is read; ETH that came back to the account is not cost ----
+    function _buyT(MockToken t, uint256 eth) internal returns (uint256) { vm.prank(address(acct)); return guard.buy{value: eth}(address(t), 1, route(K_ETH, address(t), eth, address(acct))); }
+    function _sellT(MockToken t, uint256 amount, uint256 minOut) internal returns (uint256 out) {
+        vm.startPrank(address(acct)); t.approve(address(guard), amount);
+        out = guard.sell(address(t), amount, minOut, route(address(t), K_ETH, amount, address(guard))); vm.stopPrank(); }
+    function _expectSellT(MockToken t, uint256 amount, bytes memory err) internal {
+        vm.startPrank(address(acct)); t.approve(address(guard), amount); vm.expectRevert(err);
+        guard.sell(address(t), amount, 1, route(address(t), K_ETH, amount, address(guard))); vm.stopPrank(); }
+    function _exitT(MockToken t, uint256 amount) internal returns (uint256 out) {
+        vm.startPrank(address(acct), cold); t.approve(address(guard), amount);
+        out = guard.exit(address(t), amount, 1, route(address(t), K_ETH, amount, address(guard))); vm.stopPrank(); }
+    function _sumLots() internal view returns (uint256 c) { address[] memory l = guard.lotsOf(address(acct)); for (uint256 i = 0; i < l.length; i++) { (, uint256 e) = guard.basis(address(acct), l[i]); c += e; } }
+    function _listed(address t) internal view returns (bool) { address[] memory l = guard.lotsOf(address(acct)); for (uint256 i = 0; i < l.length; i++) if (l[i] == t) return true; return false; }
+
+    /// Round 15, H: lot A (0.20) was withdrawn by the owner, lot B (0.02) is all the account has. v16 kept A's 0.20 in the base
+    /// (only the traded token was reconciled) and let a stolen key dump B for 1 wei (loss 0.02 within 30% of 0.22).
+    function test_v17_stale_cost_of_a_withdrawn_lot_cannot_fund_a_dump() public {
+        MockToken b = new MockToken(); vm.deal(address(acct), 0.22 ether);
+        _buy(0.2 ether);                                                                             // A: 200 tokens at 0.20
+        router.set(50, 1e15, address(0)); _buyT(b, 0.02 ether);                                      // B: 1 token at 0.02; no ETH left
+        vm.prank(address(acct)); tok.transfer(address(0xdead), 200e18);                              // the owner withdraws all of A
+        (, uint256 budget) = guard.budgetOf(address(acct)); assertEq(budget, 0.006 ether);            // 30% of B alone (v16 quoted 0.066)
+        router.set(50, 1, address(0));                                                               // the thief's sink: 1 wei for all of B
+        _expectSellT(b, 1e18, abi.encodeWithSelector(GuardedSwap.BudgetExceeded.selector, 0.02 ether - 1, 0.006 ether));
+        assertEq(guard.costOf(address(acct)), 0.22 ether);                                          // refused: nothing written
+    }
+    function test_v17_partial_withdrawal_of_another_lot_shrinks_the_base() public {
+        MockToken b = new MockToken(); vm.deal(address(acct), 0.22 ether);
+        _buy(0.2 ether); router.set(50, 1e15, address(0)); _buyT(b, 0.02 ether);
+        vm.prank(address(acct)); tok.transfer(address(0xdead), 180e18);                              // 90% of A out: A now carries 0.02
+        (, uint256 budget) = guard.budgetOf(address(acct)); assertEq(budget, 0.012 ether);            // 30% of (0.02 + 0.02)
+        router.set(50, 1, address(0));
+        _expectSellT(b, 1e18, abi.encodeWithSelector(GuardedSwap.BudgetExceeded.selector, 0.02 ether - 1, 0.012 ether));
+        router.set(50, 0.02 ether, address(0)); assertEq(_sellT(b, 1e18, 1), 0.02 ether);            // at cost it goes, and the sale writes A's reconciliation
+        (uint256 ta, uint256 ea) = guard.basis(address(acct), address(tok)); assertEq(ta, 20e18); assertEq(ea, 0.02 ether);
+        assertEq(guard.costOf(address(acct)), 0.02 ether); assertEq(guard.lotsOf(address(acct)).length, 1);
+    }
+    /// v15 finding "reversible purchases manufacture allowance" (lot A 0.04, 0.20 cash; buy B 0.20; sell A for 0.001; sell B for
+    /// 0.199). Under v15 the buy of B raised the base from 0.04 to 0.24 and so admitted the A sale. Since v16 the cash is in the base
+    /// already and the buy moves it into a lot: the budget is the same with or without step 1, and so is the verdict on the A sale.
+    function test_v17_reversible_purchase_manufactures_no_allowance() public {
+        MockToken b = new MockToken(); vm.deal(address(acct), 0.24 ether);
+        _buy(0.04 ether);                                                                            // A: 40 tokens at 0.04; 0.20 cash
+        (, uint256 b0) = guard.budgetOf(address(acct)); assertEq(b0, 0.072 ether);
+        uint256 snap = vm.snapshotState();
+        _buyT(b, 0.2 ether); (, uint256 b1) = guard.budgetOf(address(acct)); assertEq(b1, b0);        // step 1 moves nothing
+        router.set(1000, 2.5e13, address(0)); assertEq(_sell(40e18, 1), 0.001 ether);                // step 2: loss 0.039
+        (uint256 l2, ) = guard.loss(address(acct)); assertEq(l2, 0.039 ether);
+        router.set(1000, 9.95e14, address(0)); assertEq(_sellT(b, 200e18, 1), 0.199 ether);          // step 3: loss 0.001
+        (uint256 l3, ) = guard.loss(address(acct)); assertEq(l3, 0.04 ether);                         // 16.7% of the 0.24 account, all of it real loss
+        vm.revertToState(snap);                                                                      // without step 1
+        router.set(1000, 2.5e13, address(0)); assertEq(_sell(40e18, 1), 0.001 ether);
+        (uint256 l2b, ) = guard.loss(address(acct)); assertEq(l2b, l2);                               // the same sale, the same verdict
+        vm.revertToState(snap); vm.deal(address(acct), 0); router.set(1000, 2.5e13, address(0));     // the A sale is refused only when the cash is not the account's
+        _expectSell(40e18, abi.encodeWithSelector(GuardedSwap.BudgetExceeded.selector, 0.039 ether, 0.012 ether));
+    }
+    /// Round 15, M: ETH paid straight back to the account during a buy was counted as spent (only the gate's balance was measured).
+    function test_v17_eth_returned_to_the_account_during_a_buy_is_not_cost() public {
+        router.setKickback(address(acct), 1 ether);                                                  // the whole input comes back past the gate
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwap.ZeroAmount.selector);
+        guard.buy{value: 1 ether}(address(tok), 1, route(K_ETH, address(tok), 1 ether, address(acct)));
+        router.setKickback(address(acct), 0.4 ether); _buy(1 ether);                                 // 0.4 of 1 comes back
+        (, uint256 e1) = guard.basis(address(acct), address(tok)); assertEq(e1, 0.6 ether); assertEq(address(acct).balance, 9.4 ether);
+        (, uint256 budget) = guard.budgetOf(address(acct)); assertEq(budget, 3 ether);                 // the base did not move
+        router.setRefund(0.3 ether); router.setKickback(address(acct), 0.2 ether); _buy(1 ether);    // change through the gate AND past it: each counted once
+        (, uint256 e2) = guard.basis(address(acct), address(tok)); assertEq(e2, 1.1 ether); assertEq(address(acct).balance, 8.9 ether);
+        (, , uint128 buyEth, ) = guard.window(address(acct)); assertEq(buyEth, 1.1 ether);           // the hourly cap counts the net spend too
+        (, budget) = guard.budgetOf(address(acct)); assertEq(budget, 3 ether);
+    }
+    function test_v17_eth_refunded_by_the_token_transfer_is_not_cost() public {
+        RefundingToken r = new RefundingToken(); vm.deal(address(r), 2 ether); r.setRefund(address(acct), 0.25 ether);
+        vm.prank(address(acct)); guard.buy{value: 1 ether}(address(r), 1, route(K_ETH, address(r), 1 ether, address(guard)));   // paid to the gate; the sweep to the account pays 0.25 back
+        (uint256 t1, uint256 e1) = guard.basis(address(acct), address(r)); assertEq(t1, 1000e18); assertEq(e1, 0.75 ether);
+        r.setRefund(address(acct), 1 ether); vm.prank(address(acct)); vm.expectRevert(GuardedSwap.ZeroAmount.selector);
+        guard.buy{value: 1 ether}(address(r), 1, route(K_ETH, address(r), 1 ether, address(guard)));
+    }
+    /// Round 15, L: floorFor quoted the base before reconciliation. It now quotes exactly the threshold the sale enforces.
+    function test_v17_floorFor_is_the_threshold_the_sale_enforces() public {
+        MockToken b = new MockToken(); vm.deal(address(acct), 1.2 ether);
+        _buy(1 ether); _buyT(b, 0.2 ether);                                                          // A 1000 at 1.0, B 200 at 0.2, no ETH
+        vm.prank(address(acct)); tok.transfer(address(0xdead), 600e18);                              // A now carries 0.4: base 0.6, budget 0.18
+        uint256 floor = guard.floorFor(address(acct), address(b), 200e18); assertEq(floor, 0.02 ether);
+        uint256 px = floor * 1e18 / 200e18;
+        router.set(1000, px - 1, address(0));                                                        // 200 wei under the quote
+        _expectSellT(b, 200e18, abi.encodeWithSelector(GuardedSwap.BudgetExceeded.selector, 0.18 ether + 200, 0.18 ether));
+        router.set(1000, px, address(0)); assertEq(_sellT(b, 200e18, 1), floor);                     // at the quote it goes
+        (uint256 lost, ) = guard.budgetOf(address(acct)); assertEq(lost, 0.18 ether);
+    }
+    function test_v17_open_lots_are_capped_and_an_emptied_lot_frees_its_slot() public {
+        uint256 n = guard.MAX_LOTS(); assertEq(n, 32); MockToken[] memory ts = new MockToken[](n + 1);
+        for (uint256 i = 0; i <= n; i++) ts[i] = new MockToken();
+        for (uint256 i = 0; i < n; i++) _buyT(ts[i], 0.001 ether);
+        assertEq(guard.lotsOf(address(acct)).length, n);
+        vm.prank(address(acct)); vm.expectRevert(GuardedSwap.TooManyLots.selector);
+        guard.buy{value: 0.001 ether}(address(ts[n]), 1, route(K_ETH, address(ts[n]), 0.001 ether, address(acct)));
+        _buyT(ts[0], 0.001 ether);                                                                   // more of an open lot takes no new slot
+        vm.prank(address(acct)); ts[5].transfer(address(0xdead), 1e18);                              // the owner empties one lot
+        _buyT(ts[n], 0.001 ether);                                                                   // the buy reconciles first: the slot is free
+        assertEq(guard.lotsOf(address(acct)).length, n); assertFalse(_listed(address(ts[5]))); assertTrue(_listed(address(ts[n])));
+        assertEq(guard.costOf(address(acct)), 0.033 ether); assertEq(_sumLots(), 0.033 ether);
+        for (uint256 i = 0; i <= n; i++) vm.cool(address(ts[i])); vm.cool(address(guard)); vm.cool(address(acct));   // as in a fresh transaction
+        uint256 g0 = gasleft(); _sellT(ts[1], 1e18, 1); uint256 used = g0 - gasleft();               // a sale walks all 32 lots
+        assertLt(used, 800_000); emit log_named_uint("sale with 32 open lots, gas", used);
+    }
+    function test_v17_a_lot_that_will_not_answer_does_not_block_the_others() public {
+        MockToken b = new MockToken(); MockToken c = new MockToken();
+        _buy(1 ether); _buyT(b, 1 ether); _buyT(c, 1 ether);
+        tok.setBricked(address(acct), true);                                                         // A's balanceOf reverts for the account
+        c.setBurnsGas(true);                                                                         // C's burns every unit of gas it is given
+        uint256 g0 = gasleft(); assertEq(_sellT(b, 500e18, 1), 0.5 ether); uint256 used = g0 - gasleft();
+        assertLt(used, 600_000);                                                                     // each unreadable lot costs at most BALANCE_GAS
+        assertEq(guard.costOf(address(acct)), 2.5 ether);                                            // A and C keep their last cost (documented residual)
+        (, uint256 budget) = guard.budgetOf(address(acct)); assertEq(budget, (2.5 ether + 7.5 ether) * 3000 / 10000);   // the views answer too
+        assertEq(_exitT(b, 500e18), 0.5 ether); assertFalse(_listed(address(b)));                   // and the cold key's exit
+    }
+    function test_v17_registry_follows_the_lots() public {
+        MockToken b = new MockToken();
+        _buy(1 ether); assertTrue(_listed(address(tok)));
+        _sell(400e18, 1); assertTrue(_listed(address(tok)));                                         // a partial sale keeps the lot
+        _buyT(b, 1 ether); assertEq(guard.lotsOf(address(acct)).length, 2);
+        _sell(600e18, 1); assertFalse(_listed(address(tok))); assertEq(guard.costOf(address(acct)), _sumLots());   // a full sale closes it
+        _buy(1 ether); assertTrue(_listed(address(tok)));
+        vm.prank(address(acct)); tok.transfer(address(0xdead), 1000e18);                             // emptied by the owner: listed until a call reconciles
+        assertTrue(_listed(address(tok))); (uint256 lt, ) = guard.lotOf(address(acct), address(tok)); assertEq(lt, 0);
+        assertEq(_exitT(b, 400e18), 0.4 ether);                                                      // the exit reconciles every lot too
+        assertFalse(_listed(address(tok))); assertTrue(_listed(address(b)));
+        assertEq(guard.costOf(address(acct)), 0.6 ether); assertEq(_sumLots(), 0.6 ether);
+        assertEq(_exitT(b, 600e18), 0.6 ether); assertEq(guard.lotsOf(address(acct)).length, 0); assertEq(guard.costOf(address(acct)), 0);
+    }
+
     function test_constructor_refuses_itself_as_router_or_executor() public {
         address self_ = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
         vm.expectRevert(bytes("self")); new GuardedSwap(self_, exec, address(this), cold, 12, 0.3 ether, 1 ether);

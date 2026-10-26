@@ -4,14 +4,14 @@
 
 **Threat model.** The executor key leaks. The attacker can call `buy`/`sell`/`announce` on behalf of every client account and can build any router calldata. The attacker cannot change the delegation, cannot withdraw and cannot call the router directly. The guardian key (pause only) may also leak. The router and its executor are trusted infrastructure; the tokens are not.
 
-## Rules (v16)
+## Rules (v17)
 
 | Rule | What it enforces |
 | --- | --- |
 | Recipient | Everything a swap returns — tokens, ETH, change — is paid to the calling account. There is no recipient parameter; the router calldata is decoded on-chain and must name the account (buy) or this contract (sale, forwarded after settlement). |
 | Route check | Only `swap(SwapExecutionParams)` of the pinned router, run by the pinned executor; of the router's `flags` only bit `0x200` may be set (every bit the router dispatches on is refused); no fee receivers, no `permit`; declared tokens and amounts must match; a buy may not hand its input to any `srcReceivers`. |
-| Loss budget | Every buy is recorded at cost. Selling below cost is a loss; losses per account must stay within 30% of the account's value at cost (its ETH plus the cost of its open lots), and what is outstanding fades linearly over a week from its last booking — nothing but time or the cold key's unlock moves it. A sale beyond the budget does not go through. Sales at or above cost are never limited: taking profit is never delayed, one position crashing is inside the budget while it is a small part of the account, a thief dumping everything at once books at most about 23% of the account. |
-| Only the lot | A sale can cover at most the tokens this contract saw bought for the account; the lot is reconciled with the balance at every call and closes when the account holds nothing. |
+| Loss budget | Every buy is recorded at what left the account for good (ETH that comes back to the account during the buy is not cost). Selling below cost is a loss; losses per account must stay within 30% of the account's value at cost (its ETH plus the cost of all its open lots, every lot reconciled with what the account still holds before the budget is read), and what is outstanding fades linearly over a week from its last booking — nothing but time or the cold key's unlock moves it. A sale beyond the budget does not go through. Sales at or above cost are never limited: taking profit is never delayed, one position crashing is inside the budget while it is a small part of the account, a thief dumping everything at once books at most about 23% of the account. |
+| Only the lot | A sale can cover at most the tokens this contract saw bought for the account; the lot is reconciled with the balance at every call and closes when the account holds nothing. An account has at most 32 open lots. |
 | Rate limits | Per account and hour: 12 sales, 0.3 ETH into buys, 1 ETH out of sales. The delegation adds 0.5 ETH per 24 h. |
 | Guardian | Pause the executor — buys and sells — for at most 7 days, then a day's cooldown. Never blocks `exit()` or the owner's own wallet. No other power. |
 | Exit key | The operator's cold key, kept off the trading machine. `unlock` clears an account's losses when a crash was the market; `replaceGuardian` removes a guardian that misbehaves. `exit` sells a position outside the budget and the limits — still paid only to the account — to evacuate every client into ETH when the executor key is compromised. |
@@ -27,7 +27,8 @@ Two watchers — one next to the engine, one on separate infrastructure with a m
 - Trade badly within the loss budget and the hourly budgets: at most 0.3 ETH per hour into buys with no price reference for a buy (0.5 ETH per 24 h in the delegation), and sales below cost up to 30% of the account's value at cost (ETH plus open lots) per week. On an account that holds mostly ETH this budget exceeds the cost of its positions, so the positions themselves are not protected beyond the share of the account; the watchers' pause is what ends such a drain.
 - The budget is relative to what was paid, not to the market: a position that has appreciated can be sold at cost without touching it.
 - A route may deliver the sold tokens to a pool the aggregator chose; a planted sink cannot be told apart on-chain, and is bounded by the loss budget. An `exit` runs outside the budget, so the exit transaction is built on the operator's side with an independent quote and is not signed below 90% of it.
-- A token whose balance stops answering keeps its last known lot; the gate never takes an unreadable balance as empty.
+- A token whose balance stops answering keeps its last known lot — and its cost in the budget's base; the gate never takes an unreadable balance as empty.
+- Fill an account's 32 lot slots with junk the owner cannot get rid of, which stops buys of new tokens through this gate for that account (no funds move; sales and exit still work).
 
 ## What the client keeps
 
