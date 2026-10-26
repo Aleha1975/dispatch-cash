@@ -54,7 +54,9 @@ pragma solidity ^0.8.26;
 ///            had moved out still counted). The open lots are kept in a per-account registry of at most MAX_LOTS tokens. A buy
 ///            is charged only what left the account for good: ETH that came back to the account itself during the buy is not
 ///            cost. Residual: a lot whose token stops answering balanceOf (or needs more than BALANCE_GAS to) keeps its last
-///            reconciled cost in the base until it answers again.
+///            reconciled cost in the base until it answers again. Anyone may run the reconciliation for an account (reconcile):
+///            until it runs, a lot the owner emptied stays on record, and tokens given back to the account before then bring its
+///            old cost back into the base (free audit, F-1); the watcher reconciles whenever a token leaves an account.
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
 }
@@ -107,6 +109,7 @@ contract GuardedSwap {
     event Bought(address indexed account, address indexed token, uint256 ethIn, uint256 tokensOut);
     event Sold(address indexed account, address indexed token, uint256 tokensIn, uint256 ethOut, uint256 lossAdded, bool exit);
     event Unlocked(address indexed account, uint256 lossCleared);
+    event Reconciled(address indexed account, address indexed token, uint256 tokens, uint256 ethIn);   // a lot lowered to the account's balance (0, 0 = closed)
     event Paused(bool paused);
     event GuardianProposed(address indexed current, address indexed proposed);
     event GuardianChanged(address indexed previous, address indexed current);
@@ -165,11 +168,10 @@ contract GuardedSwap {
             if (paused()) revert PauseCooldown();
             uint256 end = pausedAt != 0 ? pausedAt + PAUSE_MAX : pauseEnd;     // an expired pause ended at its expiry
             if (end != 0 && block.timestamp < end + PAUSE_COOLDOWN) revert PauseCooldown();
-            pausedAt = block.timestamp; pauseEnd = 0;
+            pausedAt = block.timestamp; pauseEnd = 0; emit Paused(true);
         } else if (pausedAt != 0) {
-            uint256 exp = pausedAt + PAUSE_MAX; pauseEnd = block.timestamp < exp ? block.timestamp : exp; pausedAt = 0;
-        }
-        emit Paused(p);
+            uint256 exp = pausedAt + PAUSE_MAX; pauseEnd = block.timestamp < exp ? block.timestamp : exp; pausedAt = 0; emit Paused(false);
+        }                                                               // (free audit, I-4) resuming when nothing was paused changes nothing and emits nothing
     }
     /// @notice Two-step guardian rotation: the current guardian proposes, the proposed address accepts within PENDING_TTL.
     /// @notice The cold key may replace the guardian outright: a lost or hostile guardian key cannot hold the executor in a
@@ -244,7 +246,7 @@ contract GuardedSwap {
         (bool ok, uint256 bal) = _balanceOf(token, account);
         if (!ok) return;                                            // unreadable balance: keep the last lot; the sale or the cold key's exit must not die here (round 11, H-1)
         if (bal == 0) { _closeLot(account, token); return; }
-        if (bal < b.tokens) { uint256 keep = _ceil(b.ethIn * bal, b.tokens); costOf[account] -= b.ethIn - keep; b.ethIn = keep; b.tokens = bal; }
+        if (bal < b.tokens) { uint256 keep = _ceil(b.ethIn * bal, b.tokens); costOf[account] -= b.ethIn - keep; b.ethIn = keep; b.tokens = bal; emit Reconciled(account, token, bal, keep); }
     }
     /// @dev v17: every open lot of the account reconciled, so the base a sale reads carries no cost of tokens the account no
     ///      longer holds (round 15, H). Walked from the end: closing a lot moves the last entry, which is already done.
@@ -253,6 +255,11 @@ contract GuardedSwap {
         address[] storage a = _lots[account];
         for (uint256 i = a.length; i > 0; i--) _trim(account, a[i - 1]);
     }
+    /// @notice Anyone may reconcile an account's lots with what it holds (free audit, F-1): a lot the owner emptied is closed now,
+    ///         not at the next sale, so tokens given back to the account later cannot bring its old cost back into the base. It only
+    ///         lowers or closes lots, never raises one, and never closes a lot whose balance does not answer. The watcher calls it
+    ///         whenever a token leaves an account.
+    function reconcile(address account) external lock { _trimAll(account); }
     /// @dev The registry follows the lots: an entry is added when a lot opens and removed wherever one is deleted.
     function _openLot(address account, address token) private {
         if (_lotIdx[account][token] != 0) return;
@@ -260,7 +267,7 @@ contract GuardedSwap {
         _lots[account].push(token); _lotIdx[account][token] = _lots[account].length;
     }
     function _closeLot(address account, address token) private {
-        costOf[account] -= basis[account][token].ethIn; delete basis[account][token];
+        costOf[account] -= basis[account][token].ethIn; delete basis[account][token]; emit Reconciled(account, token, 0, 0);   // (free audit, I-2)
         uint256 i = _lotIdx[account][token]; if (i == 0) return;
         address[] storage a = _lots[account]; address last = a[a.length - 1];
         a[i - 1] = last; _lotIdx[account][last] = i; a.pop(); delete _lotIdx[account][token];

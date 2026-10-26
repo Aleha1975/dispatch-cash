@@ -20,7 +20,7 @@ No owner, no upgrade path, no funds held between calls. Anyone may call it; it c
 
 ## The incident protocol
 
-Two watchers — one next to the engine, one on separate infrastructure with a mirrored journal — reconcile the gate's on-chain events with the engine's own journal: an event with no journal entry is a trade by a foreign key — a breach, not a heuristic. On a breach it pauses buys, stops the engine and alerts the operator. The operator, from a phone, either clears the budget (`unlock`: a market crash) or evacuates (`exit` for every position: a theft). Clients are not involved; their funds never left their own accounts. The executor key is then rotated and clients re-sign on their next visit.
+Two watchers — one next to the engine, one on separate infrastructure with a mirrored journal — reconcile the gate's on-chain events with the engine's own journal: an event with no journal entry is a trade by a foreign key — a breach, not a heuristic. On a breach it pauses buys, stops the engine and alerts the operator. The operator, from a phone, either clears the budget (`unlock`: a market crash) or evacuates (`exit` for every position: a theft). Clients are not involved; their funds never left their own accounts. The executor key is then rotated and clients re-sign on their next visit. Deployment requirement: the executor's delegations are limited to this gate's `buy` and `sell` (and token approvals to it) and never include `exit()` or `unlock()`; `exit()` is reached only through the cold key's own delegation, and each gate deployment should have its own exit key.
 
 ## What a stolen key can still do (documented residuals)
 
@@ -28,6 +28,7 @@ Two watchers — one next to the engine, one on separate infrastructure with a m
 - The budget is relative to what was paid, not to the market: a position that has appreciated can be sold at cost without touching it.
 - A route may deliver the sold tokens to a pool the aggregator chose; a planted sink cannot be told apart on-chain, and is bounded by the loss budget. An `exit` runs outside the budget, so the exit transaction is built on the operator's side with an independent quote and is not signed below 90% of it.
 - A token whose balance stops answering keeps its last known lot — and its cost in the budget's base; the gate never takes an unreadable balance as empty.
+- Between the owner moving a token out and the next reconciliation (`reconcile`, run by the watcher), give the token back to the account so that the emptied lot's old cost counts in the base again.
 - Fill an account's 32 lot slots with junk the owner cannot get rid of, which stops buys of new tokens through this gate for that account (no funds move; sales and exit still work).
 
 ## What the client keeps

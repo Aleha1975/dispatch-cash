@@ -564,6 +564,59 @@ contract GuardedSwapTest is Test {
         assertEq(_exitT(b, 600e18), 0.6 ether); assertEq(guard.lotsOf(address(acct)).length, 0); assertEq(guard.costOf(address(acct)), 0);
     }
 
+    // ---- free audit of v17: reconcile(), Reconciled events, Paused only on a change ----
+    /// F-1: the owner empties lot A; the watcher reconciles; tokens of A given back afterwards are not a lot and bring no cost back.
+    function test_v17_reconcile_closes_the_window_for_a_donated_lot() public {
+        MockToken b = new MockToken(); vm.deal(address(acct), 10 ether);
+        _buy(3 ether); _buyT(b, 7 ether);                                                            // A 3000 at 3, B 7000 at 7, no ETH
+        vm.prank(address(acct)); tok.transfer(address(0xBEEF), 3000e18);                             // the owner takes all of A out
+        vm.expectEmit(true, true, false, true, address(guard)); emit GuardedSwap.Reconciled(address(acct), address(tok), 0, 0);
+        vm.prank(address(0x5157)); guard.reconcile(address(acct));                                   // anyone (the watcher)
+        assertFalse(_listed(address(tok))); assertEq(guard.costOf(address(acct)), 7 ether);
+        tok.mint(address(0x7777), 3000e18); vm.prank(address(0x7777)); tok.transfer(address(acct), 3000e18);   // the thief gives A back
+        (, uint256 budget) = guard.budgetOf(address(acct)); assertEq(budget, 2.1 ether);              // still 30% of B alone (3.0 without reconcile)
+        router.set(1000, 6.5e14, address(0));
+        _expectSellT(b, 7000e18, abi.encodeWithSelector(GuardedSwap.BudgetExceeded.selector, 2.45 ether, 2.1 ether));
+        _expectSell(3000e18, abi.encodeWithSelector(GuardedSwap.NotInLot.selector, 0, 3000e18));    // and the donated A is not the executor's to sell
+    }
+    /// reconcile() cannot be used to grief: it only lowers lots to the balance, keeps a lot whose balance does not answer, and
+    /// leaves a lot that is fully held untouched.
+    function test_v17_reconcile_keeps_unreadable_and_held_lots() public {
+        MockToken b = new MockToken(); MockToken c = new MockToken();
+        _buy(1 ether); _buyT(b, 1 ether); _buyT(c, 1 ether);
+        tok.setBricked(address(acct), true); b.setBurnsGas(true);                                    // A's read reverts, B's burns its gas
+        vm.prank(address(acct)); c.transfer(address(0xdead), 250e18);                                // C partly moved out
+        vm.expectEmit(true, true, false, true, address(guard)); emit GuardedSwap.Reconciled(address(acct), address(c), 750e18, 0.75 ether);
+        guard.reconcile(address(acct));
+        (uint256 ta, uint256 ea) = guard.basis(address(acct), address(tok)); assertEq(ta, 1000e18); assertEq(ea, 1 ether);   // unreadable is not empty
+        (uint256 tb, uint256 eb) = guard.basis(address(acct), address(b)); assertEq(tb, 1000e18); assertEq(eb, 1 ether);
+        assertEq(guard.costOf(address(acct)), 2.75 ether); assertEq(guard.lotsOf(address(acct)).length, 3);
+        tok.setBricked(address(acct), false); b.setBurnsGas(false);
+        vm.recordLogs(); guard.reconcile(address(acct)); assertEq(vm.getRecordedLogs().length, 0);   // nothing to lower: no change, no event
+        assertEq(guard.costOf(address(acct)), 2.75 ether);
+    }
+    function test_v17_reconcile_gas_one_and_32_lots() public {
+        _buy(0.001 ether); vm.prank(address(acct)); tok.transfer(address(0xdead), 0.5e18);
+        vm.cool(address(guard)); vm.cool(address(tok)); vm.cool(address(acct));
+        uint256 g0 = gasleft(); guard.reconcile(address(acct)); uint256 used1 = g0 - gasleft();
+        MockToken[] memory ts = new MockToken[](31);
+        for (uint256 i = 0; i < 31; i++) { ts[i] = new MockToken(); _buyT(ts[i], 0.001 ether); vm.prank(address(acct)); ts[i].transfer(address(0xdead), 0.5e18); }
+        assertEq(guard.lotsOf(address(acct)).length, 32);
+        vm.cool(address(guard)); vm.cool(address(tok)); vm.cool(address(acct)); for (uint256 i = 0; i < 31; i++) vm.cool(address(ts[i]));
+        g0 = gasleft(); guard.reconcile(address(acct)); uint256 used32 = g0 - gasleft();             // 31 lots halved, one already reconciled
+        vm.cool(address(guard)); vm.cool(address(tok)); vm.cool(address(acct)); for (uint256 i = 0; i < 31; i++) vm.cool(address(ts[i]));
+        g0 = gasleft(); guard.reconcile(address(acct)); uint256 used32idle = g0 - gasleft();         // nothing to change
+        emit log_named_uint("reconcile, 1 lot (lowered)", used1); emit log_named_uint("reconcile, 32 lots (31 lowered)", used32);
+        emit log_named_uint("reconcile, 32 lots (no change)", used32idle);
+        assertLt(used32, 1_000_000);
+    }
+    /// I-4: resuming when nothing is paused emits nothing.
+    function test_v17_unpause_without_a_pause_emits_nothing() public {
+        vm.recordLogs(); guard.setPaused(false); assertEq(vm.getRecordedLogs().length, 0);
+        vm.expectEmit(address(guard)); emit GuardedSwap.Paused(true); guard.setPaused(true);
+        vm.expectEmit(address(guard)); emit GuardedSwap.Paused(false); guard.setPaused(false);
+    }
+
     function test_constructor_refuses_itself_as_router_or_executor() public {
         address self_ = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
         vm.expectRevert(bytes("self")); new GuardedSwap(self_, exec, address(this), cold, 12, 0.3 ether, 1 ether);

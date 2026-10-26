@@ -42,7 +42,7 @@ No owner, no upgrade path, no funds kept between calls.
 
 ## Views
 
-`lotOf` returns the lot as the next call will reconcile it with the account's balance (`basis` is the raw record); `lotsOf` lists the tokens of the account's open lots as recorded; `budgetOf` returns the losses on record (decayed) and the budget they must stay within, on the reconciled base a sale would read; `floorFor` quotes the lowest ETH a sale of `amount` may return without exceeding the budget.
+`lotOf` returns the lot as the next call will reconcile it with the account's balance (`basis` is the raw record); `lotsOf` lists the tokens of the account's open lots as recorded; `budgetOf` returns the losses on record (decayed) and the budget they must stay within, on the reconciled base a sale would read; `floorFor` quotes the lowest ETH a sale of `amount` may return without exceeding the budget. `reconcile(account)` (anyone) lowers or closes the account's lots to what it holds now — the watcher calls it whenever a token leaves an account, so tokens given back later cannot bring an emptied lot's cost back into the base.
 
 ## Constructor
 
