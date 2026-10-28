@@ -571,7 +571,7 @@ contract GuardedSwapTest is Test {
         _buy(3 ether); _buyT(b, 7 ether);                                                            // A 3000 at 3, B 7000 at 7, no ETH
         vm.prank(address(acct)); tok.transfer(address(0xBEEF), 3000e18);                             // the owner takes all of A out
         vm.expectEmit(true, true, false, true, address(guard)); emit GuardedSwap.Reconciled(address(acct), address(tok), 0, 0);
-        vm.prank(address(0x5157)); guard.reconcile(address(acct));                                   // anyone (the watcher)
+        guard.reconcile(address(acct));                                                              // the guardian (the watcher)
         assertFalse(_listed(address(tok))); assertEq(guard.costOf(address(acct)), 7 ether);
         tok.mint(address(0x7777), 3000e18); vm.prank(address(0x7777)); tok.transfer(address(acct), 3000e18);   // the thief gives A back
         (, uint256 budget) = guard.budgetOf(address(acct)); assertEq(budget, 2.1 ether);              // still 30% of B alone (3.0 without reconcile)
@@ -622,5 +622,37 @@ contract GuardedSwapTest is Test {
         vm.expectRevert(bytes("self")); new GuardedSwap(self_, exec, address(this), cold, 12, 0.3 ether, 1 ether);
         self_ = vm.computeCreateAddress(address(this), vm.getNonce(address(this)));
         vm.expectRevert(bytes("self")); new GuardedSwap(address(router), self_, address(this), cold, 12, 0.3 ether, 1 ether);
+    }
+
+    // ---- v17.1 (round 16): L-1 reconcile restricted, L-2 balance reads need their gas ----
+    /// L-1: a stranger cannot close or lower a lot on a transient reading; the account, the guardian and the cold key can.
+    function test_v171_reconcile_restricted_to_account_guardian_cold() public {
+        _buy(1 ether); vm.prank(address(acct)); tok.transfer(address(0xdead), 1000e18);              // the balance reads empty right now
+        vm.prank(thief); vm.expectRevert(GuardedSwap.NotReconciler.selector); guard.reconcile(address(acct));
+        vm.prank(address(0x5157)); vm.expectRevert(GuardedSwap.NotReconciler.selector); guard.reconcile(address(acct));
+        vm.prank(exec); vm.expectRevert(GuardedSwap.NotReconciler.selector); guard.reconcile(address(acct));
+        assertTrue(_listed(address(tok))); assertEq(guard.costOf(address(acct)), 1 ether);           // the lot is still on record
+        vm.prank(address(acct)); guard.reconcile(address(acct));                                     // the account's own batch
+        assertFalse(_listed(address(tok))); assertEq(guard.costOf(address(acct)), 0);
+        MockToken b = new MockToken(); _buyT(b, 1 ether); vm.prank(address(acct)); b.transfer(address(0xdead), 1000e18);
+        vm.prank(cold); guard.reconcile(address(acct)); assertFalse(_listed(address(b)));
+        MockToken c = new MockToken(); _buyT(c, 1 ether); vm.prank(address(acct)); c.transfer(address(0xdead), 1000e18);
+        guard.reconcile(address(acct)); assertFalse(_listed(address(c)));                            // the guardian (this test contract)
+    }
+    /// L-2: a token that answers 0 to a starved read cannot get its lot closed by a low gas limit; with enough gas the same
+    /// call reads the real balance and keeps the lot.
+    function test_v171_starved_balance_read_reverts_instead_of_closing_the_lot() public {
+        SwallowToken w = new SwallowToken(); _buyT(w, 1 ether);
+        vm.expectRevert(GuardedSwap.GasTooLow.selector); guard.reconcile{gas: 120_000}(address(acct));
+        assertTrue(_listed(address(w))); assertEq(guard.costOf(address(acct)), 1 ether);
+        guard.reconcile(address(acct));
+        assertTrue(_listed(address(w))); assertEq(guard.costOf(address(acct)), 1 ether);
+    }
+    /// L-2 on the sale path: a sale with too little gas for the walk reverts, it does not run on a stale base.
+    function test_v171_sale_with_starved_walk_reverts() public {
+        SwallowToken w = new SwallowToken(); _buyT(w, 1 ether); _buy(1 ether);
+        vm.startPrank(address(acct)); tok.approve(address(guard), 500e18);
+        vm.expectRevert(); guard.sell{gas: 130_000}(address(tok), 500e18, 1, route(address(tok), K_ETH, 500e18, address(guard))); vm.stopPrank();
+        assertTrue(_listed(address(w)));
     }
 }

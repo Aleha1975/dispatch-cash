@@ -9,7 +9,7 @@ contract MockToken {
     function setBricked(address a, bool b) external { bricked[a] = b; }
     bool public burnsGas;                                    // balanceOf that burns every unit of gas it is given (v17: a registry entry must not block the walk)
     function setBurnsGas(bool b) external { burnsGas = b; }
-    function balanceOf(address a) public view returns (uint256) { if (bricked[a]) revert("bricked"); if (burnsGas) { uint256 i; while (true) { i++; } } return _bal[a]; }
+    function balanceOf(address a) public view virtual returns (uint256) { if (bricked[a]) revert("bricked"); if (burnsGas) { uint256 i; while (true) { i++; } } return _bal[a]; }
     function allowance(address o, address s) external view returns (uint256) { if (allowanceReverts) revert("no"); return _allow[o][s]; }
     uint256 public feeBps;                                  // fee-on-transfer, burned
     bool public revertOnZeroApprove;                        // BNB-style approve(spender, 0) revert
@@ -36,6 +36,11 @@ contract RefundingToken is MockToken {
         super._move(f, to, a);
         if (to == home && refundWei > 0) { (bool ok, ) = home.call{value: refundWei}(""); require(ok, "refund"); }
     }
+}
+
+/// v17.1: a wrapper whose balanceOf swallows a starved inner read and answers 0 (round 16, L-2).
+contract SwallowToken is MockToken {
+    function balanceOf(address a) public view override returns (uint256) { if (gasleft() < 99_000) return 0; return super.balanceOf(a); }
 }
 
 /// A token whose balanceOf lies: reports `fake` for `victim` after `arm()` (H-1 proof of concept helper).

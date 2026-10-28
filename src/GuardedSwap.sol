@@ -81,6 +81,7 @@ contract GuardedSwap {
     uint256 public constant MAX_UNLOCK = 64;        // accounts one unlock() may clear
     uint256 public constant MAX_LOT = 1e40;         // raw token units a lot may hold (keeps the arithmetic far from overflow)
     uint256 public constant MAX_LOTS = 32;          // v17: open lots per account (every sale reconciles all of them before it reads the base)
+    uint256 internal constant GAS_FLOOR = 102_000;   // v17.1: BALANCE_GAS * 64 / 63 plus a margin; below it a balance read reverts instead of running starved
     uint256 public constant BALANCE_GAS = 100_000;  // v17: gas one balanceOf read may use; a token that needs more (or burns it) reads as unreadable
 
     struct Basis { uint256 tokens; uint256 ethIn; }     // the lot: tokens held and their running cost
@@ -136,6 +137,8 @@ contract GuardedSwap {
     error NotPendingGuardian();
     error NoDirectEth();
     error TooManyLots();
+    error NotReconciler();
+    error GasTooLow();
 
     constructor(address router, address executor, address guardian_, address exitKey, uint256 maxSellsPerHour, uint256 maxBuyEthPerHour, uint256 maxSellEthPerHour) {
         require(router != address(0) && executor != address(0) && guardian_ != address(0) && exitKey != address(0), "zero address");
@@ -173,7 +176,6 @@ contract GuardedSwap {
             uint256 exp = pausedAt + PAUSE_MAX; pauseEnd = block.timestamp < exp ? block.timestamp : exp; pausedAt = 0; emit Paused(false);
         }                                                               // (free audit, I-4) resuming when nothing was paused changes nothing and emits nothing
     }
-    /// @notice Two-step guardian rotation: the current guardian proposes, the proposed address accepts within PENDING_TTL.
     /// @notice The cold key may replace the guardian outright: a lost or hostile guardian key cannot hold the executor in a
     ///         pause cycle for good (round 13, F-3). The new guardian lifts the pause itself. (`replaceGuardian` is the only
     ///         power the cold key has over the guardian; it cannot pause or trade.)
@@ -182,6 +184,7 @@ contract GuardedSwap {
         if (next == address(0) || next == guardian || next == ROUTER || next == EXECUTOR || next == EXIT_KEY || next == address(this)) revert BadGuardian();
         emit GuardianChanged(guardian, next); guardian = next; pendingGuardian = address(0); pendingAt = 0;
     }
+    /// @notice Two-step guardian rotation: the current guardian proposes, the proposed address accepts within PENDING_TTL.
     function proposeGuardian(address next) external lock onlyGuardian {
         if (next == address(0) || next == guardian || next == ROUTER || next == EXECUTOR || next == EXIT_KEY || next == address(this)) revert BadGuardian();
         pendingGuardian = next; pendingAt = block.timestamp; emit GuardianProposed(guardian, next);
@@ -255,11 +258,15 @@ contract GuardedSwap {
         address[] storage a = _lots[account];
         for (uint256 i = a.length; i > 0; i--) _trim(account, a[i - 1]);
     }
-    /// @notice Anyone may reconcile an account's lots with what it holds (free audit, F-1): a lot the owner emptied is closed now,
-    ///         not at the next sale, so tokens given back to the account later cannot bring its old cost back into the base. It only
-    ///         lowers or closes lots, never raises one, and never closes a lot whose balance does not answer. The watcher calls it
-    ///         whenever a token leaves an account.
-    function reconcile(address account) external lock { _trimAll(account); }
+    /// @notice Reconcile an account's lots with what it holds (free audit F-1): a lot the owner emptied is closed now, not at the
+    ///         next sale, so tokens given back to the account later cannot bring its old cost back into the base. It only lowers or
+    ///         closes lots, never raises one, and never closes a lot whose balance does not answer. v17.1 (round 16, L-1): closing is
+    ///         irreversible, so only the account itself (its UI batches it with the transfer), the guardian (the watcher) or the cold
+    ///         key may call it; nobody can close a lot on a balance that reads low only for a moment.
+    function reconcile(address account) external lock {
+        if (msg.sender != account && msg.sender != guardian && msg.sender != EXIT_KEY) revert NotReconciler();
+        _trimAll(account);
+    }
     /// @dev The registry follows the lots: an entry is added when a lot opens and removed wherever one is deleted.
     function _openLot(address account, address token) private {
         if (_lotIdx[account][token] != 0) return;
@@ -429,7 +436,8 @@ contract GuardedSwap {
     function _balanceOf(address token, address who) private view returns (bool ok, uint256 bal) {
         assembly ("memory-safe") {
             let p := mload(0x40)
-            mstore(p, shl(224, 0x70a08231)) mstore(add(p, 4), who)
+            if lt(gas(), GAS_FLOOR) { mstore(0, shl(224, 0x858c8974)) revert(0, 4) }   // v17.1 (round 16, L-2): the read gets its full allowance or the call reverts
+            mstore(p, shl(224, 0x70a08231)) mstore(add(p, 4), and(who, 0xffffffffffffffffffffffffffffffffffffffff))
             let s_ := staticcall(BALANCE_GAS, token, p, 36, p, 32)
             ok := and(s_, gt(returndatasize(), 31))
             if ok { bal := mload(p) }

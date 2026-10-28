@@ -1,0 +1,21 @@
+Audit scope — round 17 (GuardedSwap v17.1)
+
+What to review: src/GuardedSwap.sol on branch v17.1, only the changes from v17 (commit 1dbb354, the round-16 subject, job 1063: 0 Critical, 0 High, 0 Medium, 2 Low, 4 Informational) and their seams with the rest of the contract. One contract, no dependencies. Not deployed; v15 0x2c894b3a726b49d9e68e71d548157964e5e0fbb6 is live on Base.
+
+Changes v17 -> v17.1
+1. L-1 (reconcile on a transient reading). reconcile(account) is no longer open to anyone: it reverts NotReconciler unless msg.sender is the account itself, the guardian or EXIT_KEY. The account's own UI batches transfer + reconcile; the watcher calls it with the guardian key. The router's EXECUTOR and any other address cannot. Lowering and closing semantics, the Reconciled event and the global lock are unchanged; the reconciliation inside sale/exit/buy is unchanged and still permissionless in effect (it runs for msg.sender).
+2. L-2 (balance read gas). _balanceOf reverts GasTooLow() when gasleft() < GAS_FLOOR (102 000 = BALANCE_GAS * 64 / 63 plus margin) before it issues the staticcall, so a read always receives its full BALANCE_GAS allowance or the whole call reverts; a low caller-chosen gas limit can no longer make an honest-looking token answer 0 through an inner try/catch. Applies to every use: buy measurement, _trim/_trimmed, _settle, _sweepToken and the views (budgetOf, floorFor, lotOf quote with the same helper; an eth_call needs the usual gas).
+3. I-3. _balanceOf masks the address argument to 160 bits (defence in depth).
+4. I-4(a). The guardian-rotation NatSpec moved from replaceGuardian to proposeGuardian.
+Not changed: I-1 (aliased entry points), I-2 (pull-side fee), I-4(b),(c) are accepted as informational; storage layout, budget, pause, unlock, exit, routes, hourly limits are as in v17.
+
+Claims to attack
+D1. Only the account, the guardian and EXIT_KEY can run reconcile(account); no other caller, contract or delegation chain can lower or close a lot except through the account's own sale/exit/buy.
+D2. No gas limit chosen by a caller can make any _balanceOf call run with less than BALANCE_GAS: either the staticcall gets min(BALANCE_GAS, 63/64 of the rest) = BALANCE_GAS, or the transaction reverts with GasTooLow. Check the 63/64 arithmetic, the cost of the opcodes between the gasleft() check and the staticcall (cold address access included), and EIP-150 behaviour.
+D3. GAS_FLOOR cannot block a sale or exit for a caller who supplies a normal gas limit: a walk over 32 lots that each burn the whole allowance needs roughly 3.5M gas and nothing else; eth_estimateGas finds it. Check that GasTooLow cannot be triggered by a token inside the walk (a token cannot lower the gas the next read sees below the floor by anything other than burning its own allowance, which the caller paid for).
+D4. v17.1 introduces no new way to raise the base and does not change C1-C7 of round 16; the register, costOf and the quote functions are untouched.
+D5. A stolen executor key (no access to the guardian or the cold key) cannot call reconcile on any account except through a delegation the account signed; the engine's executor delegations are restricted to the gate's buy/sell (+ approve to the gate).
+
+Accepted residuals (do not re-report unless a bound does not hold): R1-R7 of round 16 unchanged. R6 now has a narrower reading: between the owner's outgoing transfer and the guardian's (or the account's own) reconcile, giving the tokens back reinstates the emptied lot's cost; the owner's UI batches reconcile with the transfer. A guardian key compromise can lower or close lots on balances that really read low (not raise them) and can already pause; accepted.
+
+Tests: forge test --no-match-path 'test/{Fork,ForkCbPiggy,Audit15}.t.sol' — 72 tests pass (3 new: test_v171_reconcile_restricted_to_account_guardian_cold, test_v171_starved_balance_read_reverts_instead_of_closing_the_lot, test_v171_sale_with_starved_walk_reverts). With the two checks removed, the first two fail (verified); the third is a regression guard (the sale path reverts either way, as round 16 noted).
