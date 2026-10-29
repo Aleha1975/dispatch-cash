@@ -81,7 +81,7 @@ contract GuardedSwap {
     uint256 public constant MAX_UNLOCK = 64;        // accounts one unlock() may clear
     uint256 public constant MAX_LOT = 1e40;         // raw token units a lot may hold (keeps the arithmetic far from overflow)
     uint256 public constant MAX_LOTS = 32;          // v17: open lots per account (every sale reconciles all of them before it reads the base)
-    uint256 internal constant GAS_FLOOR = 102_000;   // v17.1: BALANCE_GAS * 64 / 63 plus a margin; below it a balance read reverts instead of running starved
+    uint256 internal constant GAS_FLOOR = 108_000;   // v17.2 (round 17, F-1): BALANCE_GAS * 64 / 63 plus the cold-access charges (2 x 2600) and a margin; below it a balance read reverts instead of running starved
     uint256 public constant BALANCE_GAS = 100_000;  // v17: gas one balanceOf read may use; a token that needs more (or burns it) reads as unreadable
 
     struct Basis { uint256 tokens; uint256 ethIn; }     // the lot: tokens held and their running cost
