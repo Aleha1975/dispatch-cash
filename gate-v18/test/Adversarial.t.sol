@@ -33,15 +33,15 @@ contract AdversarialTest is GateBase {
 
     // F2 (was High, L4): profit leak. A price reference built from recent executor trades makes a far-below-market sale cost budget.
     function test_FIXED_profit_leak_sale_far_below_market_books_shortfall_or_is_refused() public {
-        // other clients keep trading the token while the market rises 3x: three buys on acct2, each lifts the reference by at most 1.5x
+        // the account's own executor buys keep lifting its reference while the market rises 3x (each note at most 1.5x the live value)
         _buy(17.5 ether);                                                                 // acct: 17500 tokens, cost 17.5 (price 1e15)
         router.set(333, 3e15, address(0));
-        for (uint256 i = 0; i < 3; i++) { _hours(2); _buyT(acct2, tok, 1 ether); }
-        (uint128 rp, ) = gate.ref(address(tok)); assertGt(uint256(rp), 2.9e15);           // reference ~3e15
+        for (uint256 i = 0; i < 3; i++) { _hours(2); _buy(1 ether); }
+        (uint256 rp, ) = gate.ref(address(acct), address(tok)); assertGt(rp, 2.9e27);      // reference ~3e15 wei per token = 3e27 per 1e30 raw units
         router.set(1000, 1e15, address(0));                                               // rigged pool pays only cost
-        // one lot of 17.5: shortfall vs reference is booked as loss (0.7 * 3.0 * 17.5 - 17.5 ~ 19.3), inside the 30% budget: passes but costs budget
+        // 17.5 of the ~20.5 lot: shortfall vs reference is booked as loss (0.7 * 3.0 * 17.5 - 17.5 ~ 19.3), inside the 30% budget: passes but costs budget
         uint256 out = _sell(17_500 ether); assertEq(out, 17.5 ether);
-        (uint256 lost, ) = gate.budgetOf(address(acct)); assertGt(lost, 19 ether);
+        (uint256 lost, ) = gate.budgetOf(address(acct)); assertGt(lost, 17 ether);
         // a bigger position: the shortfall exceeds the budget and the executor sale is refused
         _hours(2); router.set(333, 3e15, address(0)); _buy(10 ether); _hours(2); _buy(10 ether); router.set(1000, 1e15, address(0));
         uint256 held = tok.balanceOf(address(acct)); assertGt(held, 6000 ether);
@@ -51,9 +51,9 @@ contract AdversarialTest is GateBase {
         _ownerExit(acct, owner1, tok, held);
     }
     function test_reference_decays_and_cannot_be_jumped_by_one_trade() public {
-        _buy(1 ether); (uint128 p0, ) = gate.ref(address(tok)); assertEq(uint256(p0), 1e15);
-        router.set(100, 1e16, address(0)); _hours(2); _buy(1 ether);                      // a 10x rigged-price buy: capped at 1.5x
-        (uint128 p1, ) = gate.ref(address(tok)); assertEq(uint256(p1), 1.5e15);
+        _buy(1 ether); (uint256 p0, ) = gate.ref(address(acct), address(tok)); assertEq(p0, 1e27);
+        router.set(100, 1e16, address(0)); _hours(2); _buy(1 ether);                      // a 10x rigged-price buy: capped at 1.5x the faded live value
+        (uint256 p1, ) = gate.ref(address(acct), address(tok)); assertEq(p1, (uint256(1e27) * (2 days - 7201) / 2 days) * 15000 / 10000);   // 1.5x the FADED value (round 2), not 1.5x the stored 1e27
         vm.warp(block.timestamp + 3 days); router.set(1000, 1e14, address(0));            // reference expired: a 10x lower sale is only a cost question
         _hours(2); router.set(1000, 1e15, address(0)); _buyT(acct2, tok, 1 ether);
         router.set(1000, 5e14, address(0)); acct2.exec(address(gate), 0, _sellData(tok, 500 ether, 1));    // -50% vs cost, small: books 0.25, no reference effect

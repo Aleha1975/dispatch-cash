@@ -58,7 +58,7 @@ contract GuardedGate {
     uint256 public constant REF_DECAY = 2 days;     // the reference fades linearly to zero over this
     uint256 public constant REF_STEP_BPS = 15000;   // a trade may raise the stored reference by at most 1.5x
     uint256 public constant MIN_REF_ETH = 0.001 ether;   // trades smaller than this do not move the reference
-    uint256 internal constant MAX_REF_PRICE = 1 << 96;
+    uint256 internal constant PRICE_SCALE = 1e30;        // round 2 (L-2): reference prices are ETH per 1e30 raw units, in a full uint256 (no range cut-off)
     uint256 public constant OWNER_GAS = 100_000;    // bound of the owner() read
     uint256 public constant MAX_UNLOCK = 64;        // accounts one unlock() may clear
     uint256 public constant MAX_LOT = 1e40;         // raw token units a lot may hold (keeps the arithmetic far from overflow)
@@ -83,9 +83,10 @@ contract GuardedGate {
     /// Each is a (current bucket, previous bucket) pair; the previous one counts with the weight of the time left in the current one.
     struct Pay { uint64 feeBucket; uint128 feeCur; uint128 feePrev; uint128 wdCur; uint128 wdPrev; uint64 gasBucket; uint128 gasCur; uint128 gasPrev; }
     mapping(address => Pay) public pay;
-    /// per-token market price reference, global across accounts: highest implied price (wei per 1e18 raw units) of recent executor trades
-    struct Ref { uint128 price; uint64 at; }
-    mapping(address => Ref) public ref;
+    /// round 2 (H-1): per-ACCOUNT, per-token price reference: highest implied price (wei per PRICE_SCALE raw units) of the account's own recent
+    /// executor trades. Keyed by msg.sender, so nobody can touch another account's reference.
+    struct Ref { uint256 price; uint64 at; }
+    mapping(address => mapping(address => Ref)) public ref;
 
     address public guardian;
     address public pendingGuardian;
@@ -211,19 +212,29 @@ contract GuardedGate {
     // ---- windows, budget ----
     /// @dev Two-bucket sliding window: buckets are aligned slots of `span` seconds. The previous bucket counts with the share of the
     ///      current slot still to run, so an edge burst cannot double the limit (it reads full weight right after the boundary).
+    ///      Round 2 (L-4): if time appears to go backward (stored bucket ahead of the clock) the stored bucket is kept, nothing resets.
     function _roll(uint64 bucket, uint128 cur, uint128 prev, uint256 span) private view returns (uint64 nb, uint128 c, uint128 p) {
         nb = uint64(block.timestamp / span);
-        if (bucket == nb) return (nb, cur, prev);
+        if (bucket >= nb) return (bucket, cur, prev);
         if (bucket + 1 == nb && bucket != 0) return (nb, 0, cur);
         return (nb, 0, 0);
     }
-    function _weigh(uint128 cur, uint128 prev, uint256 span) private view returns (uint256) {
-        return uint256(prev) * (span - block.timestamp % span) / span + cur;
+    /// @dev Round 2 (L-1): conservative total max(cur + prev * w, prev), w = share of the slot still to run (1 if the stored bucket is ahead of the
+    ///      clock). Spend concentrated at the end of two adjacent slots is counted in full, so one span can never carry more than the limit.
+    function _weigh(uint64 nb, uint128 cur, uint128 prev, uint256 span) private view returns (uint256) {
+        uint256 w = nb == block.timestamp / span ? span - block.timestamp % span : span;
+        uint256 v = uint256(prev) * w / span + cur;
+        return v > prev ? v : prev;
+    }
+    /// @dev The same weighting WITHOUT the max: used for withdrawn amounts, which only widen the fee base (under-counting is the safe side).
+    function _weighLow(uint64 nb, uint128 cur, uint128 prev, uint256 span) private view returns (uint256) {
+        uint256 w = nb == block.timestamp / span ? span - block.timestamp % span : span;
+        return uint256(prev) * w / span + cur;
     }
     function _countBuy(uint256 spent) private {
         Window storage w = window[msg.sender];
         (uint64 nb, uint128 c, uint128 p) = _roll(w.bucket, w.cur, w.prev, BUY_WINDOW);
-        if (_weigh(c, p, BUY_WINDOW) + spent > MAX_BUY_ETH_PER_HOUR) revert RateLimited();
+        if (_weigh(nb, c, p, BUY_WINDOW) + spent > MAX_BUY_ETH_PER_HOUR) revert RateLimited();
         w.bucket = nb; w.prev = p; w.cur = c + uint128(spent);
     }
     function _ceil(uint256 a, uint256 b) private pure returns (uint256) { return (a + b - 1) / b; }
@@ -365,7 +376,7 @@ contract GuardedGate {
         b.ethIn += spent; b.tokens += out; costOf[msg.sender] += spent;
         if (b.tokens > MAX_LOT) revert TooLarge();
         emit Bought(msg.sender, token, spent, out);
-        _refNote(token, spent, out);                                // the price this buy paid feeds the token's reference
+        _refNote(token, spent, out);                                // the price this buy paid feeds the account's own reference for the token
         if (change > 0) _sendEth(msg.sender, change);               // state is final before any ETH leaves
     }
 
@@ -393,6 +404,7 @@ contract GuardedGate {
         if (minOut == 0) revert MinOutZero();
         if (token.code.length == 0) revert NotAContract();
         _trimAll(msg.sender);                                       // v17: every lot reconciled -- the exit too, so the books stay true; it still ignores the budget
+        _trim(msg.sender, token);                                   // round 2 (L-3): the sold token's lot is always reconciled, whatever the gas-bounded walk reached
         { uint256 lot = basis[msg.sender][token].tokens; if (amount > lot) revert NotInLot(lot, amount); }   // only what this gate saw bought, and still holds
         uint256 budget = isExit ? 0 : _budgetOn(_base(msg.sender)); // measured once, on the reconciled lots, before anything moves (the router call cannot raise it)
         uint256 tokBase = _gateBal(token);   // tokens that were here before this call stay untouched
@@ -419,8 +431,12 @@ contract GuardedGate {
         uint256 added;
         if (!isExit) {
             if (out < cost) added = cost - out;
-            uint256 rp = _refPrice(token);                          // price reference: a sale far under a recent market price books the shortfall as loss
-            if (rp != 0) { uint256 fl = rp * sold / 1e18 * (10000 - MAX_DROP_BPS) / 10000; if (out < fl && fl - out > added) added = fl - out; }
+            uint256 rp = _refPrice(token);                          // the account's price reference: a sale far under its recent market price books the shortfall as loss
+            if (rp != 0) {
+                uint256 fl = rp <= type(uint256).max / sold ? rp * sold / PRICE_SCALE : type(uint256).max / PRICE_SCALE;   // saturates: an absurd reference can only refuse the sale
+                fl = fl / 10000 * (10000 - MAX_DROP_BPS);
+                if (out < fl && fl - out > added) added = fl - out;
+            }
         }
         if (added != 0) {
             uint256 carried = _decayed(msg.sender); uint256 total = carried + added;   // against the budget measured when the sale started
@@ -436,35 +452,42 @@ contract GuardedGate {
         emit Sold(msg.sender, token, sold, out, added, isExit);
     }
 
-    // ---- per-token price reference ----
-    /// @dev Reference price of `token` now: the stored high-water price faded linearly to zero over REF_DECAY (0 = none).
+    // ---- per-account, per-token price reference (round 2, H-1) ----
+    /// @dev The calling account's reference price of `token` now: the stored high-water price faded linearly to zero over REF_DECAY (0 = none).
     function _refPrice(address token) private view returns (uint256) {
-        Ref storage r = ref[token];
+        Ref storage r = ref[msg.sender][token];
         uint256 dt = block.timestamp > r.at ? block.timestamp - r.at : 0;
         if (r.price == 0 || dt >= REF_DECAY) return 0;
-        return uint256(r.price) * (REF_DECAY - dt) / REF_DECAY;
+        return r.price * (REF_DECAY - dt) / REF_DECAY;
     }
-    /// @dev Record an executor trade's implied price (ETH per 1e18 raw token units). It only ever raises the reference (high-water), and a
-    ///      single trade lifts a live reference by at most REF_STEP_BPS, so one rigged trade cannot jump it. Dust trades are ignored.
+    /// @dev Record the calling account's own executor trade (msg.sender is the account, its lot is read from storage). Prices are wei per
+    ///      PRICE_SCALE raw units. It only raises the reference. The step cap applies to the FADED live value (REF_STEP_BPS of _refPrice), never to
+    ///      the stored undecayed one; with no live reference the first note may not exceed 1.5x the lot's cost-basis price. A third party cannot
+    ///      reach this state: it is keyed by msg.sender. Dust trades are ignored.
     function _refNote(address token, uint256 eth, uint256 tokens) private {
         if (eth < MIN_REF_ETH || tokens == 0) return;
-        uint256 pr = eth * 1e18 / tokens;
-        if (pr >= MAX_REF_PRICE) return;
-        if (pr <= _refPrice(token)) return;
-        Ref storage r = ref[token];
-        if (r.price != 0 && block.timestamp < r.at + REF_DECAY) { uint256 cap = uint256(r.price) * REF_STEP_BPS / 10000; if (pr > cap) pr = cap; }
-        r.price = uint128(pr); r.at = uint64(block.timestamp);
+        uint256 pr = eth * PRICE_SCALE / tokens;
+        uint256 live = _refPrice(token);
+        if (pr <= live) return;
+        uint256 cap;
+        if (live != 0) cap = live * REF_STEP_BPS / 10000;
+        else { Basis storage b = basis[msg.sender][token]; if (b.tokens == 0) return; cap = b.ethIn * PRICE_SCALE / b.tokens * REF_STEP_BPS / 10000; }
+        if (pr > cap) pr = cap;
+        if (pr == 0) return;
+        Ref storage r = ref[msg.sender][token];
+        r.price = pr; r.at = uint64(block.timestamp);
     }
 
     // ---- money out of the account: fee, gas, withdrawal ----
     /// @dev Roll the fee window (30-day buckets) and return the weighted fee total and the weighted non-owner withdrawals.
     function _feeRoll(Pay storage p) private returns (uint256 feeW, uint256 wdW) {
         uint64 nb = uint64(block.timestamp / FEE_WINDOW);
+        if (p.feeBucket > nb) nb = p.feeBucket;                     // round 2 (L-4): time stepping backward keeps the stored bucket
         if (p.feeBucket != nb) {
             if (p.feeBucket != 0 && p.feeBucket + 1 == nb) { p.feePrev = p.feeCur; p.wdPrev = p.wdCur; } else { p.feePrev = 0; p.wdPrev = 0; }
             p.feeCur = 0; p.wdCur = 0; p.feeBucket = nb;
         }
-        return (_weigh(p.feeCur, p.feePrev, FEE_WINDOW), _weigh(p.wdCur, p.wdPrev, FEE_WINDOW));
+        return (_weigh(nb, p.feeCur, p.feePrev, FEE_WINDOW), _weighLow(nb, p.wdCur, p.wdPrev, FEE_WINDOW));
     }
     /// @notice The performance fee, paid from the calling account (msg.value) to FEE_TO only. Two limits, both measured on the account's
     ///         native balance: (1) this call <= 20% of the balance the account had before it (msg.sender.balance + msg.value);
@@ -486,9 +509,9 @@ contract GuardedGate {
     /// @notice The fee the account could be charged right now (a view for the engine; the same two limits as payFee).
     function feeRoom(address account) external view returns (uint256 room) {
         Pay storage p = pay[account]; uint256 bal = account.balance;
-        (, uint128 fc, uint128 fp) = _roll(p.feeBucket, p.feeCur, p.feePrev, FEE_WINDOW);
+        (uint64 fb, uint128 fc, uint128 fp) = _roll(p.feeBucket, p.feeCur, p.feePrev, FEE_WINDOW);
         (, uint128 wc, uint128 wp) = _roll(p.feeBucket, p.wdCur, p.wdPrev, FEE_WINDOW);
-        uint256 feeSum = _weigh(fc, fp, FEE_WINDOW); uint256 wd = _weigh(wc, wp, FEE_WINDOW);
+        uint256 feeSum = _weigh(fb, fc, fp, FEE_WINDOW); uint256 wd = _weighLow(fb, wc, wp, FEE_WINDOW);
         room = bal * FEE_MAX_BPS / 10000;
         uint256 agg = (bal + feeSum + wd) * FEE_MAX_BPS / 10000; agg = agg > feeSum ? agg - feeSum : 0;
         if (agg < room) room = agg;
@@ -502,7 +525,7 @@ contract GuardedGate {
         if (v > GAS_CALL_MAX) revert GasLimit();
         Pay storage p = pay[msg.sender];
         (uint64 nb, uint128 c, uint128 pv) = _roll(p.gasBucket, p.gasCur, p.gasPrev, GAS_WINDOW);
-        uint256 day = _weigh(c, pv, GAS_WINDOW) + v;
+        uint256 day = _weigh(nb, c, pv, GAS_WINDOW) + v;
         if (day > GAS_DAY_MAX) revert GasLimit();
         if (day * 10000 > (msg.sender.balance + v) * GAS_BAL_BPS) revert GasLimit();
         p.gasBucket = nb; p.gasPrev = pv; p.gasCur = c + _u128(v);

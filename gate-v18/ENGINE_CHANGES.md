@@ -37,7 +37,7 @@ v18 keeps today's account model: tokens stay in the client's account, a sale pul
 | `reconcile` | watcher calls it | unchanged (account / guardian / cold key). |
 
 Other places:
-- ABI: new `guardAbiV18`: `buy, sell, exitSell, exit, payFee, refundGas, withdraw, withdrawTo, forgetLot, feeRoom, ownerOf, pay(address), ref(address), lotOf, lotsOf, budgetOf, floorFor, reconcile, unlock, setPaused`; events `Bought, Sold, FeePaid, GasPaid, Withdrawn, LotForgotten, Reconciled`. `pay` and `window` getters changed shape (two-bucket sliding windows); only `feeRoom` should be used for fee sizing.
+- ABI: new `guardAbiV18`: `buy, sell, exitSell, exit, payFee, refundGas, withdraw, withdrawTo, forgetLot, feeRoom, ownerOf, pay(address), ref(address account, address token), lotOf, lotsOf, budgetOf, floorFor, reconcile, unlock, setPaused`; events `Bought, Sold, FeePaid, GasPaid, Withdrawn, LotForgotten, Reconciled`. `pay` and `window` getters changed shape (two-bucket sliding windows); only `feeRoom` should be used for fee sizing.
 - `GUARD_ERR` add (checked with `cast sig`): `0x74b1a5d3 FeeLimit`, `0x48dd75ba GasLimit`, `0xac64a0a9 NoBeneficiary`, `0x67a2cc26 BadRecipient`, `0x345c7cac TokenUnreadable`, plus new `NotOwnerOrigin`, `DustLot` (recompute with `cast sig`). A new lot needs a buy of at least 0.001 HYPE (`DustLot`); `BudgetExceeded` can now also come from the price reference when a token's price fell > 30% below its recent high. `RateLimited` now only comes from buys.
 - Deploy params struct (different from v17.2): `{router, executor(kyber), guardian, exitKey, feeTo, maxBuyEthPerHour 17.5e18, gasCallMax 0.02e18, gasDayMax 0.1e18}`.
 - Watcher: pause on a foreign trade as today; also alarm on `Withdrawn` for amounts > 50% of an account without a client request (a thief's only "withdraw" is a DoS), and on `Sold` events booked with `lossAdded` far above the engine's own expectation.
@@ -52,3 +52,9 @@ Other places:
 
 ## 4. Migration of accounts on the old gate (0x795f8ff1...146d5)
 Old permissions keep working with the old gate (`st.legacy[gate]` machinery). A client who signs `gate` + `approve` for the new address trades on v18 for new buys; positions bought through the old gate are in the old gate's lot book and are sold through the legacy set (the lot lives in the old contract). Simplest: ask the handful of live accounts to re-sign both once and close old-gate positions first. Add the old gate to `GUARD_PREV`.
+
+## Round 2 (audit job 1205): interface changes
+- `ref(address)` became `ref(address account, address token)` returning `(uint256 price, uint64 at)`; price is wei per 1e30 raw units (was uint128 per 1e18). The engine does not read it (informational only).
+- Buy window: after spending the full hourly cap in one slot, further buys are refused until the previous slot no longer counts in full (up to two slots). Treat `MAX_BUY_ETH_PER_HOUR` as a hard limit per span; `RateLimited` is the signal to wait.
+- `feeRoom` / `payFee` / `refundGas` use the same conservative window (fees of the previous 30-day slot count in full until the slot ends); always size the fee with `feeRoom`.
+- Selectors, the delegation method list and `sell` arguments are unchanged.

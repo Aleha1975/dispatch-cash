@@ -43,6 +43,8 @@ contract MockRouter {
     address constant K_ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
     uint256 public ethPerToken; uint256 public tokensPerEth; address public payTo;
     address public reenterGate; bytes public reenterData; bool public reentered; bool public reentryBlocked;
+    uint256 public fixedOut;                     // test helper: a buy mints exactly this many raw units (0 = value * tokensPerEth)
+    function setFixedOut(uint256 o) external { fixedOut = o; }
     uint256 public kickWei; address public kickTo; bool public pullHalf; uint256 public refund;
     receive() external payable {}
     function set(uint256 tpe, uint256 ept, address to) external { tokensPerEth = tpe; ethPerToken = ept; payTo = to; }
@@ -56,10 +58,11 @@ contract MockRouter {
         if (reenterGate != address(0)) { reentered = true; (bool ok, bytes memory r) = reenterGate.call(reenterData); reentryBlocked = !ok && r.length >= 4 && bytes4(r) == GuardedGate.Reentrancy.selector; }
         if (d.srcToken == K_ETH) {
             require(msg.value == d.amount, "value");
-            MockToken(d.dstToken).mint(to, msg.value * tokensPerEth);
+            uint256 outAmt = fixedOut != 0 ? fixedOut : msg.value * tokensPerEth;
+            MockToken(d.dstToken).mint(to, outAmt);
             if (refund > 0) { (bool okr, ) = msg.sender.call{value: refund}(""); require(okr, "refund"); }
             if (kickWei > 0) { (bool okk, ) = kickTo.call{value: kickWei}(""); require(okk, "kick"); }
-            return (msg.value * tokensPerEth, 0);
+            return (outAmt, 0);
         }
         uint256 pull = pullHalf ? d.amount / 2 : d.amount;
         MockToken(d.srcToken).transferFrom(msg.sender, address(this), pull);
