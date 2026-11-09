@@ -1,0 +1,37 @@
+PASS fork is real Elysium (chain id, kyber executor has code)  chain 99901, fork block 3473469
+PASS Hybrid account owner() is the client's wallet and the gate reads it
+PASS signature 1 (gate delegation), recovered signer = owner (sign-in folded)  4 caveats
+PASS gate delegation carries no native value cap (no valueLte / period / transfer-amount enforcer)  4 caveats: targets, methods, expiry 90 d, limitedCalls 100000
+PASS signature 2 (approve delegation) by the owner
+PASS buy 3 HYPE via the gate delegation
+PASS tokens sit in the client's account, none in the gate  lot 3000 cost 3
+PASS refused: sell before the approve (no allowance for the gate)
+PASS approve(gate) via the approve delegation
+PASS refused: approve with a spender other than the gate (calldata word 0 pinned)
+PASS sell 1000 tokens
+PASS sale proceeds (1 HYPE) arrived in the account; tokens left the account, gate holds none
+PASS payFee 5 HYPE (within 20% of the account balance)
+PASS refundGas 0.01 HYPE
+PASS FEE_TO received exactly fee + gas
+PASS refused: payFee above 20% of the balance (50 HYPE)
+PASS refused: second fee that would push 30-day fees past 20% of the base (16 HYPE)
+PASS withdraw 2 HYPE
+PASS owner EOA got exactly 2 HYPE
+PASS gate holds no HYPE and no tokens
+PASS refused: gate functions outside the list (exitSell / forgetLot / withdrawTo / unlock)
+PASS refused: a plain native transfer to a thief (target != gate)
+PASS refused: token transfer to a thief (the approve delegation allows approve only)
+PASS refused: approve delegation used on the gate (target/method)
+PASS refused: delegation signed by another key
+PASS paused: buy / sell / payFee refused
+PASS paused: withdraw 1 HYPE still works
+PASS owner got it while paused
+PASS refused: even a delegation to the executor cannot exitSell (tx.origin != owner, NotOwnerOrigin)
+PASS refused: the executor cannot redeem the owner's exitSell delegation
+PASS paused: owner exitSell 500 tokens through his own delegation (real Hybrid account, tx.origin = owner)
+PASS exitSell proceeds (0.5 HYPE) arrived in the account, tokens left it, gate holds none
+PASS withdraw the FULL account balance in ONE call (90.49 HYPE), paused
+PASS owner EOA received all of it; account is empty; gate holds nothing  owner +90.49
+PASS the client's remaining 1500 tokens are still in his own account
+
+ALL PASSED
