@@ -1,4 +1,4 @@
-PASS fork is real Elysium (chain id, kyber executor has code)  chain 99901, fork block 3486125
+PASS fork is real Elysium (chain id, kyber executor has code)  chain 99901, fork block 3495766
 PASS Hybrid account owner() is the client's wallet and the gate reads it
 PASS signature 1 (gate delegation), recovered signer = owner (sign-in folded)  4 caveats
 PASS gate delegation carries no native value cap (no valueLte / period / transfer-amount enforcer)  4 caveats: targets, methods, expiry 90 d, limitedCalls 100000

@@ -46,7 +46,7 @@ contract FeeTest is GateBase {
         gate.payFee{value: 20 ether}();
         vm.expectRevert(GuardedGate.FeeLimit.selector); gate.payFee{value: 1 ether}();
         vm.stopPrank();
-        (, , , uint128 wdc, uint128 wdp, , , ) = gate.pay(self); assertEq(wdc + wdp, 0);
+        (, , uint256 wdn, ) = gate.windows(self); assertEq(wdn, 0);
     }
     function test_withdrawTo_other_than_owner_widens_withdraw_to_owner_does_not() public {
         _fee(acct, 20 ether);                                                    // 100 -> 80, aggregate used up

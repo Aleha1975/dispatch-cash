@@ -58,3 +58,9 @@ Old permissions keep working with the old gate (`st.legacy[gate]` machinery). A 
 - Buy window: after spending the full hourly cap in one slot, further buys are refused until the previous slot no longer counts in full (up to two slots). Treat `MAX_BUY_ETH_PER_HOUR` as a hard limit per span; `RateLimited` is the signal to wait.
 - `feeRoom` / `payFee` / `refundGas` use the same conservative window (fees of the previous 30-day slot count in full until the slot ends); always size the fee with `feeRoom`.
 - Selectors, the delegation method list and `sell` arguments are unchanged.
+
+## Round 3 (audit job 1206): interface changes
+- `pay(address)` and `window(address)` getters are gone; `windows(address) returns (buys, fees, withdrawn, gas)` gives the ring totals now (informational; size fees with `feeRoom`).
+- Windows are rings of 6 sub-buckets plus the running one: after a full-cap buy the next buy is possible after at most 70 minutes (not 1 to 2 hours); plan buys as <= 17.5 HYPE per 60 minutes, a steady 2.5 per 10 minutes is always allowed. `RateLimited` / `FeeLimit` / `GasLimit` unchanged.
+- `floorFor(account, token, amount)` now also covers the price-reference floor; pass at least this as `minOut` to avoid `BudgetExceeded` after the swap.
+- Reference: at most one raise per 10 minutes, deleted when the lot closes. `ref(account, token)` keeps its shape. Selectors of buy/sell/payFee/refundGas/withdraw and the delegation method list are unchanged.

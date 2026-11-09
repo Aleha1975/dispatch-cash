@@ -53,7 +53,7 @@ contract Round2Test is GateBase {
         assertGe(uint256(1 ether) * 1e18 / rawPerEth, 1 << 96);          // the old rule would have dropped this price
         router.setFixedOut(rawPerEth); acct.exec(address(gate), 1 ether, _buyData(t, 1 ether));
         (uint256 p, ) = gate.ref(address(acct), address(t)); assertEq(p, 1 ether * 1e30 / rawPerEth);
-        router.setFixedOut(rawPerEth / 7); acct.exec(address(gate), 0.2 ether, _buyData(t, 0.2 ether)); router.setFixedOut(0);   // a pricier buy lifts it, stepwise
+        vm.warp(block.timestamp + 11 minutes); router.setFixedOut(rawPerEth / 7); acct.exec(address(gate), 0.2 ether, _buyData(t, 0.2 ether)); router.setFixedOut(0);   // a pricier buy lifts it, stepwise
         (uint256 p2, ) = gate.ref(address(acct), address(t)); assertGt(p2, p);
         // and the 70% floor works: a sale at 25% of the reference books the reference shortfall on top of the cost shortfall
         (uint256 tk, ) = gate.lotOf(address(acct), address(t));
@@ -99,7 +99,7 @@ contract Round2Test is GateBase {
     function test_L4_backward_time_buys_do_not_reset() public {
         vm.warp((block.timestamp / 1 hours + 1) * 1 hours + 10);
         uint256 t0 = block.timestamp;
-        _buy(17.4 ether); vm.warp(t0 + 1 hours + 3000); _buy(0.1 ether);        // stored bucket moves to the next slot
+        _buy(17.4 ether); vm.warp(t0 + 40 minutes); _buy(0.1 ether);        // stored head moves ahead (round 3: ring slots of 10 min)
         vm.warp(t0);                                                      // clock steps back into the earlier slot
         vm.expectRevert(GuardedGate.RateLimited.selector); acct.exec(address(gate), 17.4 ether, _buyData(tok, 17.4 ether));
     }

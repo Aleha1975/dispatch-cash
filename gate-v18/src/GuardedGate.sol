@@ -19,7 +19,8 @@ pragma solidity ^0.8.26;
 ///            adds a per-token price reference (a sale far below a recent market price books the shortfall as loss). The client's own
 ///            sale is exitSell(): not delegated, proven by tx.origin == owner, outside the budget and the reference, works while paused.
 ///         4. FEE_TO is a constructor immutable; the pause also stops fee and gas payments, never withdraw / exit / exitSell.
-///         5. Fee / buy / gas limits use a two-bucket weighted sliding window instead of fixed windows.
+///         5. Fee / buy / gas limits use a ring of 6 sub-buckets per span (plus the running one): the full sum of the ring is counted
+///            (conservative, never over-allows; round 3).
 ///
 ///         Kept from v17.2: loss budget (30% of ETH + cost of open lots, 7-day linear refill, cold-key unlock), only-the-lot rule with
 ///         reconciliation against the account's holdings (_trim/_trimAll, 32-lot registry), pinned router executor and decoded route,
@@ -48,7 +49,7 @@ contract GuardedGate {
     uint256 public constant PENDING_TTL = 7 days;   // a proposed guardian must accept within this
     uint256 public constant MAX_RECEIVERS = 8;      // srcReceivers a sale route may name
     uint256 public constant FEE_MAX_BPS = 2000;     // payFee: at most 20% of the account's native balance (per call, and per FEE_WINDOW in total)
-    uint256 public constant FEE_WINDOW = 30 days;   // span of the sliding fee window (two buckets of this length, weighted)
+    uint256 public constant FEE_WINDOW = 30 days;   // span of the sliding fee window (a ring of 6 sub-buckets of 5 days, round 3)
     uint256 public constant BUY_WINDOW = 1 hours;
     uint256 public constant GAS_WINDOW = 1 days;
     uint256 public constant GAS_BAL_BPS = 500;      // refundGas: the weighted day total also stays <= 5% of the account's balance
@@ -57,7 +58,12 @@ contract GuardedGate {
     uint256 public constant MAX_DROP_BPS = 3000;    // an executor sale may not realise less than (1 - 30%) of the token's price reference without booking the shortfall
     uint256 public constant REF_DECAY = 2 days;     // the reference fades linearly to zero over this
     uint256 public constant REF_STEP_BPS = 15000;   // a trade may raise the stored reference by at most 1.5x
-    uint256 public constant MIN_REF_ETH = 0.001 ether;   // trades smaller than this do not move the reference
+    uint256 public constant MIN_REF_ETH = 0.001 ether;   // trades smaller than this do not move the reference (round 3, M-1: and nor does a trade under REF_MIN_LOT_BPS of the lot's cost)
+    uint256 public constant REF_MIN_LOT_BPS = 500;       // round 3 (M-1): a note needs eth >= 5% of the lot's ethIn (sell: the lot before the sale; buy: the lot before the buy)
+    uint256 public constant REF_GAP = 10 minutes;        // round 3 (M-1): at most one reference raise per account+token per this long
+    uint256 public constant REF_LOT_MULT = 3;            // round 3 (M-1): while a lot exists the reference is at most 3x the lot's cost-basis price
+    uint256 internal constant RING = 7;                  // round 3 (L-1): 6 sub-buckets of span/6 cover the span; the 7th is the one now running (so a spend is counted for >= span)
+    uint256 internal constant SUBS = 6;
     uint256 internal constant PRICE_SCALE = 1e30;        // round 2 (L-2): reference prices are ETH per 1e30 raw units, in a full uint256 (no range cut-off)
     uint256 public constant OWNER_GAS = 100_000;    // bound of the owner() read
     uint256 public constant MAX_UNLOCK = 64;        // accounts one unlock() may clear
@@ -74,15 +80,16 @@ contract GuardedGate {
     mapping(address => Loss) public loss;
 
     uint256 public immutable MAX_BUY_ETH_PER_HOUR;    // set at deployment (production: 17.5 ether). Sells have no count / proceeds cap (DESIGN.md 1.4)
-    struct Window { uint64 bucket; uint128 cur; uint128 prev; }   // per account: buy HYPE in this hour bucket and the previous one (sliding, weighted)
-    mapping(address => Window) public window;
+    /// round 3 (L-1): ring of RING sub-buckets; `head` = index (time / slot) of the newest one, v[i % RING] holds slot i. The sum of the ring is the spend of
+    /// the last span (+ at most one slot). Time stepping backward keeps the stored head (nothing resets).
+    struct Ring { uint64 head; uint128[7] v; }
+    mapping(address => Ring) private win;                 // per account: buy HYPE (slots of BUY_WINDOW / 6)
 
     uint256 public immutable GAS_CALL_MAX;
     uint256 public immutable GAS_DAY_MAX;
-    /// fee window (30-day buckets): fees paid and native withdrawn through withdrawTo to a non-owner; gas window (day buckets): gas refunded.
-    /// Each is a (current bucket, previous bucket) pair; the previous one counts with the weight of the time left in the current one.
-    struct Pay { uint64 feeBucket; uint128 feeCur; uint128 feePrev; uint128 wdCur; uint128 wdPrev; uint64 gasBucket; uint128 gasCur; uint128 gasPrev; }
-    mapping(address => Pay) public pay;
+    /// fee ring (slots of 5 days): fees paid; wd ring: native withdrawn through withdrawTo to a non-owner; gas ring (slots of 4 h): gas refunded.
+    struct Pay { Ring fee; Ring wd; Ring gas; }
+    mapping(address => Pay) private pay;
     /// round 2 (H-1): per-ACCOUNT, per-token price reference: highest implied price (wei per PRICE_SCALE raw units) of the account's own recent
     /// executor trades. Keyed by msg.sender, so nobody can touch another account's reference.
     struct Ref { uint256 price; uint64 at; }
@@ -210,32 +217,36 @@ contract GuardedGate {
     }
 
     // ---- windows, budget ----
-    /// @dev Two-bucket sliding window: buckets are aligned slots of `span` seconds. The previous bucket counts with the share of the
-    ///      current slot still to run, so an edge burst cannot double the limit (it reads full weight right after the boundary).
-    ///      Round 2 (L-4): if time appears to go backward (stored bucket ahead of the clock) the stored bucket is kept, nothing resets.
-    function _roll(uint64 bucket, uint128 cur, uint128 prev, uint256 span) private view returns (uint64 nb, uint128 c, uint128 p) {
-        nb = uint64(block.timestamp / span);
-        if (bucket >= nb) return (bucket, cur, prev);
-        if (bucket + 1 == nb && bucket != 0) return (nb, 0, cur);
-        return (nb, 0, 0);
+    /// @dev Ring window (round 3, L-1). Slot length = span / SUBS. The newest slot index is max(now / slot, stored head): time stepping
+    ///      backward keeps the stored head (round 1 L-4), so the ring then still counts everything it holds.
+    function _head(Ring storage r, uint256 span) private view returns (uint64 nh) {
+        nh = uint64(block.timestamp / (span / SUBS)); uint64 h = r.head; if (h > nh) nh = h;
     }
-    /// @dev Round 2 (L-1): conservative total max(cur + prev * w, prev), w = share of the slot still to run (1 if the stored bucket is ahead of the
-    ///      clock). Spend concentrated at the end of two adjacent slots is counted in full, so one span can never carry more than the limit.
-    function _weigh(uint64 nb, uint128 cur, uint128 prev, uint256 span) private view returns (uint256) {
-        uint256 w = nb == block.timestamp / span ? span - block.timestamp % span : span;
-        uint256 v = uint256(prev) * w / span + cur;
-        return v > prev ? v : prev;
+    /// @dev Sum of the newest `n` slots up to `nh` (n = RING: every spend of the last `span` is inside, conservative; n = SUBS: at most one span, used only
+    ///      for withdrawn amounts, where under-counting is the safe side). Slots newer than the stored head are empty.
+    function _sum(Ring storage r, uint64 nh, uint256 n) private view returns (uint256 t) {
+        uint64 h = r.head;
+        for (uint256 d = 0; d < n && d <= nh; d++) { uint64 i = nh - uint64(d); if (i <= h) t += r.v[i % RING]; }
     }
-    /// @dev The same weighting WITHOUT the max: used for withdrawn amounts, which only widen the fee base (under-counting is the safe side).
-    function _weighLow(uint64 nb, uint128 cur, uint128 prev, uint256 span) private view returns (uint256) {
-        uint256 w = nb == block.timestamp / span ? span - block.timestamp % span : span;
-        return uint256(prev) * w / span + cur;
+    function _add(Ring storage r, uint64 nh, uint256 amt) private {
+        uint64 h = r.head;
+        if (nh > h) {
+            uint256 gap = nh - h; if (gap > RING) gap = RING;
+            for (uint256 k = 1; k <= gap; k++) r.v[(h + k) % RING] = 0;      // slots that fell out of the ring (or never held anything) are cleared
+            r.head = nh;
+        }
+        r.v[nh % RING] += _u128(amt);
     }
     function _countBuy(uint256 spent) private {
-        Window storage w = window[msg.sender];
-        (uint64 nb, uint128 c, uint128 p) = _roll(w.bucket, w.cur, w.prev, BUY_WINDOW);
-        if (_weigh(nb, c, p, BUY_WINDOW) + spent > MAX_BUY_ETH_PER_HOUR) revert RateLimited();
-        w.bucket = nb; w.prev = p; w.cur = c + uint128(spent);
+        Ring storage w = win[msg.sender]; uint64 nh = _head(w, BUY_WINDOW);
+        if (_sum(w, nh, RING) + spent > MAX_BUY_ETH_PER_HOUR) revert RateLimited();
+        _add(w, nh, spent);
+    }
+    /// @notice The ring totals now: buys (last hour), fees (30 d), non-owner withdrawals counted for the fee base, gas (day).
+    function windows(address account) external view returns (uint256 buys, uint256 fees, uint256 withdrawn, uint256 gas) {
+        Ring storage w = win[account]; Pay storage p = pay[account];
+        buys = _sum(w, _head(w, BUY_WINDOW), RING); fees = _sum(p.fee, _head(p.fee, FEE_WINDOW), RING);
+        withdrawn = _sum(p.wd, _head(p.wd, FEE_WINDOW), SUBS); gas = _sum(p.gas, _head(p.gas, GAS_WINDOW), RING);
     }
     function _ceil(uint256 a, uint256 b) private pure returns (uint256) { return (a + b - 1) / b; }
     /// @dev The budget's base: the account's native ETH plus the cost of its open lots, every lot reconciled with what the
@@ -306,7 +317,7 @@ contract GuardedGate {
         _lots[account].push(token); _lotIdx[account][token] = _lots[account].length;
     }
     function _closeLot(address account, address token) private {
-        costOf[account] -= basis[account][token].ethIn; delete basis[account][token]; emit Reconciled(account, token, 0, 0);   // (free audit, I-2)
+        costOf[account] -= basis[account][token].ethIn; delete basis[account][token]; delete ref[account][token]; emit Reconciled(account, token, 0, 0);   // (free audit, I-2)
         uint256 i = _lotIdx[account][token]; if (i == 0) return;
         address[] storage a = _lots[account]; address last = a[a.length - 1];
         a[i - 1] = last; _lotIdx[account][last] = i; a.pop(); delete _lotIdx[account][token];
@@ -352,7 +363,7 @@ contract GuardedGate {
         if (token.code.length == 0) revert NotAContract();
         _trim(msg.sender, token);                                   // the lot is reconciled with what the account holds before this buy
         bool fresh = basis[msg.sender][token].tokens == 0;
-        if (fresh) _openLot(msg.sender, token);                     // a new lot takes a registry slot (TooManyLots past MAX_LOTS)
+        if (fresh) { _openLot(msg.sender, token); delete ref[msg.sender][token]; }   // a new lot takes a registry slot (TooManyLots past MAX_LOTS); round 3 (L-2): a reference of an earlier lot does not carry over
         _checkRoute(routerData, K_ETH, token, msg.value, minOut);
         if (msg.value > MAX_BUY_ETH_PER_HOUR) revert RateLimited();   // the net spend is counted below, once known
         uint256 ethBase = address(this).balance - msg.value;        // ETH that was here before this call stays untouched
@@ -373,10 +384,11 @@ contract GuardedGate {
         if (fresh && spent < MIN_NEW_LOT) revert DustLot();         // v18: no 1-wei junk lots to fill the registry
         _countBuy(spent);                                           // hourly budget counts what was actually spent
         Basis storage b = basis[msg.sender][token];
+        uint256 lotBefore = b.ethIn;
         b.ethIn += spent; b.tokens += out; costOf[msg.sender] += spent;
         if (b.tokens > MAX_LOT) revert TooLarge();
         emit Bought(msg.sender, token, spent, out);
-        _refNote(token, spent, out);                                // the price this buy paid feeds the account's own reference for the token
+        _refNote(token, spent, out, lotBefore);                                // the price this buy paid feeds the account's own reference for the token
         if (change > 0) _sendEth(msg.sender, change);               // state is final before any ETH leaves
     }
 
@@ -431,12 +443,8 @@ contract GuardedGate {
         uint256 added;
         if (!isExit) {
             if (out < cost) added = cost - out;
-            uint256 rp = _refPrice(token);                          // the account's price reference: a sale far under its recent market price books the shortfall as loss
-            if (rp != 0) {
-                uint256 fl = rp <= type(uint256).max / sold ? rp * sold / PRICE_SCALE : type(uint256).max / PRICE_SCALE;   // saturates: an absurd reference can only refuse the sale
-                fl = fl / 10000 * (10000 - MAX_DROP_BPS);
-                if (out < fl && fl - out > added) added = fl - out;
-            }
+            uint256 fl = _refFloor(_refPrice(msg.sender, token), sold);   // the account's price reference: a sale far under its recent market price books the shortfall as loss
+            if (out < fl && fl - out > added) added = fl - out;
         }
         if (added != 0) {
             uint256 carried = _decayed(msg.sender); uint256 total = carried + added;   // against the budget measured when the sale started
@@ -445,7 +453,7 @@ contract GuardedGate {
             // nothing else moves it -- not new buys, not closed lots, not a shrinking base (round 11 C-1, round 13 F-4)
             loss[msg.sender] = Loss(total, uint64(block.timestamp));
         }
-        if (!isExit) _refNote(token, out, sold);
+        if (!isExit) _refNote(token, out, sold, b.ethIn);
         b.ethIn -= cost; b.tokens -= sold; costOf[msg.sender] -= cost;
         (bool okb, uint256 left) = _balanceOf(token, msg.sender);
         if (b.tokens == 0 || (okb && left == 0)) _closeLot(msg.sender, token);   // full exit (an unreadable balance is not taken as empty)
@@ -453,46 +461,48 @@ contract GuardedGate {
     }
 
     // ---- per-account, per-token price reference (round 2, H-1) ----
-    /// @dev The calling account's reference price of `token` now: the stored high-water price faded linearly to zero over REF_DECAY (0 = none).
-    function _refPrice(address token) private view returns (uint256) {
-        Ref storage r = ref[msg.sender][token];
+    /// @dev The account's reference price of `token` now: the stored high-water price faded linearly to zero over REF_DECAY (0 = none), and
+    ///      (round 3, M-1) while the account has a lot, at most REF_LOT_MULT x that lot's cost-basis price.
+    function _refPrice(address account, address token) private view returns (uint256 v) {
+        Ref storage r = ref[account][token];
         uint256 dt = block.timestamp > r.at ? block.timestamp - r.at : 0;
         if (r.price == 0 || dt >= REF_DECAY) return 0;
-        return r.price * (REF_DECAY - dt) / REF_DECAY;
+        v = r.price * (REF_DECAY - dt) / REF_DECAY;
+        Basis storage b = basis[account][token];
+        if (b.tokens != 0) { uint256 hard = b.ethIn * PRICE_SCALE / b.tokens * REF_LOT_MULT; if (v > hard) v = hard; }
     }
-    /// @dev Record the calling account's own executor trade (msg.sender is the account, its lot is read from storage). Prices are wei per
-    ///      PRICE_SCALE raw units. It only raises the reference. The step cap applies to the FADED live value (REF_STEP_BPS of _refPrice), never to
-    ///      the stored undecayed one; with no live reference the first note may not exceed 1.5x the lot's cost-basis price. A third party cannot
-    ///      reach this state: it is keyed by msg.sender. Dust trades are ignored.
-    function _refNote(address token, uint256 eth, uint256 tokens) private {
-        if (eth < MIN_REF_ETH || tokens == 0) return;
+    /// @dev The ETH an executor sale of `sold` raw units must realise to stay clear of the reference (MAX_DROP_BPS under it); 0 = no reference.
+    function _refFloor(uint256 rp, uint256 sold) private pure returns (uint256 fl) {
+        if (rp == 0) return 0;
+        fl = rp <= type(uint256).max / sold ? rp * sold / PRICE_SCALE : type(uint256).max / PRICE_SCALE;   // saturates: an absurd reference can only refuse the sale
+        fl = fl / 10000 * (10000 - MAX_DROP_BPS);
+    }
+    /// @dev Record the calling account's own executor trade (msg.sender is the account). Prices are wei per PRICE_SCALE raw units. It only raises the
+    ///      reference. Round 3 (M-1): (a) a note needs eth >= max(MIN_REF_ETH, 5% of `lotEth`, the lot's ethIn before this trade); (b) at most one raise
+    ///      per REF_GAP (a later note inside it is ignored); (c) the step cap is 1.5x the FADED live value (or the lot's cost price when none), and the
+    ///      result never exceeds REF_LOT_MULT x the lot's cost-basis price. A third party cannot reach this state: it is keyed by msg.sender.
+    function _refNote(address token, uint256 eth, uint256 tokens, uint256 lotEth) private {
+        uint256 minEth = lotEth * REF_MIN_LOT_BPS / 10000; if (minEth < MIN_REF_ETH) minEth = MIN_REF_ETH;
+        if (eth < minEth || tokens == 0) return;
+        Basis storage b = basis[msg.sender][token]; if (b.tokens == 0) return;
+        Ref storage r = ref[msg.sender][token];
+        if (r.price != 0 && block.timestamp < uint256(r.at) + REF_GAP) return;
         uint256 pr = eth * PRICE_SCALE / tokens;
-        uint256 live = _refPrice(token);
+        uint256 live = _refPrice(msg.sender, token);
         if (pr <= live) return;
-        uint256 cap;
-        if (live != 0) cap = live * REF_STEP_BPS / 10000;
-        else { Basis storage b = basis[msg.sender][token]; if (b.tokens == 0) return; cap = b.ethIn * PRICE_SCALE / b.tokens * REF_STEP_BPS / 10000; }
+        uint256 cost = b.ethIn * PRICE_SCALE / b.tokens;
+        uint256 cap = (live != 0 ? live : cost) * REF_STEP_BPS / 10000; uint256 hard = cost * REF_LOT_MULT;
+        if (cap > hard) cap = hard;
         if (pr > cap) pr = cap;
         if (pr == 0) return;
-        Ref storage r = ref[msg.sender][token];
         r.price = pr; r.at = uint64(block.timestamp);
     }
 
     // ---- money out of the account: fee, gas, withdrawal ----
-    /// @dev Roll the fee window (30-day buckets) and return the weighted fee total and the weighted non-owner withdrawals.
-    function _feeRoll(Pay storage p) private returns (uint256 feeW, uint256 wdW) {
-        uint64 nb = uint64(block.timestamp / FEE_WINDOW);
-        if (p.feeBucket > nb) nb = p.feeBucket;                     // round 2 (L-4): time stepping backward keeps the stored bucket
-        if (p.feeBucket != nb) {
-            if (p.feeBucket != 0 && p.feeBucket + 1 == nb) { p.feePrev = p.feeCur; p.wdPrev = p.wdCur; } else { p.feePrev = 0; p.wdPrev = 0; }
-            p.feeCur = 0; p.wdCur = 0; p.feeBucket = nb;
-        }
-        return (_weigh(nb, p.feeCur, p.feePrev, FEE_WINDOW), _weighLow(nb, p.wdCur, p.wdPrev, FEE_WINDOW));
-    }
     /// @notice The performance fee, paid from the calling account (msg.value) to FEE_TO only. Two limits, both measured on the account's
     ///         native balance: (1) this call <= 20% of the balance the account had before it (msg.sender.balance + msg.value);
-    ///         (2) fees of the sliding 30-day window <= 20% of (that balance + fees already paid + native withdrawn through withdrawTo
-    ///         to a non-owner in the window), so repeated 20% calls cannot compound into a drain. The window is two weighted buckets:
+    ///         (2) fees of the sliding 30-day window (ring of 6 sub-buckets of 5 days, summed in full) <= 20% of (that balance + fees already paid + native withdrawn through withdrawTo
+    ///         to a non-owner in the window), so repeated 20% calls cannot compound into a drain. The window is a ring of sub-buckets:
     ///         no 2x burst at a boundary. withdraw() to the owner does NOT widen (2). Paused: refused.
     function payFee() external payable lock {
         if (paused()) revert IsPaused();
@@ -500,35 +510,33 @@ contract GuardedGate {
         if (v == 0) revert ZeroAmount();
         uint256 before = msg.sender.balance + v;                    // the account's balance before this transfer
         if (v * 10000 > before * FEE_MAX_BPS) revert FeeLimit();
-        Pay storage p = pay[msg.sender]; (uint256 feeW, uint256 wdW) = _feeRoll(p);
+        Pay storage p = pay[msg.sender]; uint64 nh = _head(p.fee, FEE_WINDOW);
+        uint256 feeW = _sum(p.fee, nh, RING); uint256 wdW = _sum(p.wd, _head(p.wd, FEE_WINDOW), SUBS);
         if ((feeW + v) * 10000 > (before + feeW + wdW) * FEE_MAX_BPS) revert FeeLimit();
-        p.feeCur += _u128(v);
+        _add(p.fee, nh, v);
         emit FeePaid(msg.sender, v);
         _sendEth(FEE_TO, v);
     }
     /// @notice The fee the account could be charged right now (a view for the engine; the same two limits as payFee).
     function feeRoom(address account) external view returns (uint256 room) {
         Pay storage p = pay[account]; uint256 bal = account.balance;
-        (uint64 fb, uint128 fc, uint128 fp) = _roll(p.feeBucket, p.feeCur, p.feePrev, FEE_WINDOW);
-        (, uint128 wc, uint128 wp) = _roll(p.feeBucket, p.wdCur, p.wdPrev, FEE_WINDOW);
-        uint256 feeSum = _weigh(fb, fc, fp, FEE_WINDOW); uint256 wd = _weighLow(fb, wc, wp, FEE_WINDOW);
+        uint256 feeSum = _sum(p.fee, _head(p.fee, FEE_WINDOW), RING); uint256 wd = _sum(p.wd, _head(p.wd, FEE_WINDOW), SUBS);
         room = bal * FEE_MAX_BPS / 10000;
         uint256 agg = (bal + feeSum + wd) * FEE_MAX_BPS / 10000; agg = agg > feeSum ? agg - feeSum : 0;
         if (agg < room) room = agg;
     }
     /// @notice Refund of the network fees the operator advanced, paid from the calling account to FEE_TO (never to a key). Limits: per call
-    ///         GAS_CALL_MAX; per sliding day (two weighted buckets) GAS_DAY_MAX and also <= 5% of the account's balance.
+    ///         GAS_CALL_MAX; per sliding day (ring of 6 sub-buckets of 4 h, summed in full) GAS_DAY_MAX and also <= 5% of the account's balance.
     function refundGas() external payable lock {
         if (paused()) revert IsPaused();
         uint256 v = msg.value;
         if (v == 0) revert ZeroAmount();
         if (v > GAS_CALL_MAX) revert GasLimit();
-        Pay storage p = pay[msg.sender];
-        (uint64 nb, uint128 c, uint128 pv) = _roll(p.gasBucket, p.gasCur, p.gasPrev, GAS_WINDOW);
-        uint256 day = _weigh(nb, c, pv, GAS_WINDOW) + v;
+        Pay storage p = pay[msg.sender]; uint64 nh = _head(p.gas, GAS_WINDOW);
+        uint256 day = _sum(p.gas, nh, RING) + v;
         if (day > GAS_DAY_MAX) revert GasLimit();
         if (day * 10000 > (msg.sender.balance + v) * GAS_BAL_BPS) revert GasLimit();
-        p.gasBucket = nb; p.gasPrev = pv; p.gasCur = c + _u128(v);
+        _add(p.gas, nh, v);
         emit GasPaid(msg.sender, v);
         _sendEth(FEE_TO, v);
     }
@@ -550,7 +558,7 @@ contract GuardedGate {
         emit Withdrawn(msg.sender, to, msg.value);
         if (to != msg.sender) {
             (bool okO, address o) = _owner(msg.sender);
-            if (!okO || to != o) { Pay storage p = pay[msg.sender]; _feeRoll(p); p.wdCur += _u128(msg.value); }
+            if (!okO || to != o) { Ring storage wr = pay[msg.sender].wd; _add(wr, _head(wr, FEE_WINDOW), msg.value); }
         }
         _sendEth(to, msg.value);
     }
@@ -590,13 +598,15 @@ contract GuardedGate {
     function lotOf(address account, address token) external view returns (uint256 tokens, uint256 ethIn) { return _trimmed(account, token); }
     /// @notice The tokens of the account's open lots as recorded (a lot the next call would find empty is still listed).
     function lotsOf(address account) external view returns (address[] memory) { return _lots[account]; }
-    /// @notice The lowest ETH a sale of `amount` of `token` would accept right now without exceeding the budget (0 = any, or not in the lot).
+    /// @notice The lowest ETH an EXECUTOR sale of `amount` of `token` would accept right now without exceeding the budget (0 = any, or not in the lot).
+    ///         Round 3 (L-3): the larger of the cost floor and the price-reference floor (70% of the faded reference), each less the free budget room.
     function floorFor(address account, address token, uint256 amount) external view returns (uint256) {
         (uint256 tokens, uint256 ethIn) = _trimmed(account, token);
         if (tokens == 0 || amount > tokens) return 0;
         uint256 cost = ethIn * amount / tokens; uint256 room = _budgetOn(_quotedBase(account)); uint256 lost = _decayed(account);   // v17: the base a sale would read (round 15, L)
         room = room > lost ? room - lost : 0;
-        return cost > room ? cost - room : 0;
+        uint256 fl = _refFloor(_refPrice(account, token), amount); if (fl < cost) fl = cost;
+        return fl > room ? fl - room : 0;
     }
 
     function _callRouter(bytes calldata data, uint256 value) private {
