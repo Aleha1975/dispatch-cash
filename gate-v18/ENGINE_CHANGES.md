@@ -72,3 +72,10 @@ Old permissions keep working with the old gate (`st.legacy[gate]` machinery). A 
 - **Pause.** Lifting a pause early no longer blocks the next pause; a pause that ran to its 7-day expiry is followed by 1 day. A replacement guardian (cold key) starts clean. `pauseUsed()` and `episodeAt()` are public views.
 - **Registry.** On `TooManyLots` the engine calls `reconcile(account)` once and retries (the walk now wraps); the owner's `forgetLot` remains the last resort.
 - **Router errors.** `RouterFailed(bytes)` carries at most 256 bytes of the router's revert data.
+
+## Round 5 (audit job 1209): interface changes (current)
+- `loss(address)` returns `(used, at)` (two values). `budgetOf(account, token)` and `floorFor(account, token, amount)` keep their shape; the loss they report now drains at `budget / 7 days` (leaky bucket) instead of the round-4 weighted end.
+- Pause: new public view `pauseExp()`; `pauseEnd()` is when the last pause ended (lifted or expired), `pauseUsed()` the seconds used in the current 8-day window, `episodeAt()` the window start. In any 8 days the executor can be stopped for at most 7; a new pause is as long as the allowance left. `PauseCooldown` is reverted while the allowance is used up and the window has not reset.
+- `exitSell` and `exit` no longer walk the lot registry (only the sold token is reconciled); send them with a normal gas limit. Executor `sell` and `buy` still walk it with the `TRIM_GAS` cursor.
+- `ownerOf` / `withdraw`: `owner()` must return exactly 32 bytes and an address above 0xffff. Selectors and the delegation method list are unchanged.
+- Deployment checklist (I-7, I-8): guardian, `FEE_TO`, `EXIT_KEY` differ from the executor key and from every account owner; `FEE_TO` accepts native; `reconcile` is called with the guardian or cold key.

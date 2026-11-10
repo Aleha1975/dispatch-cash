@@ -22,12 +22,13 @@ pragma solidity 0.8.26;
 ///         4. FEE_TO is a constructor immutable; the pause also stops fee and gas payments, never withdraw / exit / exitSell.
 ///         5. Fee / buy / gas limits use a ring of 6 sub-buckets per span (plus the running one): the full sum of the ring is counted
 ///            (conservative, never over-allows; round 3).
-///         6. Round 4: buy / sell / exitSell take a deadline (Expired); pause cooldown only after a pause that ran to expiry; the loss record
-///            refills linearly from one accumulator; _trimAll wraps; router revert data is bounded.
+///         6. Round 4: buy / sell / exitSell take a deadline (Expired); _trimAll wraps; router revert data is bounded.
+///         7. Round 5: the loss record is a plain leaky bucket (room returns at budget / 7 days); a pause may use at most 7 days in any 8-day window
+///            and two full pauses cannot chain; exitSell / exit do not walk the registry; _owner takes exactly one word and no precompile range.
 ///
 ///         Kept from v17.2: loss budget (30% of ETH + cost of the lot under sale, 7-day linear refill, cold-key unlock), only-the-lot rule with
 ///         reconciliation against the account's holdings (_trim/_trimAll, 32-lot registry), pinned router executor and decoded route,
-///         minOut, bounded balanceOf with gas floor, guardian pause (<= 7 days, 1 day cooldown after a pause that ran to expiry), two-step guardian rotation, cold-key
+///         minOut, bounded balanceOf with gas floor, guardian pause (<= 7 days in any 8-day window), two-step guardian rotation, cold-key
 ///         replaceGuardian and exit() through tx.origin. No owner, no upgrade. `ETH` means the chain's native token (HYPE on Elysium).
 interface IERC20 {
     function balanceOf(address) external view returns (uint256);
@@ -46,9 +47,9 @@ contract GuardedGate {
     address public immutable EXIT_KEY;                // the operator's cold key: unlock, exit, replaceGuardian
     address public immutable FEE_TO;                  // the only recipient of fees and gas refunds
     uint256 public constant BUDGET_BPS = 3000;      // losses may reach 30% of (the account's ETH + the cost of the lot under sale)...
-    uint256 public constant REFILL = 7 days;        // ...and that room comes back linearly over a week
+    uint256 public constant REFILL = 7 days;        // ...and that room comes back linearly at budget / REFILL
     uint256 public constant PAUSE_MAX = 7 days;     // a pause lifts itself after this
-    uint256 public constant PAUSE_COOLDOWN = 1 days; // and a new pause may start only this long after a pause that ran to its expiry
+    uint256 public constant PAUSE_COOLDOWN = 1 days; // PAUSE_MAX + PAUSE_COOLDOWN is the pause window: at most PAUSE_MAX of pause in it, and a new window needs this gap after the last pause
     uint256 public constant PENDING_TTL = 7 days;   // a proposed guardian must accept within this
     uint256 public constant MAX_RECEIVERS = 8;      // srcReceivers a sale route may name
     uint256 public constant FEE_MAX_BPS = 2000;     // payFee: at most 20% of the account's native balance (per call, and per FEE_WINDOW in total)
@@ -70,10 +71,9 @@ contract GuardedGate {
     struct Basis { uint256 tokens; uint256 ethIn; }     // the lot: tokens held and their running cost
     mapping(address => mapping(address => Basis)) public basis;
     mapping(address => uint256) public costOf;        // the account's total cost basis across lots (bookkeeping only since round 4: no limit reads it)
-    /// round 4 (L-6): ONE running accumulator. `amount` is outstanding as of `at` and fades linearly to zero at `end`. A new booking adds to the
-    /// outstanding amount and moves `end` to the amount-weighted average of the old remaining time and a full REFILL for the new part, so a tiny
-    /// booking leaves `end` where it was (it cannot restart the clock on the whole record) while the area under the curve is preserved.
-    struct Loss { uint256 amount; uint64 at; uint64 end; }
+    /// round 5 (M-1): a plain leaky bucket. `used` was outstanding at `at`; it drains linearly at budget / REFILL (the budget of the sale being
+    /// checked, 30% of the same base) per second. A booking adds to the drained value and sets `at` to now, so a tiny booking restarts nothing.
+    struct Loss { uint256 used; uint64 at; }
     mapping(address => Loss) public loss;
 
     uint256 public immutable MAX_BUY_ETH_PER_HOUR;    // set at deployment (production: 17.5 ether). Sells have no count / proceeds cap (DESIGN.md 1.4)
@@ -90,10 +90,11 @@ contract GuardedGate {
     address public guardian;
     address public pendingGuardian;
     uint256 public pendingAt;                          // when the pending guardian was proposed
-    uint256 public pausedAt;                           // 0 = not paused; a pause expires PAUSE_MAX after this
-    uint256 public pauseEnd;                           // round 4 (L-1): when the last pause RAN TO ITS EXPIRY (0 = none; an early lift sets nothing, so it starts no cooldown)
-    uint256 public pauseUsed;                          // round 4 (L-1): seconds of the episode's PAUSE_MAX already used by pauses that were lifted early
-    uint256 public episodeAt;                          // round 4 (L-1): start of the current pause episode (0 = none)
+    uint256 public pausedAt;                           // 0 = not paused; start of the running (or expired, not yet booked) pause
+    uint256 public pauseExp;                           // round 5: when the running pause ends by itself; fixed when it starts (replaceGuardian does not move it)
+    uint256 public pauseEnd;                           // round 5: when the last pause ended (lifted or expired); 0 = none
+    uint256 public pauseUsed;                          // round 5: seconds of pause used in the current window (every pause costs at least one second)
+    uint256 public episodeAt;                          // round 5: start of the current pause window (0 = none)
 
     uint256 private _lock;
     mapping(address => address[]) private _lots;      // v17: the tokens of the account's open lots (basis tokens > 0), unordered (declared last: earlier slots keep v16's layout)
@@ -170,35 +171,33 @@ contract GuardedGate {
     modifier onlyGuardian() { if (msg.sender != guardian) revert NotGuardian(); _; }
 
     // ---- guardian: pause the executor, rotate itself ----
-    /// @notice Paused while the guardian's pause is younger than its allowance: a lost key can never freeze the executor for good.
-    ///         The allowance of one pause is PAUSE_MAX less what earlier pauses of the same episode used before they were lifted early.
-    function paused() public view returns (bool) { return pausedAt != 0 && block.timestamp < pausedAt + PAUSE_MAX - pauseUsed; }
-    /// @notice The guardian stops and resumes the executor (buys and sells; exit() is never blocked). Round 4 (L-1): lifting a pause early
-    ///         starts NO cooldown (a false alarm must not block the real one); the early-lifted time is added up per episode, so pause, lift,
-    ///         pause cannot keep the executor stopped longer than PAUSE_MAX in total. A pause that RUNS TO ITS EXPIRY is followed by
-    ///         PAUSE_COOLDOWN. An episode (and its used time) resets PAUSE_MAX + PAUSE_COOLDOWN after it began, or after a cooldown.
+    /// @notice Paused while the running pause has not reached its end. Its length was fixed when it started (see setPaused).
+    function paused() public view returns (bool) { return pausedAt != 0 && block.timestamp < pauseExp; }
+    /// @dev Book the running (or expired, never lifted) pause: it ended at the lift or at its expiry, whichever came first, and cost at least one second.
+    function _endPause() private {
+        uint256 end = block.timestamp < pauseExp ? block.timestamp : pauseExp;
+        if (end <= pausedAt) end = pausedAt + 1;
+        pauseUsed += end - pausedAt; pauseEnd = end; pausedAt = 0;
+    }
+    /// @notice The guardian stops and resumes the executor (buys, sells, fees; exit() / exitSell / withdraw are never blocked). Round 5 (L-1): in a
+    ///         window of PAUSE_MAX + PAUSE_COOLDOWN (8 days) the pauses add up to at most PAUSE_MAX; a new pause is as long as the allowance that is
+    ///         left. A new window starts only when 8 days have passed since the first pause of the old one AND PAUSE_COOLDOWN since the last pause
+    ///         ended, so in any 8 days the executor is stopped for at most 7 (two full pauses cannot chain). Lifting early gives back the unused time.
     function setPaused(bool p) external lock onlyGuardian {
         if (p) {
             if (paused()) revert PauseCooldown();
-            if (pausedAt != 0) { pauseEnd = pausedAt + PAUSE_MAX - pauseUsed; pauseUsed = PAUSE_MAX; pausedAt = 0; }   // an expired pause that was never lifted ended at its expiry
-            if (pauseEnd != 0) {
-                if (block.timestamp < pauseEnd + PAUSE_COOLDOWN) revert PauseCooldown();
-                pauseEnd = 0; pauseUsed = 0; episodeAt = 0;                       // cooldown over: a fresh episode
-            }
-            if (episodeAt != 0 && block.timestamp >= episodeAt + PAUSE_MAX + PAUSE_COOLDOWN) { pauseUsed = 0; episodeAt = 0; }
-            if (episodeAt == 0) episodeAt = block.timestamp;
-            pausedAt = block.timestamp; emit Paused(true);
+            if (pausedAt != 0) _endPause();                         // an expired pause that was never lifted
+            if (episodeAt == 0 || (block.timestamp >= episodeAt + PAUSE_MAX + PAUSE_COOLDOWN && block.timestamp >= pauseEnd + PAUSE_COOLDOWN)) { pauseUsed = 0; episodeAt = block.timestamp; }
+            if (pauseUsed >= PAUSE_MAX) revert PauseCooldown();
+            pausedAt = block.timestamp; pauseExp = block.timestamp + PAUSE_MAX - pauseUsed; emit Paused(true);
         } else if (pausedAt != 0) {
-            uint256 exp = pausedAt + PAUSE_MAX - pauseUsed;
-            if (block.timestamp >= exp) { pauseEnd = exp; pauseUsed = PAUSE_MAX; }   // lifted after it expired: it ran to expiry
-            else pauseUsed += block.timestamp - pausedAt;                           // lifted early: no cooldown, the time is used up
-            pausedAt = 0; emit Paused(false);
-        }                                                               // (free audit, I-4) resuming when nothing was paused changes nothing and emits nothing
+            _endPause(); emit Paused(false);
+        }                                                               // resuming when nothing was paused changes nothing and emits nothing
     }
     /// @notice The cold key may replace the guardian outright: a lost or hostile guardian key cannot hold the executor in a
-    ///         pause cycle for good (round 13, F-3). The new guardian lifts the pause itself. (`replaceGuardian` is the only
-    ///         power the cold key has over the guardian; it cannot pause or trade.) Round 4 (L-1): the new guardian starts with a clean
-    ///         slate (no cooldown, no used pause time); a pause that is running now stays and keeps its start.
+    ///         pause cycle for good. The new guardian lifts the pause itself. (`replaceGuardian` is the only power the cold key has over the
+    ///         guardian; it cannot pause or trade.) Round 5: the new guardian starts with a clean allowance (a new epoch); a pause that is
+    ///         running now keeps its start AND its end.
     function replaceGuardian(address next) external lock {
         if (msg.sender != EXIT_KEY) revert NotExitKey();
         if (next == address(0) || next == guardian || next == ROUTER || next == EXECUTOR || next == EXIT_KEY || next == FEE_TO || next == address(this)) revert BadGuardian();
@@ -222,7 +221,7 @@ contract GuardedGate {
     function unlock(address[] calldata accounts) external lock {
         if (msg.sender != EXIT_KEY) revert NotExitKey();       // the key itself, directly: no contract between the key and this call may clear budgets (round 13, F-1)
         if (accounts.length > MAX_UNLOCK) revert TooLarge();
-        for (uint256 i = 0; i < accounts.length; i++) { uint256 l = loss[accounts[i]].amount; delete loss[accounts[i]]; emit Unlocked(accounts[i], l); }
+        for (uint256 i = 0; i < accounts.length; i++) { uint256 l = loss[accounts[i]].used; delete loss[accounts[i]]; emit Unlocked(accounts[i], l); }
     }
 
     // ---- windows, budget ----
@@ -258,24 +257,24 @@ contract GuardedGate {
         withdrawn = _sum(p.wd, _head(p.wd, FEE_WINDOW), SUBS); gas = _sum(p.gas, _head(p.gas, GAS_WINDOW), RING);
     }
     function _ceil(uint256 a, uint256 b) private pure returns (uint256) { return (a + b - 1) / b; }
-    function _ceilDiv(uint256 a, uint256 b) private pure returns (uint256) { return a == 0 ? 0 : (a - 1) / b + 1; }
     /// @dev Round 4 (M-2, option A): the budget of an executor sale is measured on the account's native ETH plus the cost of the lot UNDER SALE
     ///      only (`_saleBase`). Cost of other lots, which a caller of buy() could create at no net cost (buy a junk token, send the native back
     ///      later), gives no room. `costOf` is kept as bookkeeping (and for the views of the app) but no limit reads it.
     function _saleBase(address account, uint256 lotEth) private view returns (uint256) { return account.balance + lotEth; }
-    /// @dev The budget on a base: BUDGET_BPS of it. What is outstanding decays on its own clock (_decayed), not the budget's.
+    /// @dev The budget on a base: BUDGET_BPS of it.
     function _budgetOn(uint256 base) private pure returns (uint256) { return base * BUDGET_BPS / 10000; }
-    function _decayed(address account) private view returns (uint256) {
-        Loss storage l = loss[account];
-        if (l.amount == 0) return 0;
-        if (block.timestamp <= l.at) return l.amount;                   // (round 13, L-2) no backward time
-        if (block.timestamp >= l.end) return 0;
-        return l.amount * (l.end - block.timestamp) / (l.end - l.at);   // linear from `amount` at `at` to zero at `end`
+    /// @dev Round 5 (M-1): leaky bucket. What is outstanding drains at budget / REFILL per second since `at` (rounded down: conservative).
+    function _decayed(address account, uint256 budget) private view returns (uint256) {
+        Loss storage l = loss[account]; uint256 u = l.used;
+        if (u == 0 || block.timestamp <= l.at) return u;                // (round 13, L-2) no backward time
+        uint256 d = budget * (block.timestamp - l.at) / REFILL;
+        return d >= u ? 0 : u - d;
     }
     /// @notice Losses on the account's record right now, and the budget an executor sale of `token` must stay within (round 4: native balance + that lot's cost).
     function budgetOf(address account, address token) external view returns (uint256 lost, uint256 budget) {
         (, uint256 ethIn) = _trimmed(account, token);
-        return (_decayed(account), _budgetOn(_saleBase(account, ethIn)));
+        uint256 b = _budgetOn(_saleBase(account, ethIn));
+        return (_decayed(account, b), b);
     }
 
     /// @dev The lot never exceeds what the account holds: tokens the owner moved out (or a negative rebase) leave the lot
@@ -290,7 +289,7 @@ contract GuardedGate {
         if (bal < b.tokens) { uint256 keep = _ceil(b.ethIn * bal, b.tokens); costOf[account] -= b.ethIn - keep; b.ethIn = keep; b.tokens = bal; emit Reconciled(account, token, bal, keep); }
     }
     /// @dev v17: every open lot of the account reconciled, so the books carry no cost of tokens the account no
-    ///      longer holds (round 15, H; since round 4 the budget base is the sold lot only, so this keeps the registry and costOf true, not the budget). Walked from the end: closing a lot moves the last entry, which is already done.
+    ///      longer holds (round 15, H; since round 4 the budget base is the sold lot only, so this keeps the registry and costOf true, not the budget). Walked from the end: closing a lot moves the last entry into the freed index, which is then visited again (round 5, L-5).
     ///      Bounded by MAX_LOTS reads of at most BALANCE_GAS each; a token that does not answer is skipped, never fatal.
     ///      v18: a total gas budget (TRIM_GAS) per call -- a cursor remembers where the walk stopped and the next call resumes there, so a
     ///      registry stuffed with slow tokens cannot make every sale cost 32 slow reads.
@@ -310,7 +309,9 @@ contract GuardedGate {
                 if (pos <= stop) break;
                 continue;
             }
-            _trim(account, a[pos - 1]); pos--;
+            uint256 len = a.length;
+            _trim(account, a[pos - 1]);
+            if (a.length == len || pos > a.length) pos--;               // round 5 (L-5): otherwise a close moved the last entry into pos - 1: visit it
         }
         _trimPos[account] = (wrapped && pos <= stop) ? 0 : pos;          // a finished round starts over next time
     }
@@ -398,6 +399,7 @@ contract GuardedGate {
         uint256 change = address(this).balance - ethBase;           // unspent part of msg.value, returned to the caller last
         if (change > msg.value) revert RouterOverpaid();
         uint256 spent = msg.value - change;
+        if (home > msg.value) home = msg.value;                     // round 5 (L-2): never more credit than was sent
         spent = home >= spent ? 0 : spent - home;                   // v17: ETH that came straight back to the account was not spent (round 15, M)
         if (spent == 0) revert ZeroAmount();                        // a free lot would have no cost to protect
         if (fresh && spent < MIN_NEW_LOT) revert DustLot();         // v18: no 1-wei junk lots to fill the registry
@@ -432,7 +434,7 @@ contract GuardedGate {
         if (amount == 0) revert ZeroAmount();
         if (minOut == 0) revert MinOutZero();
         if (token.code.length == 0) revert NotAContract();
-        _trimAll(msg.sender);                                       // v17: every lot reconciled -- the exit too, so the books stay true; it still ignores the budget
+        if (!isExit) _trimAll(msg.sender);                          // round 5 (L-7): exits reconcile only the sold lot (next line) and never walk the registry
         _trim(msg.sender, token);                                   // round 2 (L-3): the sold token's lot is always reconciled, whatever the gas-bounded walk reached
         { uint256 lot = basis[msg.sender][token].tokens; if (amount > lot) revert NotInLot(lot, amount); }   // only what this gate saw bought, and still holds
         uint256 budget = isExit ? 0 : _budgetOn(_saleBase(msg.sender, basis[msg.sender][token].ethIn)); // round 4 (M-2): native + the cost of THIS lot, measured once before anything moves
@@ -462,14 +464,9 @@ contract GuardedGate {
             if (out < cost) added = cost - out;
         }
         if (added != 0) {
-            uint256 carried = _decayed(msg.sender); uint256 total = carried + added;   // against the budget measured when the sale started
+            uint256 total = _decayed(msg.sender, budget) + added;       // against the budget measured when the sale started
             if (total > budget) revert BudgetExceeded(total, budget);
-            // round 4 (L-6): one running accumulator. The carried part keeps its remaining time, the new part gets a full REFILL, and the end is
-            // their amount-weighted average (rounded up): a 1-wei booking leaves the end where it was instead of restarting the whole record.
-            Loss storage l = loss[msg.sender];
-            uint256 rem = carried == 0 ? 0 : uint256(l.end) - block.timestamp;
-            uint256 span = _ceilDiv(carried * rem + added * REFILL, total);
-            loss[msg.sender] = Loss(total, uint64(block.timestamp), uint64(block.timestamp + span));
+            loss[msg.sender] = Loss(total, uint64(block.timestamp));
         }
         b.ethIn -= cost; b.tokens -= sold; costOf[msg.sender] -= cost;
         (bool okb, uint256 left) = _balanceOf(token, msg.sender);
@@ -557,10 +554,10 @@ contract GuardedGate {
             let p := mload(0x40)
             mstore(p, shl(224, 0x8da5cb5b))
             ok := staticcall(OWNER_GAS, account, p, 4, p, 32)
-            ok := and(ok, gt(returndatasize(), 31))
+            ok := and(ok, eq(returndatasize(), 32))                       // exactly one word
             if ok { v := mload(p) }
         }
-        if (!ok || v >> 160 != 0) return (false, address(0));
+        if (!ok || v >> 160 != 0 || v <= 0xffff) return (false, address(0));   // no precompile-range owner
         to = address(uint160(v));
         if (to == address(0) || to == account || to == address(this) || to == ROUTER || !_plain(to)) return (false, address(0));
         return (true, to);
@@ -583,8 +580,8 @@ contract GuardedGate {
     function floorFor(address account, address token, uint256 amount) external view returns (uint256) {
         (uint256 tokens, uint256 ethIn) = _trimmed(account, token);
         if (tokens == 0 || amount == 0 || amount > tokens) return 0;
-        uint256 cost = ethIn * amount / tokens; uint256 room = _budgetOn(_saleBase(account, ethIn)); uint256 lost = _decayed(account);
-        room = room > lost ? room - lost : 0;
+        uint256 cost = ethIn * amount / tokens; uint256 budget = _budgetOn(_saleBase(account, ethIn)); uint256 lost = _decayed(account, budget);
+        uint256 room = budget > lost ? budget - lost : 0;
         return cost > room ? cost - room : 0;
     }
 
@@ -674,7 +671,8 @@ contract GuardedGate {
         }
     }
     function _sendEth(address to, uint256 amount) private {
-        (bool ok, ) = to.call{value: amount}("");
+        bool ok;
+        assembly ("memory-safe") { ok := call(gas(), to, amount, 0, 0, 0, 0) }   // no return data is copied
         if (!ok) revert EthSendFailed();
     }
 }

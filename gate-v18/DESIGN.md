@@ -1,4 +1,4 @@
-# Gate v18 (GuardedGate) - design, 09.11.2026 (reworked after the owner's decisions of 09.11; adversarial-review fixes applied the same day, section 4). **Round 4 (10.11, section 7) REMOVED the price reference: wherever sections 1-6 speak of `ref`, the 70% reference floor, `_refNote` or `floorFor` with a reference, they describe history; section 7 is current.**
+# Gate v18 (GuardedGate) - design, 09.11.2026 (reworked after the owner's decisions of 09.11; adversarial-review fixes applied the same day, section 4). **Round 4 (10.11, section 7) REMOVED the price reference: wherever sections 1-6 speak of `ref`, the 70% reference floor, `_refNote` or `floorFor` with a reference, they describe history; section 7 is current. Round 5 (section 8) replaced the loss record (plain leaky bucket) and the pause rules: statements about the loss record, `end` or pause episodes in sections 2 and 7.5-7.7 are history; section 8 is current.**
 
 Goal: a client who already holds HYPE on Elysium starts with exactly 3 wallet prompts: TWO `eth_signTypedData` (the gate delegation, with the sign-in folded into it, and the `approve` delegation) and ONE funding transfer. Exit (cold key) permissions stay optional and off the start path. Local only: nothing deployed.
 
@@ -10,7 +10,7 @@ Bought tokens stay in the client's own smart account, as in the live v17.2 gate 
 Onboarding = signature 1 (gate delegation) + signature 2 (approve delegation) + 1 funding transfer. Selling to HYPE is the exit for tokens; there is no engine path that withdraws tokens.
 
 ### 1.2 Gate delegation: no value limits in the delegation, all limits in the gate
-Delegation = delegate: executor key; caveats: `allowedTargets [gate]`, `allowedMethods {buy, sell, payFee, refundGas, withdraw}` (0xf496a610, 0x3581f5bb, 0x29610252, 0x4f6d3aed, 0x3ccfd60b), `timestamp` 90 days, `limitedCalls` 100000. **No `valueLte`, no `nativeTokenPeriodTransfer`.** (The kit's `FunctionCall` scope adds `valueLte 0` when none is given, so the caveats are built directly, as the engine already does for `approve`; the e2e asserts that no value enforcer is present.)
+Delegation = delegate: executor key; caveats: `allowedTargets [gate]`, `allowedMethods {buy, sell, payFee, refundGas, withdraw}` (0x9e2044fc, 0xccda6635, 0x29610252, 0x4f6d3aed, 0x3ccfd60b; buy and sell changed in round 4, the list in section 7.9 is the only one to use), `timestamp` 90 days, `limitedCalls` 100000. **No `valueLte`, no `nativeTokenPeriodTransfer`.** (The kit's `FunctionCall` scope adds `valueLte 0` when none is given, so the caveats are built directly, as the engine already does for `approve`; the e2e asserts that no value enforcer is present.)
 
 Every native outflow of the account through this delegation is pinned in the gate:
 | Path | Where the value goes | Limit (in the gate) |
@@ -46,8 +46,8 @@ Executor pin and decoded route (`_checkRoute`: pinned EXECUTOR, flags, no permit
 | | Today | v18 |
 | --- | --- | --- |
 | Buy into attacker tokens | <= 8.7 HYPE/h; delegation 24 h cap up to ~580 | <= 17.5 HYPE per hour-long span (bursts every 70 min = 15/h at best; round 3), no daily ceiling in the delegation (up to 420/day until paused or the account is empty) |
-| Sell lots (rigged route) | <= 29 HYPE/h, 12 sells/h; loss <= 30% per 7 d | no count/proceeds cap; loss below cost <= 30% of (native + the sold lot's cost) per 7 d; profit leak NOT bounded on-chain, watched off-chain (7.2) |
-| Native out to an attacker address | none (withdraw pinned to owner) | none |
+| Sell lots (rigged route) | <= 29 HYPE/h, 12 sells/h; loss <= 30% per 7 d | no count/proceeds cap; loss below cost: at most 30% of (native + the sold lot's cost) at once, then room returns at that budget / 7 d (leaky bucket, section 8.1); profit leak NOT bounded on-chain, watched off-chain (7.2) |
+| Native out to an attacker address | none (withdraw pinned to owner) | none outside the documented channels: `buy` pays up to 17.5 HYPE per hour-long span to a pool the key holder chooses (the route's `targetData` is not inspected), within the buy cap |
 | Native withdrawn to the owner | up to the delegation cap (1,000,000 HYPE) | any amount, to owner() only (DoS only) |
 | Fee/gas | `gas` delegation pays the executor key itself (<= 0.087 per 30 d); fee up to ~145 HYPE lifetime | nothing reaches the key; FEE_TO only: fee <= 20% of the balance per 30 days, gas <= 0.1/day |
 | Approve | any token, spender pinned to the gate | same (unchanged) |
@@ -134,3 +134,36 @@ If a call resumed in the middle of a round and reached index 0 with gas left, it
 - **I-8** Rounding and assembly notes with no impact (the reference rounding is gone with the reference).
 - **I-9** A fee stays in the "30-day" window for 30 to 35 days (ring slots of 5 days); withdrawals counted for the fee base for 25 to 30. The engine bills on `feeRoom` with retry.
 - **Leads** of the report (the `home` credit in `buy`, ERC-721 sharing the selectors, fee base deposit, router decoding, approve delegation scope) are not confirmed; the `home` credit is a candidate for hardening if a payer that owes the account native through a route is ever found.
+
+## 8. Round 5: fixes for external audit job 1209 (report `audit_1209.md`; tests in `test/Round5.t.sol`)
+`forge test`: 95 tests pass; e2e on the local anvil fork: 36 checks, ALL PASSED (`e2e/RESULT.txt`). Runtime 20,315 bytes (limit 24,576). No business rule changed: `withdraw()` is the full balance to the owner even when paused; `exitSell` / `exit` are never capped, blocked or paused; there is no count / fraction / proceeds cap on executor sells; fees <= 20% per call and per 30-day ring; buys <= 17.5 HYPE in any 60 minutes.
+
+### 8.1 M-1 loss record: plain leaky bucket
+`Loss{used, at}`. On read `used` drains linearly at `budget / 7 days` since `at`, where `budget` is 30% of the same base the sale uses (native balance + cost of the sold lot); a booking adds to the drained value and sets `at = now`. The amount-weighted `end` of round 4 is gone. Sustained loss is at most one budget per 7 days plus the initial budget. `floorFor` and `budgetOf` use the same `_decayed(account, budget)`. Rounding is down on the drained part (conservative). If the base is tiny the drain is slow, which only affects that account's executor sales. Tests: `test_M1_auditor_sequence_lot_only_stays_within_budget_plus_one_week` (the auditor's hourly re-booking: the audit's test asserted more than 45% of the cost lost in 7 days, now it stays under 60%, which is the initial 30% plus one week of 30%), `test_M1_sustained_rebooking_is_one_budget_per_7_days` (28 days with a refilled base: booked <= maxBudget x (1 + days / 7)), `test_M1_floorFor_uses_the_same_decay`, and the two `test_L6_*` of round 4 rewritten for the bucket. `loss(address)` returns `(used, at)`. I-9 of 1209 (a 1-wei booking and `end`) is moot: there is no `end`.
+
+### 8.2 L-1 + L-3 + I-1 pause window
+One rule: in a window of 8 days (`PAUSE_MAX + PAUSE_COOLDOWN`) the pauses add up to at most 7 days. State: `pausedAt`, `pauseExp` (end of the running pause, fixed at its start), `pauseEnd` (when the last pause ended: lifted or expired), `pauseUsed` (seconds used in the window), `episodeAt` (window start). A new pause needs `pauseUsed < 7 d` and lasts the remaining allowance. The window resets only when 8 days have passed since `episodeAt` AND 1 day since `pauseEnd`; so in any 8 days the executor is stopped for at most 7 and two full pauses cannot chain (the auditor's trace is `test_L1_auditor_chain_of_two_full_pauses_is_refused`; `test_L1_any_8_days_hold_at_most_7_days_of_pause` runs a guardian that pauses the moment it can for 60 days and checks every sliding 8-day window). Lifting early gives the unused time back. A pause lifted in the same second costs one second (I-1). `replaceGuardian` starts a new epoch (clean allowance) but does not change a running pause's expiry (L-3, `test_L3_...`). `acceptGuardian` still does not reset. The NatSpec that promised a total per episode is rewritten (I-4).
+
+### 8.3 L-7 exits do not walk the registry
+`_sale` calls `_trimAll` only for executor sells. `exitSell` and `exit` trim only the sold token, so a registry of 32 gas-burning junk lots cannot make a client exit revert `GasTooLow` (`test_L7_exitSell_and_exit_succeed_with_32_gas_burning_lots`, limit 700,000 gas). Executor sells, `buy` (when the registry is full) and `reconcile` still walk it with the `TRIM_GAS` cursor.
+
+### 8.4 L-5 resumed `_trimAll` round
+After `_trim` a close moves the last entry into the freed index; the walk now stays on that index (visits the moved-in entry) when the length fell, and steps down otherwise. It cannot store a finished round with an unvisited lot. Test `test_L5_resumed_round_visits_the_entry_a_close_moved_into_the_cursor_slot` (fails with the old step).
+
+### 8.5 L-6 `_owner`
+`owner()` must return exactly 32 bytes and the address must be above 0xffff (no precompile range). Test `test_L6_owner_read_needs_32_bytes_and_a_real_address`. The test owner `owner2` moved to `0xB0B00B` for this.
+
+### 8.6 L-2 `buy` accounting
+The native counted as returned (`home`) is capped at `msg.value`; token output is counted as the account's balance increase, as before. Note: since `spent <= msg.value` already, the cap does not change the result of the arithmetic; it states the limit. The residual stays and is accepted as Low: a third-party contract that pays the account on anyone's call inside the route window (a distributor claim for the account, a release, a pull-payment escrow) would be booked as trade output (token variant: the tokens enter a lot at the cost of the buy) or as returned native (the hourly ring under-counts). No such payer is known on Elysium. One candidate to check before deployment: another gate deployment (the live v17.2) on which the same account still has an executor delegation. Mitigation in the engine: allow-list tokens; do not leave delegations to older gates on a client account that uses this one. The option to require `dstReceiver == gate` for buys was not taken: production routes may deliver to the account.
+
+### 8.7 Documented, not changed (L-4, I-2 .. I-9)
+- **L-4** The sale base includes native that any party can deposit; each unit adds 0.3 of loss room at once and can leave only through the buy cap (17.5 per hour), which the key holder has anyway. Net extraction is not higher; only timing changes. The statement "30% of (native + lot)" is a bound on the booked outstanding amount, measured on the balance at the time of the sale.
+- **I-2** ERC-721 shares `balanceOf` / `transferFrom` / `approve`: a collection can pass the helpers for tokenId 1. The engine allow-lists tokens.
+- **I-3** Deadlines and windows follow the sequencer's time (`delaySeconds + futureSeconds` of the Orbit config). Derive the deadline from the latest block timestamp; record the chain values; the watcher compares chain time with wall time.
+- **I-4** Doc drift fixed: section 1.2 selectors, the NatSpec of `setPaused`, the "native out to an attacker address" wording in section 2, the 30% / 7-day statements.
+- **I-5** `_sendEth` is now an assembly call that copies no return data. `_call3` picks the 2- or 3-argument encoding by `y == 0`; callers pass `address(this)` or the literal `address(0)`, so it is not reachable; a new caller must keep that.
+- **I-6** Exits are capped at the lot: gains of a rebasing-up token and tokens that came back after a trim leave through the owner's wallet, not the gate. Tokens sent to the gate by hand stay there (like stray native, I-5 of round 4). `exit()` has no deadline: replace an unmined signed exit at the same nonce.
+- **I-7** The exclusion lists in the constructor cover the router's executor contract, not the executor key. Deployment checklist: guardian, `FEE_TO`, `EXIT_KEY` differ from the executor key and from every account owner.
+- **I-8** `reconcile` is not delegated: the engine calls it with the guardian key (or the cold key), not as the executor. `FEE_TO` is immutable and must accept native, or `payFee` / `refundGas` revert for every account.
+- **I-9** Moot (see 8.1).
+- Leads of the report that stay leads: pause drains the loss record (the cooldown day gives a still-delegated stolen key a full budget; replace the guardian in time), an owner wallet that is itself a client, a transiently inflatable `balanceOf` (closed by the cap on token output only in part), a lot closed on a zero read, `payFee` after selling everything, router assumptions, `tx.origin` through the delayed inbox, Stylus.

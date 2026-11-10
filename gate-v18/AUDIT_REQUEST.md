@@ -1,6 +1,6 @@
 # One Dollar Audit job: GuardedGate v18 for Elysium (draft, not submitted)
 
-Contract: `GuardedGate` v18, `src/GuardedGate.sol` (680 lines, pragma pinned to solc 0.8.26, evm cancun, optimizer 10000 runs; no external imports; runtime 20,658 bytes, limit 24,576; round 4 state: the price reference described in item 4 and question 3 below was REMOVED, see the section "Round 4" at the end). This revision already contains the fixes of an internal adversarial review (DESIGN.md section 4; `test/Adversarial.t.sol` `test_FIXED_*`). Successor of GuardedSwap v17.2 (public repo github.com/Aleha1975/dispatch-cash, branch v17.2, commit 81ff720, 18 audit rounds on Base, last round 0 findings above informational; live on Elysium at 0x795f8ff1d458a168b78e3c37c028fb834d1146d5 as an unmodified build). v18 is NOT deployed. Please review the whole file; the delta against v17.2 is below, the unchanged parts keep their audited reasoning (comments in source).
+Contract: `GuardedGate` v18, `src/GuardedGate.sol` (678 lines, pragma pinned to solc 0.8.26, evm cancun, optimizer 10000 runs; no external imports; runtime 20,315 bytes, limit 24,576; round 4 state: the price reference described in item 4 and question 3 below was REMOVED, see the section "Round 4"; round 5 replaced the loss record and the pause rules, see "Round 5" at the end). This revision already contains the fixes of an internal adversarial review (DESIGN.md section 4; `test/Adversarial.t.sol` `test_FIXED_*`). Successor of GuardedSwap v17.2 (public repo github.com/Aleha1975/dispatch-cash, branch v17.2, commit 81ff720, 18 audit rounds on Base, last round 0 findings above informational; live on Elysium at 0x795f8ff1d458a168b78e3c37c028fb834d1146d5 as an unmodified build). v18 is NOT deployed. Please review the whole file; the delta against v17.2 is below, the unchanged parts keep their audited reasoning (comments in source).
 Target chain: Elysium (Arbitrum Orbit, settles to HyperEVM, native HYPE, chain id 99901). Aggregator: KyberSwap MetaAggregationRouterV2 0x6131B5fae19EA4f9D964eAc0408E4408b66337b5, executor 0x8F10B468b06c6FD214B65F87778827F7D113f996.
 
 ## What the product does
@@ -86,3 +86,21 @@ Decision: the price reference is removed entirely (the report found a new way ar
 | I-4 stale docs, floating pragma | Comments and docs fixed; `pragma solidity 0.8.26;` | 2 | - |
 
 Residuals after round 4: profit leak through a rigged route (stolen executor key; off-chain watcher + pause); a client with several lots has less loss room per sale (30% of native + the sold lot); a guardian can chain several early-lifted pauses inside one episode (total still <= 7 days per 8); `_trimAll` is still bounded by gas, so a registry stuffed with slow tokens needs `reconcile` / `forgetLot`.
+
+## Round 5: fixes for job 1209 (`audit_1209.md`; line refs are to `src/GuardedGate.sol` after the fixes, 678 lines, runtime 20,315 bytes; tests in `test/Round5.t.sol`; DESIGN.md section 8)
+`forge test`: 95 pass; e2e on a local anvil fork: 36 checks, ALL PASSED. Business rules unchanged: `withdraw()` full balance to the owner, never paused; `exitSell` (tx.origin == owner) and `exit` never capped, blocked or paused; no count / fraction / proceeds cap on executor sells; fee <= 20% per call and per 30-day ring; buys <= 17.5 HYPE in any 60 minutes.
+
+| Finding | Fix | Lines | Test |
+|---|---|---|---|
+| M-1 loss record returns room at up to 2x the stated rate | Plain leaky bucket `Loss{used, at}`: drains at budget / 7 d (budget = 30% of the sale's base), booking adds to the drained value and sets `at`; `floorFor` and `budgetOf` use the same `_decayed(account, budget)` | 73-77, 264-278, 458-475, 580-587 | `test_M1_auditor_sequence_lot_only_stays_within_budget_plus_one_week`, `test_M1_sustained_rebooking_is_one_budget_per_7_days`, `test_M1_floorFor_uses_the_same_decay` |
+| L-1 two full pauses chain (14 days) | At most 7 days of pause per 8-day window: `pauseUsed`, `episodeAt`, `pauseEnd`; a new pause lasts the allowance left; the window resets only after 8 days AND 1 day since the last pause ended | 93-97, 173-196 | `test_L1_auditor_chain_of_two_full_pauses_is_refused`, `test_L1_any_8_days_hold_at_most_7_days_of_pause`, the `test_L1_*` of round 4 |
+| L-3 `replaceGuardian` moves a running pause's end | `pauseExp` fixed when the pause starts; the replacement resets only the allowance | 93-97, 201-208 | `test_L3_replaceGuardian_does_not_move_a_running_pauses_expiry` |
+| I-1 same-second lift uses no allowance | Every pause costs at least one second (`_endPause`) | 177-181 | `test_I1_a_pause_lifted_in_the_same_second_uses_one_second` |
+| L-7 exits run the registry walk, can revert `GasTooLow` | `_trimAll` only for executor sells; exits trim the sold token only | 437 | `test_L7_exitSell_and_exit_succeed_with_32_gas_burning_lots` |
+| L-5 resumed `_trimAll` skips a lot | The index is re-read when a close moved an entry into it | 311-315 | `test_L5_resumed_round_visits_the_entry_a_close_moved_into_the_cursor_slot` |
+| L-6 `_owner` accepts long returns, precompile range | exactly 32 bytes, address > 0xffff | 550-564 | `test_L6_owner_read_needs_32_bytes_and_a_real_address` |
+| L-2 `buy` books any balance rise | `home` capped at `msg.value` (no change in arithmetic); token output stays the account's balance increase; residual (a third-party payer on Elysium) accepted as Low, DESIGN.md 8.6 | 402 | - |
+| I-5 `_sendEth` return data | assembly call without return data copy | 673-677 | all |
+| L-4, I-2 .. I-4, I-6 .. I-9 | Documented (DESIGN.md 8.7); I-4 doc drift fixed; I-9 moot | - | - |
+
+Residuals after round 5: profit leak through a rigged route (stolen executor key; off-chain watcher + pause); the sale base includes deposited native (L-4: its extra room is recoverable only through the buy cap); the balance-delta accounting in `buy` (L-2); sequencer time (I-3); the pause drains the loss record while it runs (lead).

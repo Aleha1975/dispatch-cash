@@ -7,7 +7,7 @@ import "./Mocks.sol";
 abstract contract GateBase is Test {
     address constant K_ETH = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
     MockToken public tok; MockRouter public router; GuardedGate public gate; MockAccount public acct; MockAccount public acct2; address public exec;
-    address owner1 = address(0xA11CE); address owner2 = address(0xB0B); address cold = address(0xC01D); address guardian = address(0x6A12D);
+    address owner1 = address(0xA11CE); address owner2 = address(0xB0B00B); address cold = address(0xC01D); address guardian = address(0x6A12D);
     address feeTo = address(0xFEE); address thief = address(0x1111111111111111111111111111111111111111);
     uint256 constant BUY_H = 17.5 ether; uint256 constant GAS_CALL = 0.02 ether; uint256 constant GAS_DAY = 0.1 ether;
 
