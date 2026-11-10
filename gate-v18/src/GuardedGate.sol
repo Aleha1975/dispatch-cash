@@ -14,7 +14,7 @@ pragma solidity 0.8.26;
 ///         1. payFee: at most 20% of the account's native balance per call and 20% of its balance base per 30 days (30 to 35 days in practice, ring slots of 5 days); refundGas: code caps
 ///            per call and per day. Both pay FEE_TO only (never the executor key).
 ///         2. withdraw: native, no cap, never paused, pays owner() of the calling account only (no recipient argument).
-///            withdrawTo (account-only, NOT in the delegation) is the fallback when owner() cannot be resolved.
+///            withdrawTo (account-only, NOT in the delegation) is the fallback when owner() cannot be resolved or cannot act (round 8: the cold key can relay it).
 ///         3. Sells are not limited by count or proceeds; buys keep the hourly HYPE cap. The executor's sell() keeps the loss budget
 ///            (round 4: measured on the account's native balance plus the cost of the lot under sale only). There is NO on-chain price
 ///            reference (removed in round 4, DESIGN.md section 7): a profit leak through a rigged route is a documented residual watched
@@ -32,10 +32,6 @@ pragma solidity 0.8.26;
 ///         reconciliation against the account's holdings (_trim/_trimAll, 32-lot registry), pinned router executor and decoded route,
 ///         minOut, bounded balanceOf with gas floor, guardian pause (<= 7 days in any 8-day window), two-step guardian rotation, cold-key
 ///         replaceGuardian and exit() through tx.origin. No owner, no upgrade. `ETH` means the chain's native token (HYPE on Elysium).
-interface IERC20 {
-    function balanceOf(address) external view returns (uint256);
-}
-
 contract GuardedGate {
     // KyberSwap MetaAggregationRouterV2 calldata shape (decoded, never trusted blindly)
     struct SwapDescriptionV2 { address srcToken; address dstToken; address[] srcReceivers; uint256[] srcAmounts; address[] feeReceivers; uint256[] feeAmounts; address dstReceiver; uint256 amount; uint256 minReturnAmount; uint256 flags; bytes permit; }
@@ -68,6 +64,7 @@ contract GuardedGate {
     uint256 public constant MAX_LOT = 1e40;         // raw token units a lot may hold (keeps the arithmetic far from overflow)
     uint256 public constant MAX_LOTS = 32;          // v17: open lots per account (reconcile and a buy on a full registry walk them with a gas-bounded cursor, an executor sale reads one entry; no limit reads the other lots' cost)
     uint256 internal constant GAS_FLOOR = 105_000;   // round 6 (I-2): BALANCE_GAS * 64 / 63 plus the cold-account access cost and a margin; below it a balance read reverts instead of running starved
+    uint256 internal constant TRIM_RESERVE = 80_000;  // round 8 (L-1, L-4): gas kept after a walk iteration starts: one read (~28k after the 100k forward) + one lot close (~40k) + the cursor store (22.1k)
     uint256 internal constant ONE = 1e18;            // round 6: the loss record is stored as a fraction of one budget, ONE = a full budget
     uint256 internal constant PSLOTS = 9;            // round 6: day-slots of the pause ring (8 days of window + the partly covered oldest day)
     uint256 public constant BALANCE_GAS = 100_000;  // v17: gas one balanceOf read may use; a token that needs more (or burns it) reads as unreadable
@@ -184,7 +181,12 @@ contract GuardedGate {
     function pauseUsed() public view returns (uint256 t) {
         uint64 h = _pr.head; uint64 nh = uint64(block.timestamp / 1 days); if (h > nh) nh = h;       // time stepping backward keeps the stored head
         for (uint256 d = 0; d < PSLOTS && d <= nh; d++) { uint64 i = nh - uint64(d); if (i <= h) t += _pr.v[i % PSLOTS]; }
-        if (pausedAt != 0) { uint256 e = block.timestamp < pauseExp ? block.timestamp : pauseExp; if (e > pausedAt) t += e - pausedAt; }   // round 7 (L-6): a running or expired, not yet booked pause is not in the ring yet
+        if (pausedAt != 0) {                                                                         // round 7 (L-6): a running or expired, not yet booked pause is not in the ring yet
+            uint256 e = block.timestamp < pauseExp ? block.timestamp : pauseExp;
+            uint256 lo = nh >= PSLOTS - 1 ? (uint256(nh) - (PSLOTS - 1)) * 1 days : 0;               // round 8 (L-2): only the seconds booking would place in the day-slots the sum reads
+            uint256 st = pausedAt > lo ? pausedAt : lo;
+            if (e > st) t += e - st;
+        }
     }
     function _padd(uint64 day, uint256 secs) private {
         uint64 h = _pr.head;
@@ -250,8 +252,7 @@ contract GuardedGate {
     function _head(Ring storage r, uint256 span) private view returns (uint64 nh) {
         nh = uint64(block.timestamp / (span / SUBS)); uint64 h = r.head; if (h > nh) nh = h;
     }
-    /// @dev Sum of the newest `n` slots up to `nh` (n = RING: every spend of the last `span` is inside, conservative; n = SUBS: at most one span, used only
-    ///      for withdrawn amounts, where under-counting is the safe side). Slots newer than the stored head are empty.
+    /// @dev Sum of the newest `n` slots up to `nh` (n = RING: every spend of the last `span` is inside, conservative). Slots newer than the stored head are empty.
     function _sum(Ring storage r, uint64 nh, uint256 n) private view returns (uint256 t) {
         uint64 h = r.head;
         for (uint256 d = 0; d < n && d <= nh; d++) { uint64 i = nh - uint64(d); if (i <= h) t += r.v[i % RING]; }
@@ -313,24 +314,24 @@ contract GuardedGate {
     ///      longer holds (round 15, H; since round 4 the budget base is the sold lot only, so this keeps the registry and costOf true, not the budget). Walked from the end: closing a lot moves the last entry into the freed index, which is then visited again (round 5, L-5).
     ///      Bounded by MAX_LOTS reads of at most BALANCE_GAS each; a token that does not answer is skipped, never fatal.
     ///      v18: a total gas budget (TRIM_GAS) per call -- a cursor remembers where the walk stopped and the next call resumes there, so a
-    ///      registry stuffed with slow tokens cannot make a call cost 32 slow reads (round 6: only reconcile and a buy on a full registry walk; sales do not).
+    ///      registry stuffed with slow tokens cannot make a call cost 32 slow reads (round 6: reconcile and a buy on a full registry walk; since round 7 an executor sale reads one entry, _trimNext).
     ///      Round 4 (L-4): when the walk resumed in the middle of a round and reached the start with gas left, it WRAPS once and goes on from the
     ///      end of the registry down to where it began, so a slot freed above the cursor is found by the same call (a buy that reverted with
     ///      TooManyLots rolls the cursor back, so without the wrap the same partial walk would repeat).
-    function _trimAll(address account) private {
+    function _trimAll(address account) private returns (bool ran) {
         address[] storage a = _lots[account];
         uint256 pos = _trimPos[account]; uint256 n = a.length;
         if (pos == 0 || pos > n) pos = n;
         uint256 start = pos; uint256 stop = 0; bool wrapped = pos == n;   // a fresh round (start == n) has nothing to wrap to
         uint256 g0 = gasleft();
-        while (g0 - gasleft() < TRIM_GAS && gasleft() > GAS_FLOOR + 30_000) {   // round 7 (L-9): stop with gas left for one more read, so the cursor is stored
+        while (g0 - gasleft() < TRIM_GAS && gasleft() > GAS_FLOOR + TRIM_RESERVE) {   // round 8 (L-1): the reserve covers a read, a lot close and the cursor store, so the cursor is always stored
             if (pos <= stop) {
                 if (wrapped) break;
                 wrapped = true; stop = start; pos = a.length;           // second leg: from the end down to where this call began
                 if (pos <= stop) break;
                 continue;
             }
-            uint256 len = a.length;
+            uint256 len = a.length; ran = true;
             _trim(account, a[pos - 1]);
             if (a.length == len || pos > a.length) pos--;               // round 5 (L-5): otherwise a close moved the last entry into pos - 1: visit it
         }
@@ -340,7 +341,8 @@ contract GuardedGate {
     function _trimNext(address account) private {
         address[] storage a = _lots[account]; uint256 n = a.length; if (n == 0) return;
         uint256 pos = _trimPos[account]; if (pos == 0 || pos > n) pos = n;
-        _trim(account, a[pos - 1]); _trimPos[account] = pos - 1;
+        uint256 len = a.length; _trim(account, a[pos - 1]);
+        _trimPos[account] = (a.length == len || pos > a.length) ? pos - 1 : pos;   // round 8 (L-3): as _trimAll -- a close moved the last entry into pos - 1: stay on it
     }
     /// @notice ACCOUNT-ONLY (not delegated): drop an open lot from the books without reading the token at all -- the escape from junk
     ///         lots whose balanceOf burns gas or reverts. The tokens (if any) stay in the account; the gate just stops tracking them.
@@ -358,10 +360,12 @@ contract GuardedGate {
     ///         next sale, so tokens given back to the account later cannot bring its old cost back into the books. It only lowers or
     ///         closes lots, never raises one, and never closes a lot whose balance does not answer. v17.1 (round 16, L-1): closing is
     ///         irreversible, so only the account itself (its UI batches it with the transfer), the guardian (the watcher) or the cold
-    ///         key may call it; nobody can close a lot on a balance that reads low only for a moment.
+    ///         key may call it directly. (Since round 7 each executor sale also reconciles ONE other entry, which may close it: the gate
+    ///         reads the same balance, and a lot with no tokens in the account has no use.) Round 8 (L-4): with too little gas for one
+    ///         full iteration it reverts GasTooLow instead of succeeding as a no-op. Send it with a fixed limit of 1,000,000 gas or more.
     function reconcile(address account) external lock {
         if (msg.sender != account && msg.sender != guardian && msg.sender != EXIT_KEY) revert NotReconciler();
-        _trimAll(account);
+        if (!_trimAll(account) && _lots[account].length != 0) revert GasTooLow();   // not one entry was visited: the gas ran out before the walk began (the revert also undoes the cursor store)
     }
     /// @dev The registry follows the lots: an entry is added when a lot opens and removed wherever one is deleted.
     function _openLot(address account, address token) private {
@@ -543,7 +547,7 @@ contract GuardedGate {
         if (v == 0) revert ZeroAmount();
         if (v > GAS_CALL_MAX) revert GasLimit();
         Pay storage p = pay[msg.sender]; uint64 nh = _head(p.gas, GAS_WINDOW);
-        uint256 day = _sum(p.gas, nh, RING) + v;
+        uint256 day = _sum(p.gas, nh, RING) + v;                    // round 8 (L-5): the 5% rule below has no window longer than the day; see DESIGN.md 11
         if (day > GAS_DAY_MAX) revert GasLimit();
         if (day * 10000 > (msg.sender.balance + v) * GAS_BAL_BPS) revert GasLimit();
         _add(p.gas, nh, v);
@@ -562,10 +566,13 @@ contract GuardedGate {
     /// @notice ACCOUNT-ONLY fallback for an account whose owner() cannot be resolved (rotated to a contract wallet, passkey-only, reverting):
     ///         the account's owner, acting through his own account, names the recipient. NOT in the delegation's AllowedMethods, so the
     ///         executor cannot reach it. Never paused. Round 7: where owner() resolves, tx.origin must be the owner (as exitSell); it does not touch the fee base.
+    ///         Round 8 (L-6): tx.origin may also be EXIT_KEY. A resolved owner nobody controls here (retired EOA signer, contract wallet not deployed on this
+    ///         chain, passkey-only account) cannot be tx.origin; the controller signs a delegation account -> EXIT_KEY for withdrawTo with `to` pinned by
+    ///         allowedCalldata (word 0), exactly like the approve delegation pins its spender, and the cold key relays it. The key cannot choose `to`.
     function withdrawTo(address to) external payable lock {
         if (msg.value == 0) revert ZeroAmount();
         if (to == address(0) || to == address(this) || to == ROUTER) revert BadRecipient();
-        { (bool okO, address o) = _owner(msg.sender); if (okO && tx.origin != o) revert NotOwnerOrigin(); }   // round 7 (L-10): where the owner resolves, only his own transaction (an account whose owner() cannot be read has no one to prove)
+        { (bool okO, address o) = _owner(msg.sender); if (okO && tx.origin != o && tx.origin != EXIT_KEY) revert NotOwnerOrigin(); }   // round 7 (L-10): where the owner resolves, only his own transaction; round 8 (L-6): or the cold key relaying a delegation the controller signed (an account whose owner() cannot be read has no one to prove)
         emit Withdrawn(msg.sender, to, msg.value);
         _sendEth(to, msg.value);
     }
