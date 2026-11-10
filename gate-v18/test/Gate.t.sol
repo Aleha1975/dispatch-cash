@@ -11,9 +11,9 @@ contract GateTest is GateBase {
         assertEq(address(gate).balance, 0);
     }
     function test_buy_may_pay_account_or_gate_not_a_third_party() public {
-        bytes memory d = abi.encodeCall(GuardedGate.buy, (address(tok), 1, routeMin(K_ETH, address(tok), 1 ether, address(acct), 1, exec)));
+        bytes memory d = abi.encodeCall(GuardedGate.buy, (address(tok), 1, routeMin(K_ETH, address(tok), 1 ether, address(acct), 1, exec), type(uint256).max));
         acct.exec(address(gate), 1 ether, d);
-        d = abi.encodeCall(GuardedGate.buy, (address(tok), 1, routeMin(K_ETH, address(tok), 1 ether, thief, 1, exec)));
+        d = abi.encodeCall(GuardedGate.buy, (address(tok), 1, routeMin(K_ETH, address(tok), 1 ether, thief, 1, exec), type(uint256).max));
         vm.expectRevert(GuardedGate.BadRoute.selector); acct.exec(address(gate), 1 ether, d);
     }
     function test_sell_pulls_with_approve_and_pays_account() public {
@@ -32,16 +32,16 @@ contract GateTest is GateBase {
     function test_sale_must_pay_gate_not_account_or_thief() public {
         _buy(1 ether);
         for (uint256 i = 0; i < 2; i++) {
-            bytes memory d = abi.encodeCall(GuardedGate.sell, (address(tok), 500e18, 1, routeMin(address(tok), K_ETH, 500e18, i == 0 ? thief : address(acct), 1, exec)));
+            bytes memory d = abi.encodeCall(GuardedGate.sell, (address(tok), 500e18, 1, routeMin(address(tok), K_ETH, 500e18, i == 0 ? thief : address(acct), 1, exec), type(uint256).max));
             vm.expectRevert(GuardedGate.BadRoute.selector); acct.exec(address(gate), 0, d);
         }
     }
     function test_wrong_executor_and_minout_rejected() public {
-        bytes memory d = abi.encodeCall(GuardedGate.buy, (address(tok), 1, routeMin(K_ETH, address(tok), 1 ether, address(gate), 1, thief)));
+        bytes memory d = abi.encodeCall(GuardedGate.buy, (address(tok), 1, routeMin(K_ETH, address(tok), 1 ether, address(gate), 1, thief), type(uint256).max));
         vm.expectRevert(GuardedGate.BadRoute.selector); acct.exec(address(gate), 1 ether, d);
-        d = abi.encodeCall(GuardedGate.buy, (address(tok), 5, routeMin(K_ETH, address(tok), 1 ether, address(gate), 1, exec)));
+        d = abi.encodeCall(GuardedGate.buy, (address(tok), 5, routeMin(K_ETH, address(tok), 1 ether, address(gate), 1, exec), type(uint256).max));
         vm.expectRevert(GuardedGate.BadRoute.selector); acct.exec(address(gate), 1 ether, d);
-        vm.expectRevert(GuardedGate.MinOutZero.selector); acct.exec(address(gate), 1 ether, abi.encodeCall(GuardedGate.buy, (address(tok), 0, route(K_ETH, address(tok), 1 ether))));
+        vm.expectRevert(GuardedGate.MinOutZero.selector); acct.exec(address(gate), 1 ether, abi.encodeCall(GuardedGate.buy, (address(tok), 0, route(K_ETH, address(tok), 1 ether), type(uint256).max)));
         _buy(1 ether);
         vm.expectRevert(GuardedGate.MinOutZero.selector); acct.exec(address(gate), 0, _sellData(tok, 1e18, 0));
         router.set(1000, 1e12, address(0));
@@ -53,7 +53,7 @@ contract GateTest is GateBase {
         // tokens that reached the account any other way are not for sale
         tok.mint(address(acct), 500e18);
         vm.expectRevert(abi.encodeWithSelector(GuardedGate.NotInLot.selector, 1000e18, 1500e18)); acct.exec(address(gate), 0, _sellData(tok, 1500e18, 1));
-        vm.prank(thief); vm.expectRevert(abi.encodeWithSelector(GuardedGate.NotInLot.selector, 0, 1)); gate.sell(address(tok), 1, 1, route(address(tok), K_ETH, 1));
+        vm.prank(thief); vm.expectRevert(abi.encodeWithSelector(GuardedGate.NotInLot.selector, 0, 1)); gate.sell(address(tok), 1, 1, route(address(tok), K_ETH, 1), type(uint256).max);
     }
     function test_router_pulling_less_returns_the_rest_to_account() public {
         _buy(1 ether); router.setPullHalf(true);
@@ -92,7 +92,7 @@ contract GateTest is GateBase {
         _buy(5 ether); _buy(5 ether); _buy(5 ether); _buy(2.5 ether);            // 17500 tokens
         for (uint256 i = 0; i < 30; i++) _sell(1e18);                            // 30 sells in one hour (old cap 24)
         _sell(300e18);                                                           // 330 ETH of proceeds in the hour (old cap 100)
-        (uint256 la, ) = gate.loss(address(acct)); assertEq(la, 0);
+        (uint256 la, , ) = gate.loss(address(acct)); assertEq(la, 0);
     }
 
     // ---------------- native withdrawal: no cap, owner only, never paused ----------------
@@ -176,13 +176,13 @@ contract GateTest is GateBase {
         vm.expectRevert(GuardedGate.NotExitKey.selector); acct.exec(address(gate), 0, d);
         vm.prank(guardian); gate.setPaused(true);
         vm.startPrank(address(0xBEEF), cold); acct.exec(address(gate), 0, d); vm.stopPrank();
-        (uint256 t, ) = _lot(address(acct), tok); assertEq(t, 0); (uint256 la, ) = gate.loss(address(acct)); assertEq(la, 0);
+        (uint256 t, ) = _lot(address(acct), tok); assertEq(t, 0); (uint256 la, , ) = gate.loss(address(acct)); assertEq(la, 0);
     }
     function test_loss_budget_30pct_and_unlock() public {
         vm.deal(address(acct), 3 ether); _buy(1 ether);                         // base 2 + 1 = 3 -> budget 0.9
         router.set(1000, 1e12, address(0));
         acct.exec(address(gate), 0, _sellData(tok, 500e18, 1));
-        (uint256 lost, uint256 budget) = gate.budgetOf(address(acct)); assertGt(lost, 0.49 ether); assertLt(budget, 0.8 ether);
+        (uint256 lost, uint256 budget) = gate.budgetOf(address(acct), address(tok)); assertGt(lost, 0.49 ether); assertLt(budget, 0.8 ether);
         vm.expectRevert(); acct.exec(address(gate), 0, _sellData(tok, 500e18, 1));
         address[] memory a = new address[](1); a[0] = address(acct);
         vm.prank(thief); vm.expectRevert(GuardedGate.NotExitKey.selector); gate.unlock(a);
@@ -190,16 +190,16 @@ contract GateTest is GateBase {
         acct.exec(address(gate), 0, _sellData(tok, 500e18, 1));
     }
     function test_sale_at_or_above_cost_never_books_loss() public {
-        _buy(1 ether); router.set(1000, 2e15, address(0)); _sell(1000e18); (uint256 la, ) = gate.loss(address(acct)); assertEq(la, 0);
+        _buy(1 ether); router.set(1000, 2e15, address(0)); _sell(1000e18); (uint256 la, , ) = gate.loss(address(acct)); assertEq(la, 0);
     }
-    function _exitSellData(MockToken t, uint256 amt, uint256 minOut) internal view returns (bytes memory) { return abi.encodeCall(GuardedGate.exitSell, (address(t), amt, minOut, route(address(t), K_ETH, amt))); }
+    function _exitSellData(MockToken t, uint256 amt, uint256 minOut) internal view returns (bytes memory) { return abi.encodeCall(GuardedGate.exitSell, (address(t), amt, minOut, route(address(t), K_ETH, amt), type(uint256).max)); }
     function test_exitSell_lets_an_honest_full_exit_through_the_budget() public {
         vm.deal(address(acct), 0); vm.deal(address(acct), 0.1 ether); _buy(0.1 ether); router.set(1000, 1e12, address(0));   // base 0.1 -> budget 0.03, loss ~0.1
         vm.expectRevert(); acct.exec(address(gate), 0, _sellData(tok, 100e18, 1));      // executor sell: refused by the budget
         vm.expectRevert(GuardedGate.NotOwnerOrigin.selector); acct.exec(address(gate), 0, _exitSellData(tok, 100e18, 1));   // the executor (any other origin) cannot exitSell
-        vm.prank(thief, thief); vm.expectRevert(); gate.exitSell(address(tok), 1, 1, route(address(tok), K_ETH, 1));   // another account has no lot
+        vm.prank(thief, thief); vm.expectRevert(); gate.exitSell(address(tok), 1, 1, route(address(tok), K_ETH, 1), type(uint256).max);   // another account has no lot
         vm.prank(owner1, owner1); acct.exec(address(gate), 0, _exitSellData(tok, 100e18, 1));   // the owner's own transaction: no budget, no loss booked
-        (uint256 la, ) = gate.loss(address(acct)); assertEq(la, 0); (uint256 t, ) = _lot(address(acct), tok); assertEq(t, 0);
+        (uint256 la, , ) = gate.loss(address(acct)); assertEq(la, 0); (uint256 t, ) = _lot(address(acct), tok); assertEq(t, 0);
     }
     function test_exitSell_works_while_paused_and_sell_does_not() public {
         _buy(1 ether); vm.prank(guardian); gate.setPaused(true);

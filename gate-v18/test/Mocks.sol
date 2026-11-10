@@ -45,6 +45,8 @@ contract MockRouter {
     address public reenterGate; bytes public reenterData; bool public reentered; bool public reentryBlocked;
     uint256 public fixedOut;                     // test helper: a buy mints exactly this many raw units (0 = value * tokensPerEth)
     function setFixedOut(uint256 o) external { fixedOut = o; }
+    uint256 public revertLen;                    // test helper: swap() reverts with this many bytes of data (round 4, L-7)
+    function setRevertLen(uint256 n) external { revertLen = n; }
     uint256 public kickWei; address public kickTo; bool public pullHalf; uint256 public refund;
     receive() external payable {}
     function set(uint256 tpe, uint256 ept, address to) external { tokensPerEth = tpe; ethPerToken = ept; payTo = to; }
@@ -54,6 +56,7 @@ contract MockRouter {
     function setRefund(uint256 w) external { refund = w; }
     function swap(GuardedGate.SwapExecutionParams calldata p) external payable returns (uint256, uint256) { return _run(p.desc); }
     function _run(GuardedGate.SwapDescriptionV2 memory d) internal returns (uint256, uint256) {
+        if (revertLen != 0) { uint256 n = revertLen; assembly { revert(0, n) } }
         address to = payTo != address(0) ? payTo : d.dstReceiver;
         if (reenterGate != address(0)) { reentered = true; (bool ok, bytes memory r) = reenterGate.call(reenterData); reentryBlocked = !ok && r.length >= 4 && bytes4(r) == GuardedGate.Reentrancy.selector; }
         if (d.srcToken == K_ETH) {

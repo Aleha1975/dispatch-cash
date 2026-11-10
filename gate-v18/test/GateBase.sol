@@ -31,8 +31,8 @@ abstract contract GateBase is Test {
         return abi.encodeWithSelector(0xe21fd0e9, p);
     }
     function route(address tin, address tout, uint256 amount) internal view returns (bytes memory) { return routeMin(tin, tout, amount, address(gate), 1, exec); }
-    function _buyData(MockToken t, uint256 eth) internal view returns (bytes memory) { return abi.encodeCall(GuardedGate.buy, (address(t), 1, route(K_ETH, address(t), eth))); }
-    function _sellData(MockToken t, uint256 amt, uint256 minOut) internal view returns (bytes memory) { return abi.encodeCall(GuardedGate.sell, (address(t), amt, minOut, route(address(t), K_ETH, amt))); }
+    function _buyData(MockToken t, uint256 eth) internal view returns (bytes memory) { return abi.encodeCall(GuardedGate.buy, (address(t), 1, route(K_ETH, address(t), eth), type(uint256).max)); }
+    function _sellData(MockToken t, uint256 amt, uint256 minOut) internal view returns (bytes memory) { return abi.encodeCall(GuardedGate.sell, (address(t), amt, minOut, route(address(t), K_ETH, amt), type(uint256).max)); }
     function _buyT(MockAccount a, MockToken t, uint256 eth) internal returns (uint256) { return abi.decode(a.exec(address(gate), eth, _buyData(t, eth)), (uint256)); }
     function _buy(uint256 eth) internal returns (uint256) { return _buyT(acct, tok, eth); }
     function _sell(uint256 amt) internal returns (uint256) { return abi.decode(acct.exec(address(gate), 0, _sellData(tok, amt, 1)), (uint256)); }

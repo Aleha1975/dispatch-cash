@@ -16,7 +16,7 @@ contract AdversarialTest is GateBase {
     function _fee(MockAccount a, uint256 v) internal { a.exec(address(gate), v, abi.encodeCall(GuardedGate.payFee, ())); }
     function _wd(MockAccount a, uint256 v) internal { a.exec(address(gate), v, abi.encodeCall(GuardedGate.withdraw, ())); }
     function _hours(uint256 n) internal { vm.warp(block.timestamp + n * 1 hours + 1); }
-    function _exitSellData(MockToken t, uint256 amt, uint256 minOut) internal view returns (bytes memory) { return abi.encodeCall(GuardedGate.exitSell, (address(t), amt, minOut, route(address(t), K_ETH, amt))); }
+    function _exitSellData(MockToken t, uint256 amt, uint256 minOut) internal view returns (bytes memory) { return abi.encodeCall(GuardedGate.exitSell, (address(t), amt, minOut, route(address(t), K_ETH, amt), type(uint256).max)); }
     function _ownerExit(MockAccount a, address ow, MockToken t, uint256 amt) internal { vm.prank(ow, ow); a.exec(address(gate), 0, _exitSellData(t, amt, 1)); }
 
     // F1 (was High): there is no exit-mode switch any more. The executor cannot dump lots for dust whatever the owner does.
@@ -31,33 +31,6 @@ contract AdversarialTest is GateBase {
         assertEq(tok.balanceOf(address(acct)), all);                                      // everything still there
     }
 
-    // F2 (was High, L4): profit leak. A price reference built from recent executor trades makes a far-below-market sale cost budget.
-    function test_FIXED_profit_leak_sale_far_below_market_books_shortfall_or_is_refused() public {
-        // the account's own executor buys keep lifting its reference while the market rises 3x (each note at most 1.5x the live value)
-        _buy(17.5 ether);                                                                 // acct: 17500 tokens, cost 17.5 (price 1e15)
-        router.set(333, 3e15, address(0));
-        for (uint256 i = 0; i < 3; i++) { _hours(2); _buy(1 ether); }
-        (uint256 rp, ) = gate.ref(address(acct), address(tok)); assertGt(rp, 2.9e27);      // reference ~3e15 wei per token = 3e27 per 1e30 raw units
-        router.set(1000, 1e15, address(0));                                               // rigged pool pays only cost
-        // 17.5 of the ~20.5 lot: shortfall vs reference is booked as loss (0.7 * 3.0 * 17.5 - 17.5 ~ 19.3), inside the 30% budget: passes but costs budget
-        uint256 out = _sell(17_500 ether); assertEq(out, 17.5 ether);
-        (uint256 lost, ) = gate.budgetOf(address(acct)); assertGt(lost, 17 ether);
-        // a bigger position: the shortfall exceeds the budget and the executor sale is refused
-        _hours(2); router.set(333, 3e15, address(0)); _buy(10 ether); _hours(2); _buy(10 ether); router.set(1000, 1e15, address(0));
-        uint256 held = tok.balanceOf(address(acct)); assertGt(held, 6000 ether);
-        (bool okS, bytes memory rS) = address(acct).call(abi.encodeCall(MockAccount.exec, (address(gate), 0, _sellData(tok, held, 1))));
-        assertFalse(okS); assertEq(bytes4(rS), GuardedGate.BudgetExceeded.selector);
-        // the client's own exit is exempt
-        _ownerExit(acct, owner1, tok, held);
-    }
-    function test_reference_decays_and_cannot_be_jumped_by_one_trade() public {
-        _buy(1 ether); (uint256 p0, ) = gate.ref(address(acct), address(tok)); assertEq(p0, 1e27);
-        router.set(100, 1e16, address(0)); _hours(2); _buy(1 ether);                      // a 10x rigged-price buy: capped at 1.5x the faded live value
-        (uint256 p1, ) = gate.ref(address(acct), address(tok)); assertEq(p1, (uint256(1e27) * (2 days - 7201) / 2 days) * 15000 / 10000);   // 1.5x the FADED value (round 2), not 1.5x the stored 1e27
-        vm.warp(block.timestamp + 3 days); router.set(1000, 1e14, address(0));            // reference expired: a 10x lower sale is only a cost question
-        _hours(2); router.set(1000, 1e15, address(0)); _buyT(acct2, tok, 1 ether);
-        router.set(1000, 5e14, address(0)); acct2.exec(address(gate), 0, _sellData(tok, 500 ether, 1));    // -50% vs cost, small: books 0.25, no reference effect
-    }
 
     // F3 (was Medium/High): budget griefing. The thief still burns the executor's budget, but the client's honest exit no longer depends on it.
     function test_FIXED_budget_exhausted_by_fake_lot_does_not_block_owner_exit() public {
@@ -65,7 +38,7 @@ contract AdversarialTest is GateBase {
         MockToken fake = new MockToken(); _approveGate(acct, fake);
         _hours(2); _buyT(acct, fake, 17.5 ether);
         router.set(1000, 1, address(0));
-        acct.exec(address(gate), 0, abi.encodeCall(GuardedGate.sell, (address(fake), 17_500 ether, 1, route(address(fake), K_ETH, 17_500 ether))));
+        acct.exec(address(gate), 0, abi.encodeCall(GuardedGate.sell, (address(fake), 17_500 ether, 1, route(address(fake), K_ETH, 17_500 ether), type(uint256).max)));
         router.set(1000, 0.2e15, address(0));
         vm.expectRevert(); acct.exec(address(gate), 0, _sellData(tok, 17_500 ether, 1)); // executor sell refused (budget)
         _ownerExit(acct, owner1, tok, 17_500 ether);                                      // the client leaves anyway

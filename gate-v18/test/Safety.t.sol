@@ -7,24 +7,24 @@ contract SafetyTest is GateBase {
     function test_fee_on_transfer_token_sale_follows_what_left_the_account() public {
         MockToken t = new MockToken(); t.setFee(1000); _approveGate(acct, t);
         _buyT(acct, t, 1 ether); (uint256 tk, ) = _lot(address(acct), t); assertEq(tk, 900e18);   // the sweep to the account lost 10%: the lot is what the account received
-        acct.exec(address(gate), 0, abi.encodeCall(GuardedGate.sell, (address(t), 200e18, 1, route(address(t), K_ETH, 180e18))));
+        acct.exec(address(gate), 0, abi.encodeCall(GuardedGate.sell, (address(t), 200e18, 1, route(address(t), K_ETH, 180e18), type(uint256).max)));
         (tk, ) = _lot(address(acct), t); assertEq(tk, 700e18); assertEq(t.balanceOf(address(gate)), 0); assertEq(t.balanceOf(address(acct)), 700e18);
     }
     function test_return_data_bomb_token_fails_cleanly_not_by_gas() public {
         MockToken t = new MockToken(); _approveGate(acct, t); t.setMode(1);        // every transfer/approve answers with 2 MB
-        bytes memory d = abi.encodeCall(GuardedGate.buy, (address(t), 1, route(K_ETH, address(t), 1 ether)));
+        bytes memory d = abi.encodeCall(GuardedGate.buy, (address(t), 1, route(K_ETH, address(t), 1 ether), type(uint256).max));
         vm.expectRevert(GuardedGate.TransferFailed.selector); acct.exec(address(gate), 1 ether, d);   // only 32 bytes are copied; a non-word answer is a failure
         assertEq(address(gate).balance, 0);
     }
     function test_no_return_data_token_works() public {
         MockToken t = new MockToken(); _approveGate(acct, t); t.setMode(2);
         _buyT(acct, t, 1 ether);
-        acct.exec(address(gate), 0, abi.encodeCall(GuardedGate.sell, (address(t), 100e18, 1, route(address(t), K_ETH, 100e18))));
+        acct.exec(address(gate), 0, abi.encodeCall(GuardedGate.sell, (address(t), 100e18, 1, route(address(t), K_ETH, 100e18), type(uint256).max)));
         (uint256 tk, ) = _lot(address(acct), t); assertEq(tk, 900e18);
     }
     function test_false_return_on_the_gate_sweep_reverts_the_buy() public {
         MockToken t = new MockToken(); t.setMode(3);                              // transfer returns false without moving
-        bytes memory d = abi.encodeCall(GuardedGate.buy, (address(t), 1, route(K_ETH, address(t), 1 ether)));
+        bytes memory d = abi.encodeCall(GuardedGate.buy, (address(t), 1, route(K_ETH, address(t), 1 ether), type(uint256).max));
         vm.expectRevert(); acct.exec(address(gate), 1 ether, d);                  // dstReceiver = gate: the sweep cannot deliver
         assertEq(address(gate).balance, 0);
     }
@@ -43,7 +43,7 @@ contract SafetyTest is GateBase {
         HookToken h = new HookToken(); _approveGate(acct, h);
         _buyT(acct, h, 1 ether);
         h.arm(address(gate), _buyData(tok, 1 ether));                             // fires when the gate moves tokens (router pull)
-        acct.exec(address(gate), 0, abi.encodeCall(GuardedGate.sell, (address(h), 100e18, 1, route(address(h), K_ETH, 100e18))));
+        acct.exec(address(gate), 0, abi.encodeCall(GuardedGate.sell, (address(h), 100e18, 1, route(address(h), K_ETH, 100e18), type(uint256).max)));
         assertTrue(h.hit()); assertTrue(h.blocked());
     }
     function test_state_final_before_native_leaves() public {

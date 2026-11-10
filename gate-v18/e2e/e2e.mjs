@@ -17,12 +17,15 @@ const GATE = art("GuardedGate.sol", "GuardedGate"), ROUTER = art("Mocks.sol", "M
 const FORK = process.env.FORK_URL || "https://rpc.elysium.kinetiq.xyz", port = Number(process.argv[2] || 8751);
 let fails = 0; const ok = (name, cond, extra = "") => { console.log((cond ? "PASS " : "FAIL ") + name + (extra ? "  " + extra : "")); if (!cond) fails++; };
 const hype = (v) => parseEther(String(v)), f = (v) => formatEther(v);
+let dlNow;   // (secs) => chain time + secs: the deadline argument of buy / sell / exitSell (round 4, L-9)
 
 const anvil = await startAnvil({ port, forkUrl: FORK });
 try {
   const C = clients(anvil.url); const chainId = CFG0.chainId;
   await C.raw("evm_setTime", [Math.floor(Date.now() / 1000) + 30]); await C.raw("evm_mine", []);   // fork block time lags the wall clock
   for (const r of ["deployer", "executor", "guardian", "exitkey"]) await C.raw("anvil_setBalance", [ROLE[r].address, "0x" + hype(1000000).toString(16)]);
+  // the well-known test addresses may carry code on the live chain (sweeper / 7702 designators): the gate wants an EOA cold key, so clear it on the local fork only
+  for (const r of ["deployer", "executor", "guardian", "exitkey", "feeTo"]) await C.raw("anvil_setCode", [ROLE[r].address, "0x"]);
   const forkBlock = await C.pub.getBlockNumber();
   const environment = JSON.parse(JSON.stringify(await deploySmartAccountsEnvironment(C.wal(ROLE.deployer), C.pub, C.chain, { EntryPoint: CFG0.preexisting.EntryPoint })));
   overrideDeployedEnvironment(chainId, "1.3.0", environment);
@@ -46,7 +49,8 @@ try {
   ok("Hybrid account owner() is the client's wallet and the gate reads it", (await C.pub.readContract({ address: gate, abi: gateAbi, functionName: "ownerOf", args: [sa.address] })).toLowerCase() === owner.address.toLowerCase());
 
   // ---- PROMPT 1 of 3: the GATE delegation (EIP-712; the signature also proves the wallet: Option A). target = gate only, NO value cap ----
-  const SELS = ["0xf496a610", "0x3581f5bb", "0x29610252", "0x4f6d3aed", "0x3ccfd60b"];   // buy sell payFee refundGas withdraw
+  dlNow = async (secs) => BigInt((await C.pub.getBlock()).timestamp) + BigInt(secs);
+  const SELS = ["0x9e2044fc", "0xccda6635", "0x29610252", "0x4f6d3aed", "0x3ccfd60b"];   // buy sell payFee refundGas withdraw
   const until = Math.floor(Date.now() / 1000) + 90 * 86400;
   const typedOf = (dl) => ({ domain: { name: "DelegationManager", version: "1", chainId, verifyingContract: DM }, types: { Delegation: [{ name: "delegate", type: "address" }, { name: "delegator", type: "address" }, { name: "authority", type: "bytes32" }, { name: "caveats", type: "Caveat[]" }, { name: "salt", type: "uint256" }], Caveat: [{ name: "enforcer", type: "address" }, { name: "terms", type: "bytes" }] }, primaryType: "Delegation",
     message: { delegate: dl.delegate, delegator: dl.delegator, authority: dl.authority, caveats: dl.caveats.map(c => ({ enforcer: c.enforcer, terms: c.terms })), salt: BigInt(dl.salt).toString() } });
@@ -85,14 +89,15 @@ try {
   const THIEF = "0x1111111111111111111111111111111111111111";
 
   // 1 buy 3 HYPE: tokens stay in the client's account, nothing in the gate
-  ok("buy 3 HYPE via the gate delegation", await exec(call("buy", [token, 1n, route(NATIVE_K, token, hype(3))], hype(3))));
+  ok("refused: buy with an expired deadline (Expired)", await refused(call("buy", [token, 1n, route(NATIVE_K, token, hype(1)), (await dlNow(0)) - 1n], hype(1))));
+  ok("buy 3 HYPE via the gate delegation", await exec(call("buy", [token, 1n, route(NATIVE_K, token, hype(3)), await dlNow(120)], hype(3))));
   { const lot = await lotOf(); ok("tokens sit in the client's account, none in the gate", lot[0] === hype(3000) && (await tbal(sa.address)) === hype(3000) && (await tbal(gate)) === 0n, `lot ${f(lot[0])} cost ${f(lot[1])}`); }
   // 2 approve (second delegation) then sell
-  ok("refused: sell before the approve (no allowance for the gate)", await refused(call("sell", [token, hype(1000), 1n, route(token, NATIVE_K, hype(1000))])));
+  ok("refused: sell before the approve (no allowance for the gate)", await refused(call("sell", [token, hype(1000), 1n, route(token, NATIVE_K, hype(1000)), await dlNow(120)])));
   ok("approve(gate) via the approve delegation", await exec(approveTx(gate, hype(3000))));
   ok("refused: approve with a spender other than the gate (calldata word 0 pinned)", await refused(approveTx(ROLE.executor.address, 1n)) && await refused(approveTx(THIEF, 1n)));
   const b0 = await bal(sa.address);
-  ok("sell 1000 tokens", await exec(call("sell", [token, hype(1000), 1n, route(token, NATIVE_K, hype(1000))])));
+  ok("sell 1000 tokens", await exec(call("sell", [token, hype(1000), 1n, route(token, NATIVE_K, hype(1000)), await dlNow(120)])));
   ok("sale proceeds (1 HYPE) arrived in the account; tokens left the account, gate holds none", (await bal(sa.address)) - b0 === hype(1) && (await tbal(sa.address)) === hype(2000) && (await tbal(gate)) === 0n);
   // 3 fee within 20% of the balance (~98 HYPE) and gas refund: only FEE_TO receives
   const fee0 = await bal(ROLE.feeTo.address);
@@ -106,7 +111,7 @@ try {
   ok("gate holds no HYPE and no tokens", (await bal(gate)) === 0n && (await tbal(gate)) === 0n);
 
   // ---- what the delegations must refuse ----
-  ok("refused: gate functions outside the list (exitSell / forgetLot / withdrawTo / unlock)", (await refused(call("exitSell", [token, hype(10), 1n, route(token, NATIVE_K, hype(10))]))) && (await refused(call("forgetLot", [token]))) && (await refused(call("withdrawTo", [THIEF], hype(1)))) && (await refused(call("unlock", [[sa.address]]))));
+  ok("refused: gate functions outside the list (exitSell / forgetLot / withdrawTo / unlock)", (await refused(call("exitSell", [token, hype(10), 1n, route(token, NATIVE_K, hype(10)), await dlNow(600)]))) && (await refused(call("forgetLot", [token]))) && (await refused(call("withdrawTo", [THIEF], hype(1)))) && (await refused(call("unlock", [[sa.address]]))));
   ok("refused: a plain native transfer to a thief (target != gate)", await refused({ to: DM, data: redeemData(d, THIEF, hype(1), "0x") }));
   ok("refused: token transfer to a thief (the approve delegation allows approve only)", await refused({ to: DM, data: redeemData(dA, token, 0n, encodeFunctionData({ abi: tokAbi, functionName: "transfer", args: [THIEF, 1n] })) }));
   ok("refused: approve delegation used on the gate (target/method)", await refused({ to: DM, data: redeemData(dA, gate, hype(1), encodeFunctionData({ abi: gateAbi, functionName: "withdraw", args: [] })) }));
@@ -114,17 +119,18 @@ try {
   ok("refused: delegation signed by another key", await refused(call("withdraw", [], hype(1), bad)));
   // pause: guardian stops buy/sell/fee; withdraw still works
   await C.pub.waitForTransactionReceipt({ timeout: 30000, hash: await C.wal(ROLE.guardian).writeContract({ address: gate, abi: gateAbi, functionName: "setPaused", args: [true] }) });
-  ok("paused: buy / sell / payFee refused", (await refused(call("buy", [token, 1n, route(NATIVE_K, token, hype(1))], hype(1)))) && (await refused(call("sell", [token, hype(10), 1n, route(token, NATIVE_K, hype(10))]))) && (await refused(call("payFee", [], hype(0.1)))));
+  ok("paused: buy / sell / payFee refused", (await refused(call("buy", [token, 1n, route(NATIVE_K, token, hype(1)), await dlNow(120)], hype(1)))) && (await refused(call("sell", [token, hype(10), 1n, route(token, NATIVE_K, hype(10)), await dlNow(120)]))) && (await refused(call("payFee", [], hype(0.1)))));
   const o1 = await bal(owner.address), s1 = await bal(sa.address);
   ok("paused: withdraw 1 HYPE still works", await exec(call("withdraw", [], hype(1)))); ok("owner got it while paused", (await bal(owner.address)) - o1 === hype(1));
   // exitSell: not delegated to the executor. The owner's own delegation (account -> owner EOA, method exitSell only) is redeemed by the owner's EOA: tx.origin == ownerOf(account). Works while paused.
-  { const d2 = createDelegation({ environment: env, from: sa.address, to: owner.address, salt: salt(), scope: { type: ScopeType.FunctionCall, targets: [gate], selectors: ["0x1cc23c82"] } });
-    { const cav = createCaveatBuilder(env).addCaveat("allowedTargets", { targets: [gate] }).addCaveat("allowedMethods", { selectors: ["0x1cc23c82"] }).addCaveat("timestamp", { afterThreshold: 0, beforeThreshold: until }); d2.caveats = cav.build ? cav.build() : cav; }
+  { const d2 = createDelegation({ environment: env, from: sa.address, to: owner.address, salt: salt(), scope: { type: ScopeType.FunctionCall, targets: [gate], selectors: ["0xcbb9821d"] } });
+    { const cav = createCaveatBuilder(env).addCaveat("allowedTargets", { targets: [gate] }).addCaveat("allowedMethods", { selectors: ["0xcbb9821d"] }).addCaveat("timestamp", { afterThreshold: 0, beforeThreshold: until }); d2.caveats = cav.build ? cav.build() : cav; }
     d2.signature = await owner.signTypedData(typedOf(d2));
-    const es = (amt) => encodeFunctionData({ abi: gateAbi, functionName: "exitSell", args: [token, amt, 1n, route(token, NATIVE_K, amt)] });
+    const DL_SITE = await dlNow(600);   // the site passes now + 600 s
+    const es = (amt) => encodeFunctionData({ abi: gateAbi, functionName: "exitSell", args: [token, amt, 1n, route(token, NATIVE_K, amt), DL_SITE] });
     const viaOwner = async (dl, data, who) => { const h = await C.wal(who).sendTransaction({ to: DM, data: redeemData(dl, gate, 0n, data), gas: 3_000_000n }); return (await C.pub.waitForTransactionReceipt({ timeout: 15000, hash: h })).status === "success"; };
-    const dX = createDelegation({ environment: env, from: sa.address, to: ROLE.executor.address, salt: salt(), scope: { type: ScopeType.FunctionCall, targets: [gate], selectors: ["0x1cc23c82"] } });
-    { const cav = createCaveatBuilder(env).addCaveat("allowedTargets", { targets: [gate] }).addCaveat("allowedMethods", { selectors: ["0x1cc23c82"] }); dX.caveats = cav.build ? cav.build() : cav; }
+    const dX = createDelegation({ environment: env, from: sa.address, to: ROLE.executor.address, salt: salt(), scope: { type: ScopeType.FunctionCall, targets: [gate], selectors: ["0xcbb9821d"] } });
+    { const cav = createCaveatBuilder(env).addCaveat("allowedTargets", { targets: [gate] }).addCaveat("allowedMethods", { selectors: ["0xcbb9821d"] }); dX.caveats = cav.build ? cav.build() : cav; }
     dX.signature = await owner.signTypedData(typedOf(dX));
     ok("refused: even a delegation to the executor cannot exitSell (tx.origin != owner, NotOwnerOrigin)", await refused({ to: DM, data: redeemData(dX, gate, 0n, es(hype(500))) }));
     ok("refused: the executor cannot redeem the owner's exitSell delegation", await refused({ to: DM, data: redeemData(d2, gate, 0n, es(hype(500))) }));
