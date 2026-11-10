@@ -1,4 +1,4 @@
-PASS fork is real Elysium (chain id, kyber executor has code)  chain 99901, fork block 3965700
+PASS fork is real Elysium (chain id, kyber executor has code)  chain 99901, fork block 4040984
 PASS Hybrid account owner() is the client's wallet and the gate reads it
 PASS signature 1 (gate delegation), recovered signer = owner (sign-in folded)  4 caveats
 PASS gate delegation carries no native value cap (no valueLte / period / transfer-amount enforcer)  4 caveats: targets, methods, expiry 90 d, limitedCalls 100000
@@ -31,8 +31,11 @@ PASS refused: even a delegation to the executor cannot exitSell (tx.origin != ow
 PASS refused: the executor cannot redeem the owner's exitSell delegation
 PASS paused: owner exitSell 500 tokens through his own delegation (real Hybrid account, tx.origin = owner)
 PASS exitSell proceeds (0.5 HYPE) arrived in the account, tokens left it, gate holds none
-PASS withdraw the FULL account balance in ONE call (90.49 HYPE), paused
-PASS owner EOA received all of it; account is empty; gate holds nothing  owner +90.49
-PASS the client's remaining 1500 tokens are still in his own account
+PASS the executor can set the gate's allowance to 0 (approve delegation pins the spender, not the amount)
+PASS exitSell alone fails after the allowance was zeroed (TransferFailed)
+PASS paused: owner exitSell 100 tokens after the executor zeroed the allowance (approve + exitSell in one transaction of the owner)
+PASS withdraw the FULL account balance in ONE call (90.59 HYPE), paused
+PASS owner EOA received all of it; account is empty; gate holds nothing  owner +90.59
+PASS the client's remaining 1400 tokens are still in his own account
 
 ALL PASSED

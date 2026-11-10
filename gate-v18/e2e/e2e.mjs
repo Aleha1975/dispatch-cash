@@ -137,12 +137,28 @@ try {
     const t0 = await tbal(sa.address), s0 = await bal(sa.address);
     ok("paused: owner exitSell 500 tokens through his own delegation (real Hybrid account, tx.origin = owner)", await viaOwner(d2, es(hype(500)), owner));
     ok("exitSell proceeds (0.5 HYPE) arrived in the account, tokens left it, gate holds none", (await bal(sa.address)) - s0 === hype(0.5) && t0 - (await tbal(sa.address)) === hype(500) && (await tbal(gate)) === 0n);
+    // round 6 (L-5): the stolen executor key zeroes the allowance through the approve delegation (amount is not pinned); the owner's exit still works when his
+    // transaction redeems TWO delegations in a row: his own approve delegation (token, approve, spender pinned to the gate) and the exitSell delegation.
+    ok("the executor can set the gate's allowance to 0 (approve delegation pins the spender, not the amount)", await exec(approveTx(gate, 0n)));
+    const ownerCall = async (tx) => { try { await C.pub.call({ account: owner, to: tx.to, data: tx.data, gas: 3_000_000n }); return true; } catch (e) { return false; } };
+    ok("exitSell alone fails after the allowance was zeroed (TransferFailed)", !(await ownerCall({ to: DM, data: redeemData(d2, gate, 0n, es(hype(100))) })));
+    const dO = createDelegation({ environment: env, from: sa.address, to: owner.address, salt: salt(), scope: { type: ScopeType.FunctionCall, targets: [token], selectors: ["0x095ea7b3"] } });
+    { const cav = createCaveatBuilder(env).addCaveat("allowedTargets", { targets: [token] }).addCaveat("allowedMethods", { selectors: ["0x095ea7b3"] }).addCaveat("allowedCalldata", { startIndex: 4, value: "0x" + w32(gate) })
+        .addCaveat("valueLte", { maxValue: 0n }).addCaveat("timestamp", { afterThreshold: 0, beforeThreshold: until }); dO.caveats = cav.build ? cav.build() : cav; }
+    dO.signature = await owner.signTypedData(typedOf(dO));
+    const ctx = (dl) => encodeDelegations([{ ...dl, salt: BigInt(dl.salt) }]);
+    const batchData = encodeFunctionData({ abi: redeemAbi, functionName: "redeemDelegations", args: [[ctx(dO), ctx(d2)], [ExecutionMode.SingleDefault, ExecutionMode.SingleDefault],
+      [encodeExecutionCalldata([{ target: token, value: 0n, callData: encodeFunctionData({ abi: tokAbi, functionName: "approve", args: [gate, hype(100)] }) }]), encodeExecutionCalldata([{ target: gate, value: 0n, callData: es(hype(100)) }])]] });
+    const u0 = await tbal(sa.address), s2 = await bal(sa.address);
+    const hB = await C.wal(owner).sendTransaction({ to: DM, data: batchData, gas: 3_000_000n });
+    ok("paused: owner exitSell 100 tokens after the executor zeroed the allowance (approve + exitSell in one transaction of the owner)", (await C.pub.waitForTransactionReceipt({ timeout: 15000, hash: hB })).status === "success"
+      && u0 - (await tbal(sa.address)) === hype(100) && (await bal(sa.address)) - s2 === hype(0.1) && (await tbal(gate)) === 0n);
   }
   // the whole balance in ONE call, whatever the amount (no delegation cap, no gate cap), while paused
   const all = await bal(sa.address), o2 = await bal(owner.address);
   ok("withdraw the FULL account balance in ONE call (" + f(all) + " HYPE), paused", await exec(call("withdraw", [], all)));
   ok("owner EOA received all of it; account is empty; gate holds nothing", (await bal(sa.address)) === 0n && (await bal(owner.address)) - o2 === all && (await bal(gate)) === 0n, `owner +${f((await bal(owner.address)) - o2)}`);
   // the client's remaining tokens never left his account and need no gate to move
-  ok("the client's remaining 1500 tokens are still in his own account", (await tbal(sa.address)) === hype(1500));
+  ok("the client's remaining 1400 tokens are still in his own account", (await tbal(sa.address)) === hype(1400));
 } finally { anvil.stop(); }
 console.log(fails ? `\n${fails} FAILED` : "\nALL PASSED"); process.exit(fails ? 1 : 0);

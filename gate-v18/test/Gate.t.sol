@@ -156,7 +156,7 @@ contract GateTest is GateBase {
         acct.exec(address(gate), 10 ether, abi.encodeCall(GuardedGate.withdraw, ())); assertEq(owner1.balance, 10 ether);   // the whole balance, paused
         vm.warp(block.timestamp + 7 days); assertFalse(gate.paused()); vm.deal(address(acct), 5 ether); _buy(1 ether);
         vm.prank(guardian); vm.expectRevert(GuardedGate.PauseCooldown.selector); gate.setPaused(true);
-        vm.warp(block.timestamp + 1 days); vm.prank(guardian); gate.setPaused(true);
+        vm.warp(block.timestamp + 2 days); vm.prank(guardian); gate.setPaused(true);
         vm.prank(thief); vm.expectRevert(GuardedGate.NotGuardian.selector); gate.setPaused(false);
     }
     function test_guardian_rotation() public {
@@ -182,7 +182,7 @@ contract GateTest is GateBase {
         vm.deal(address(acct), 3 ether); _buy(1 ether);                         // base 2 + 1 = 3 -> budget 0.9
         router.set(1000, 1e12, address(0));
         acct.exec(address(gate), 0, _sellData(tok, 500e18, 1));
-        (uint256 lost, uint256 budget) = gate.budgetOf(address(acct), address(tok)); assertGt(lost, 0.49 ether); assertLt(budget, 0.8 ether);
+        (uint256 fill, ) = gate.loss(address(acct)); (, uint256 budget) = gate.budgetOf(address(acct), address(tok)); assertGt(fill, 0.5e18); assertLt(budget, 0.8 ether);   // round 6: the record is a share of a budget
         vm.expectRevert(); acct.exec(address(gate), 0, _sellData(tok, 500e18, 1));
         address[] memory a = new address[](1); a[0] = address(acct);
         vm.prank(thief); vm.expectRevert(GuardedGate.NotExitKey.selector); gate.unlock(a);
@@ -214,7 +214,9 @@ contract GateTest is GateBase {
         uint256 soldT; uint256 costOut;
         for (uint256 i = 0; i < 5; i++) {
             (uint256 t, uint256 c) = _lot(address(acct), tok); if (t == 0) break;
-            uint256 x = bound(cuts[i], 1, t); _sell(x); (uint256 t2, uint256 c2) = _lot(address(acct), tok);
+            uint256 x = bound(cuts[i], 1, t);
+            if (c * x / t == 0) { vm.expectRevert(GuardedGate.ZeroAmount.selector); acct.exec(address(gate), 0, _sellData(tok, x, 1)); continue; }   // round 6 (L-4): a slice must release 1 wei of cost
+            _sell(x); (uint256 t2, uint256 c2) = _lot(address(acct), tok);
             soldT += x; costOut += c - c2; assertEq(t2, t - x); assertLe(c2, c);
         }
         (uint256 tf, uint256 cf) = _lot(address(acct), tok); assertEq(tf + soldT, t0); assertEq(cf + costOut, c0);

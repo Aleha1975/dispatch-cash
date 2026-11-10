@@ -20,7 +20,7 @@ contract Round5Test is GateBase {
     function _ownerSell(MockAccount a, address ow, MockToken t, uint256 amt) internal {
         vm.prank(ow, ow); a.exec{gas: 700_000}(address(gate), 0, abi.encodeCall(GuardedGate.exitSell, (address(t), amt, 1, route(address(t), K_ETH, amt), type(uint256).max)));
     }
-    function _trimPosSlot(address a) internal pure returns (bytes32) { return keccak256(abi.encode(a, uint256(16))); }
+    function _trimPosSlot(address a) internal pure returns (bytes32) { return keccak256(abi.encode(a, uint256(17))); }
     function _pause(bool p) internal { vm.prank(guardian); gate.setPaused(p); }
 
     // ---------- M-1: the auditor's re-booking sequence ----------
@@ -114,8 +114,8 @@ contract Round5Test is GateBase {
         vm.warp(T + 8 days); assertFalse(gate.paused());
         _pause(false);                                                                      // lifted when the old window turns 8 days
         vm.prank(guardian); vm.expectRevert(GuardedGate.PauseCooldown.selector); gate.setPaused(true);   // no second full pause at once
-        vm.warp(T + 9 days - 1); vm.prank(guardian); vm.expectRevert(GuardedGate.PauseCooldown.selector); gate.setPaused(true);
-        vm.warp(T + 9 days); _pause(true); assertTrue(gate.paused());                       // after the one-day gap a new window starts
+        vm.warp(T + 10 days); _pause(true); assertTrue(gate.paused());                      // round 6: the old days have left the sliding window; the allowance is what the window allows
+        assertLt(gate.pauseExp() - block.timestamp, 7 days);
     }
     function test_L1_any_8_days_hold_at_most_7_days_of_pause() public {
         uint256 T = block.timestamp; uint256 N = 60 * 24; bool[] memory on = new bool[](N);
@@ -140,7 +140,8 @@ contract Round5Test is GateBase {
         vm.warp(T + 6.5 days); address g2 = address(0x6A12E); vm.prank(cold); gate.replaceGuardian(g2);
         assertEq(gate.pauseExp(), T + 7 days); assertTrue(gate.paused());
         vm.warp(T + 7 days); assertFalse(gate.paused());
-        vm.prank(g2); gate.setPaused(true); assertTrue(gate.paused());                      // the new guardian has a clean allowance
+        vm.prank(g2); vm.expectRevert(GuardedGate.PauseCooldown.selector); gate.setPaused(true);   // round 6 (L-2): the replacement is no reset; 7 d are used in the window
+        vm.warp(T + 10 days); vm.prank(g2); gate.setPaused(true); assertTrue(gate.paused());       // old days leave the window
     }
     function test_I1_a_pause_lifted_in_the_same_second_uses_one_second() public {
         for (uint256 i = 0; i < 5; i++) { _pause(true); _pause(false); }
