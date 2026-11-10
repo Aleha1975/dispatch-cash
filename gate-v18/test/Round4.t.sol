@@ -59,7 +59,8 @@ contract Round4Test is GateBase {
     function test_L1_early_lift_starts_no_cooldown_and_a_new_pause_works_at_once() public {
         vm.prank(guardian); gate.setPaused(true); vm.prank(guardian); gate.setPaused(false);   // false alarm, lifted in the same block
         assertEq(gate.pauseUsed(), 1);                                                      // lifted in the same second: still costs one second
-        vm.prank(guardian); gate.setPaused(true); assertTrue(gate.paused());                // the real one is not blocked
+        vm.prank(guardian); vm.expectRevert(GuardedGate.PauseCooldown.selector); gate.setPaused(true);   // round 7 (M-1): not before the booked second is over
+        vm.warp(block.timestamp + 1); vm.prank(guardian); gate.setPaused(true); assertTrue(gate.paused());   // the real one is not blocked after it
     }
     function test_L1_pause_that_ran_to_expiry_still_has_the_cooldown() public {
         vm.prank(guardian); gate.setPaused(true); vm.warp(block.timestamp + 7 days); assertFalse(gate.paused());

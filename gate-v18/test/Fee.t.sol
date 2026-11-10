@@ -48,15 +48,20 @@ contract FeeTest is GateBase {
         vm.stopPrank();
         (, , uint256 wdn, ) = gate.windows(self); assertEq(wdn, 0);
     }
-    function test_withdrawTo_other_than_owner_widens_withdraw_to_owner_does_not() public {
+    // round 7 (L-2, L-3): no withdrawal widens the fee base; withdrawTo needs the owner's own transaction where owner() resolves (L-10)
+    function test_withdrawTo_widens_nothing_and_needs_owner_origin() public {
         _fee(acct, 20 ether);                                                    // 100 -> 80, aggregate used up
-        _wd(acct, 50 ether);                                                     // to owner1: no widening
+        vm.expectRevert(GuardedGate.NotOwnerOrigin.selector); acct.exec(address(gate), 40 ether, abi.encodeCall(GuardedGate.withdrawTo, (address(0xCAFE))));   // origin is the test, not owner1
+        vm.prank(owner1, owner1); acct.exec(address(gate), 40 ether, abi.encodeCall(GuardedGate.withdrawTo, (address(0xCAFE))));   // the owner himself, to somebody else
         vm.deal(address(acct), 80 ether);
-        vm.expectRevert(GuardedGate.FeeLimit.selector); _fee(acct, 1 ether);
-        acct.exec(address(gate), 40 ether, abi.encodeCall(GuardedGate.withdrawTo, (owner1))); vm.deal(address(acct), 80 ether);   // the owner's address via withdrawTo: no widening either
-        vm.expectRevert(GuardedGate.FeeLimit.selector); _fee(acct, 1 ether);
-        acct.exec(address(gate), 40 ether, abi.encodeCall(GuardedGate.withdrawTo, (address(0xCAFE)))); vm.deal(address(acct), 80 ether);   // somebody else: counts
-        _fee(acct, 8 ether);                                                     // 20% of the 40 withdrawn elsewhere
+        vm.expectRevert(GuardedGate.FeeLimit.selector); _fee(acct, 1 ether);     // nothing was credited to the fee base
+        assertEq(gate.feeRoom(address(acct)), 0);
+    }
+    function test_L2_payFee_after_a_large_withdrawTo_cannot_take_the_remainder() public {
+        vm.prank(owner1, owner1); acct.exec(address(gate), 90 ether, abi.encodeCall(GuardedGate.withdrawTo, (address(0xCAFE))));   // 100 -> 10
+        uint256 paid;
+        for (uint256 i = 0; i < 30; i++) { uint256 room = gate.feeRoom(address(acct)); if (room == 0) break; _fee(acct, room); paid += room; }
+        assertLe(paid, 2 ether);                                                 // 20% of the 10 left (it was 9.885 of 10 with the old credit)
     }
     function test_sliding_window_has_no_edge_burst_for_fees() public {
         vm.warp((block.timestamp / 30 days + 1) * 30 days + 1);                  // just after a bucket boundary

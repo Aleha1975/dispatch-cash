@@ -88,3 +88,10 @@ Old permissions keep working with the old gate (`st.legacy[gate]` machinery). A 
 - Forced inclusion (I-1): the site's "forced exit" mode signs a long deadline and a loose `minOut`; confirm the Orbit `maxTimeVariation` and that the inbox allow-list is off.
 - Selector / event notes: the `Unlocked` event now carries the fill (share), not HYPE.
 
+## Round 7 (audit job 1212): interface changes (current)
+- Selectors and the delegation method list are unchanged. `windows(address)` keeps its four return values, but `withdrawn` is always 0 (the `withdrawTo` fee credit is gone); `feeRoom` is now `min(20% of balance, 20% of (balance + fees in the window) - fees)`: after a `withdrawTo` to a third party the engine sees a smaller room (collect the fee in parts or before the client withdraws).
+- `withdrawTo(to)`: where `owner()` resolves, `tx.origin` must be the owner (`NotOwnerOrigin`); an account whose `owner()` cannot be read behaves as before. It is account-only and must stay out of every delegation to the executor.
+- `setPaused(true)` reverts `PauseCooldown` until the booked end of the previous pause (a same-second lift books 1 s): the guardian bot retries one second later. `pauseUsed()` now includes the running pause: allowance left = `7 d - pauseUsed()`.
+- Executor `sell` reads one more registry entry (one `balanceOf`, at most 100k gas): allow the same gas headroom as for a `buy`. Engine rules kept: after any owner transfer of a lot token call `reconcile(account)` with the guardian key; on `TooManyLots` call `reconcile`.
+- After a FULL 7-day pause no pause is possible for 1 to 2 days (L-11): do not run pauses to the full 7 days; revoke delegations for a long incident.
+

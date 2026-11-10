@@ -51,7 +51,7 @@ contract GuardedGate {
     uint256 public constant BUDGET_BPS = 3000;      // one sale may book losses up to 30% of (the account's ETH + the cost of the lot under sale)...
     uint256 public constant REFILL = 7 days;        // ...and the account's loss record (a fraction of one budget) empties linearly in this time, whatever lot is sold
     uint256 public constant PAUSE_MAX = 7 days;     // a pause lifts itself after this
-    uint256 public constant PAUSE_COOLDOWN = 1 days; // PAUSE_MAX + PAUSE_COOLDOWN is the pause window: at most PAUSE_MAX of pause in it, and a new window needs this gap after the last pause
+    uint256 public constant PAUSE_COOLDOWN = 1 days; // PAUSE_MAX + PAUSE_COOLDOWN = 8 days is the pause window (PSLOTS = 9 day-slots): at most PAUSE_MAX of pause in it; informational, no expression reads it. After a FULL 7-day pause no pause is possible for 1 to 2 days (DESIGN.md 10)
     uint256 public constant PENDING_TTL = 7 days;   // a proposed guardian must accept within this
     uint256 public constant MAX_RECEIVERS = 8;      // srcReceivers a sale route may name
     uint256 public constant FEE_MAX_BPS = 2000;     // payFee: at most 20% of the account's native balance (per call, and per FEE_WINDOW in total)
@@ -66,7 +66,7 @@ contract GuardedGate {
     uint256 public constant OWNER_GAS = 100_000;    // bound of the owner() read
     uint256 public constant MAX_UNLOCK = 64;        // accounts one unlock() may clear
     uint256 public constant MAX_LOT = 1e40;         // raw token units a lot may hold (keeps the arithmetic far from overflow)
-    uint256 public constant MAX_LOTS = 32;          // v17: open lots per account (a sale walks them with a gas-bounded cursor; round 4: no limit reads the other lots' cost)
+    uint256 public constant MAX_LOTS = 32;          // v17: open lots per account (reconcile and a buy on a full registry walk them with a gas-bounded cursor, an executor sale reads one entry; no limit reads the other lots' cost)
     uint256 internal constant GAS_FLOOR = 105_000;   // round 6 (I-2): BALANCE_GAS * 64 / 63 plus the cold-account access cost and a margin; below it a balance read reverts instead of running starved
     uint256 internal constant ONE = 1e18;            // round 6: the loss record is stored as a fraction of one budget, ONE = a full budget
     uint256 internal constant PSLOTS = 9;            // round 6: day-slots of the pause ring (8 days of window + the partly covered oldest day)
@@ -89,8 +89,8 @@ contract GuardedGate {
 
     uint256 public immutable GAS_CALL_MAX;
     uint256 public immutable GAS_DAY_MAX;
-    /// fee ring (slots of 5 days): fees paid; wd ring: native withdrawn through withdrawTo to a non-owner; gas ring (slots of 4 h): gas refunded.
-    struct Pay { Ring fee; Ring wd; Ring gas; }
+    /// fee ring (slots of 5 days): fees paid; gas ring (slots of 4 h): gas refunded. (Round 7: the withdrawTo ring is gone.)
+    struct Pay { Ring fee; Ring gas; }
     mapping(address => Pay) private pay;
     address public guardian;
     address public pendingGuardian;
@@ -104,7 +104,7 @@ contract GuardedGate {
     PauseRing private _pr;
 
     uint256 private _lock;
-    mapping(address => address[]) private _lots;      // v17: the tokens of the account's open lots (basis tokens > 0), unordered (declared last: earlier slots keep v16's layout)
+    mapping(address => address[]) private _lots;      // v17: the tokens of the account's open lots (basis tokens > 0), unordered (declared last; the slots moved against v16 in round 6)
     mapping(address => mapping(address => uint256)) private _lotIdx;   // position in _lots + 1 (0 = no open lot)
     mapping(address => uint256) private _trimPos;     // _trimAll cursor: entries of _lots still to visit in this round (0 = start a round)
 
@@ -180,16 +180,17 @@ contract GuardedGate {
     // ---- guardian: pause the executor, rotate itself ----
     /// @notice Paused while the running pause has not reached its end. Its length was fixed when it started (see setPaused).
     function paused() public view returns (bool) { return pausedAt != 0 && block.timestamp < pauseExp; }
-    /// @dev Round 6: seconds of pause in the last 8 days (the 9 day-slots that touch them; the oldest day is counted whole, so this never under-counts).
+    /// @dev Round 6: seconds of pause in the last 8 days (the 9 day-slots that touch them; the oldest day is counted whole, so this never under-counts). Round 7: plus the running pause.
     function pauseUsed() public view returns (uint256 t) {
         uint64 h = _pr.head; uint64 nh = uint64(block.timestamp / 1 days); if (h > nh) nh = h;       // time stepping backward keeps the stored head
         for (uint256 d = 0; d < PSLOTS && d <= nh; d++) { uint64 i = nh - uint64(d); if (i <= h) t += _pr.v[i % PSLOTS]; }
+        if (pausedAt != 0) { uint256 e = block.timestamp < pauseExp ? block.timestamp : pauseExp; if (e > pausedAt) t += e - pausedAt; }   // round 7 (L-6): a running or expired, not yet booked pause is not in the ring yet
     }
     function _padd(uint64 day, uint256 secs) private {
         uint64 h = _pr.head;
         if (day > h) { uint256 gap = day - h; if (gap > PSLOTS) gap = PSLOTS; for (uint256 k = 1; k <= gap; k++) _pr.v[(h + k) % PSLOTS] = 0; _pr.head = day; }
         else if (day + PSLOTS <= h) return;                                                           // older than the ring: cannot matter
-        _pr.v[day % PSLOTS] += uint32(secs);                                                         // pauses are disjoint: at most 86,400 s per day
+        _pr.v[day % PSLOTS] += uint32(secs);                                                         // pauses are disjoint and a new one starts after the last one's booked end (round 7): at most 86,400 s per day
     }
     /// @dev Book the running (or expired, never lifted) pause: it ended at the lift or at its expiry, whichever came first, and cost at least one second.
     ///      Its seconds go into the day-slots they fell in.
@@ -206,7 +207,7 @@ contract GuardedGate {
     ///         never locked out, and two full pauses cannot chain. Lifting early gives back the unused time. A guardian replacement does not touch the window.
     function setPaused(bool p) external lock onlyGuardian {
         if (p) {
-            if (paused()) revert PauseCooldown();
+            if (paused() || block.timestamp < pauseEnd) revert PauseCooldown();   // round 7 (M-1): no new pause before the booked end of the last one (a same-second lift books 1 s), so booked seconds never exceed elapsed seconds
             if (pausedAt != 0) { _endPause(); emit Paused(false); }     // an expired pause that was never lifted
             uint256 used = pauseUsed();
             if (used >= PAUSE_MAX) revert PauseCooldown();
@@ -269,11 +270,11 @@ contract GuardedGate {
         if (_sum(w, nh, RING) + spent > MAX_BUY_ETH_PER_HOUR) revert RateLimited();
         _add(w, nh, spent);
     }
-    /// @notice The ring totals now: buys (last hour), fees (30 d), non-owner withdrawals counted for the fee base, gas (day).
+    /// @notice The ring totals now: buys (last hour), fees (30 d), withdrawn (always 0 since round 7, kept for the ABI), gas (day).
     function windows(address account) external view returns (uint256 buys, uint256 fees, uint256 withdrawn, uint256 gas) {
         Ring storage w = win[account]; Pay storage p = pay[account];
-        buys = _sum(w, _head(w, BUY_WINDOW), RING); fees = _sum(p.fee, _head(p.fee, FEE_WINDOW), RING);
-        withdrawn = _sum(p.wd, _head(p.wd, FEE_WINDOW), SUBS); gas = _sum(p.gas, _head(p.gas, GAS_WINDOW), RING);
+        buys = _sum(w, _head(w, BUY_WINDOW), RING); withdrawn = 0; fees = _sum(p.fee, _head(p.fee, FEE_WINDOW), RING);
+        gas = _sum(p.gas, _head(p.gas, GAS_WINDOW), RING);
     }
     function _ceil(uint256 a, uint256 b) private pure returns (uint256) { return (a + b - 1) / b; }
     /// @dev Round 4 (M-2, option A): the budget of an executor sale is measured on the account's native ETH plus the cost of the lot UNDER SALE
@@ -322,7 +323,7 @@ contract GuardedGate {
         if (pos == 0 || pos > n) pos = n;
         uint256 start = pos; uint256 stop = 0; bool wrapped = pos == n;   // a fresh round (start == n) has nothing to wrap to
         uint256 g0 = gasleft();
-        while (g0 - gasleft() < TRIM_GAS) {
+        while (g0 - gasleft() < TRIM_GAS && gasleft() > GAS_FLOOR + 30_000) {   // round 7 (L-9): stop with gas left for one more read, so the cursor is stored
             if (pos <= stop) {
                 if (wrapped) break;
                 wrapped = true; stop = start; pos = a.length;           // second leg: from the end down to where this call began
@@ -334,6 +335,12 @@ contract GuardedGate {
             if (a.length == len || pos > a.length) pos--;               // round 5 (L-5): otherwise a close moved the last entry into pos - 1: visit it
         }
         _trimPos[account] = (wrapped && pos <= stop) ? 0 : pos;          // a finished round starts over next time
+    }
+    /// @dev Round 7 (L-4): reconcile ONE registry entry (one bounded read), moving the shared cursor down by one.
+    function _trimNext(address account) private {
+        address[] storage a = _lots[account]; uint256 n = a.length; if (n == 0) return;
+        uint256 pos = _trimPos[account]; if (pos == 0 || pos > n) pos = n;
+        _trim(account, a[pos - 1]); _trimPos[account] = pos - 1;
     }
     /// @notice ACCOUNT-ONLY (not delegated): drop an open lot from the books without reading the token at all -- the escape from junk
     ///         lots whose balanceOf burns gas or reverts. The tokens (if any) stay in the account; the gate just stops tracking them.
@@ -460,7 +467,8 @@ contract GuardedGate {
         if (amount == 0) revert ZeroAmount();
         if (minOut == 0) revert MinOutZero();
         if (token.code.length == 0) revert NotAContract();
-        _trim(msg.sender, token);                                   // round 6 (L-6): only the sold token's lot is reconciled; no sale walks the registry (reconcile / buy on a full registry do)
+        _trim(msg.sender, token);                                   // round 6 (L-6): the sold token's lot is reconciled; no sale walks the whole registry (reconcile / buy on a full registry do)
+        if (!isExit) _trimNext(msg.sender);                         // round 7 (L-4): and ONE other entry per executor sale (round robin), so a lot the owner emptied is closed within MAX_LOTS sales
         { uint256 lot = basis[msg.sender][token].tokens; if (amount > lot) revert NotInLot(lot, amount); }   // only what this gate saw bought, and still holds
         uint256 budget = isExit ? 0 : _budgetOn(_saleBase(msg.sender, basis[msg.sender][token].ethIn)); // round 4 (M-2): native + the cost of THIS lot, measured once before anything moves
         uint256 tokBase = _gateBal(token);   // tokens that were here before this call stay untouched
@@ -504,9 +512,8 @@ contract GuardedGate {
     // ---- money out of the account: fee, gas, withdrawal ----
     /// @notice The performance fee, paid from the calling account (msg.value) to FEE_TO only. Two limits, both measured on the account's
     ///         native balance: (1) this call <= 20% of the balance the account had before it (msg.sender.balance + msg.value);
-    ///         (2) fees of the sliding 30-day window (ring of 6 sub-buckets of 5 days, summed in full) <= 20% of (that balance + fees already paid + native withdrawn through withdrawTo
-    ///         to a non-owner in the window), so repeated 20% calls cannot compound into a drain. The window is a ring of sub-buckets:
-    ///         no 2x burst at a boundary. withdraw() to the owner does NOT widen (2). Paused: refused.
+    ///         (2) fees of the sliding 30-day window (ring of 6 sub-buckets of 5 days, summed in full) <= 20% of (that balance + fees already paid), so repeated 20% calls cannot compound into a drain. The window is a ring of sub-buckets:
+    ///         no 2x burst at a boundary. Round 7 (L-2, L-3): no withdrawal widens (2); money sent away is not credited back to the fee base. Paused: refused.
     function payFee() external payable lock {
         if (paused()) revert IsPaused();
         uint256 v = msg.value;
@@ -514,8 +521,8 @@ contract GuardedGate {
         uint256 before = msg.sender.balance + v;                    // the account's balance before this transfer
         if (v * 10000 > before * FEE_MAX_BPS) revert FeeLimit();
         Pay storage p = pay[msg.sender]; uint64 nh = _head(p.fee, FEE_WINDOW);
-        uint256 feeW = _sum(p.fee, nh, RING); uint256 wdW = _sum(p.wd, _head(p.wd, FEE_WINDOW), SUBS);
-        if ((feeW + v) * 10000 > (before + feeW + wdW) * FEE_MAX_BPS) revert FeeLimit();
+        uint256 feeW = _sum(p.fee, nh, RING);
+        if ((feeW + v) * 10000 > (before + feeW) * FEE_MAX_BPS) revert FeeLimit();
         _add(p.fee, nh, v);
         emit FeePaid(msg.sender, v);
         _sendEth(FEE_TO, v);
@@ -523,9 +530,9 @@ contract GuardedGate {
     /// @notice The fee the account could be charged right now (a view for the engine; the same two limits as payFee).
     function feeRoom(address account) external view returns (uint256 room) {
         Pay storage p = pay[account]; uint256 bal = account.balance;
-        uint256 feeSum = _sum(p.fee, _head(p.fee, FEE_WINDOW), RING); uint256 wd = _sum(p.wd, _head(p.wd, FEE_WINDOW), SUBS);
+        uint256 feeSum = _sum(p.fee, _head(p.fee, FEE_WINDOW), RING);
         room = bal * FEE_MAX_BPS / 10000;
-        uint256 agg = (bal + feeSum + wd) * FEE_MAX_BPS / 10000; agg = agg > feeSum ? agg - feeSum : 0;
+        uint256 agg = (bal + feeSum) * FEE_MAX_BPS / 10000; agg = agg > feeSum ? agg - feeSum : 0;
         if (agg < room) room = agg;
     }
     /// @notice Refund of the network fees the operator advanced, paid from the calling account to FEE_TO (never to a key). Limits: per call
@@ -554,15 +561,12 @@ contract GuardedGate {
     }
     /// @notice ACCOUNT-ONLY fallback for an account whose owner() cannot be resolved (rotated to a contract wallet, passkey-only, reverting):
     ///         the account's owner, acting through his own account, names the recipient. NOT in the delegation's AllowedMethods, so the
-    ///         executor cannot reach it. Never paused. Value sent to somebody who is neither the account nor its owner widens the fee base.
+    ///         executor cannot reach it. Never paused. Round 7: where owner() resolves, tx.origin must be the owner (as exitSell); it does not touch the fee base.
     function withdrawTo(address to) external payable lock {
         if (msg.value == 0) revert ZeroAmount();
         if (to == address(0) || to == address(this) || to == ROUTER) revert BadRecipient();
+        { (bool okO, address o) = _owner(msg.sender); if (okO && tx.origin != o) revert NotOwnerOrigin(); }   // round 7 (L-10): where the owner resolves, only his own transaction (an account whose owner() cannot be read has no one to prove)
         emit Withdrawn(msg.sender, to, msg.value);
-        if (to != msg.sender) {
-            (bool okO, address o) = _owner(msg.sender);
-            if (!okO || to != o) { Ring storage wr = pay[msg.sender].wd; _add(wr, _head(wr, FEE_WINDOW), msg.value); }
-        }
         _sendEth(to, msg.value);
     }
     function _u128(uint256 v) private pure returns (uint128) { if (v > type(uint128).max) revert TooLarge(); return uint128(v); }

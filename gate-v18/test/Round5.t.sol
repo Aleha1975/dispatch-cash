@@ -144,7 +144,7 @@ contract Round5Test is GateBase {
         vm.warp(T + 10 days); vm.prank(g2); gate.setPaused(true); assertTrue(gate.paused());       // old days leave the window
     }
     function test_I1_a_pause_lifted_in_the_same_second_uses_one_second() public {
-        for (uint256 i = 0; i < 5; i++) { _pause(true); _pause(false); }
+        for (uint256 i = 0; i < 5; i++) { _pause(true); _pause(false); vm.warp(block.timestamp + 1); }   // round 7: the next pause waits for the booked second
         assertEq(gate.pauseUsed(), 5);
     }
 
