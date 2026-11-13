@@ -47,7 +47,7 @@ Pause never blocks: `requestRedeem`, `settle` (redeems only; queued deposits wai
 `decreasePosition`, `burnPosition`, `returnHedgeMargin`, `emergencyUnwind`, `emergencyRedeem`.
 
 Hard caps (constants): fee <= 20%, hedge cap <= 50% NAV, pool band <= 5%, slippage <= 5%, hedge step <= 20%,
-reference drift <= 30%, swap turnover <= 5x NAV per epoch. Defaults: fee 15%, hedge 35%, band 1.5%, slippage 1%,
+reference drift <= 30%, swap turnover <= 5x NAV per rolling day. Defaults: fee 15%, hedge 35%, band 1.5%, slippage 1%,
 hedge step 5%/day, drift 10%, turnover 2x.
 
 Trust assumptions: the keeper reports the HYPE price and the off-chain hedge equity (bounded as above); the operator

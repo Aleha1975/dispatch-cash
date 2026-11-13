@@ -129,7 +129,8 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
     uint256 public lastPrice;
     uint256 public lastSettleTime;
     uint256 public epoch;
-    uint256 public swapNotionalThisEpoch;
+    uint256 public swapNotionalUsed; // swap notional in the current rolling-day window
+    uint256 public swapWindowStart;
 
     uint256 public approvedHedgeEquity;
     uint256 public approvedHedgeEpoch; // epoch + 1 when set (0 = none)
@@ -389,7 +390,6 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
         lastNav = nav;
         lastPrice = r.price;
         lastSettleTime = block.timestamp;
-        swapNotionalThisEpoch = 0;
         emit Settled(epoch, nav, r.price, r.hedgeEquity, feeShares, _pps(nav, supply));
         epoch++;
     }
@@ -512,10 +512,14 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
         if (asset.balanceOf(address(this)) < pendingDepositAssets + totalClaimable) revert ReserveBreached();
     }
 
+    /// @dev Rolling-day window (not per settlement): settling is free for the keeper, so a per-epoch budget could
+    ///      be reset at will by settling with empty queues between swaps.
     function _useTurnover(uint256 notional) internal {
-        uint256 used = swapNotionalThisEpoch + notional;
+        uint256 used = notional;
+        if (block.timestamp < swapWindowStart + 1 days) used += swapNotionalUsed;
+        else swapWindowStart = block.timestamp;
         if (used * BPS > lastNav * params.swapTurnoverBps) revert Turnover();
-        swapNotionalThisEpoch = used;
+        swapNotionalUsed = used;
     }
 
     // ------------------------------------------------------------------ keeper: hedge margin

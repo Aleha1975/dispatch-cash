@@ -282,6 +282,25 @@ contract LPVaultBaseTest is VaultTestBase {
         vm.stopPrank();
     }
 
+    /// Regression: the turnover budget used to reset on every settle, so a keeper could settle with empty queues
+    /// between swaps and churn unbounded notional through the pool. It is now a rolling-day window.
+    function test_TurnoverNotResetBySettle() public {
+        deposit(alice, 100_000e6);
+        settle(P0);
+        vm.prank(keeper);
+        vault.swap(false, 100_000e6, P0); // 1x NAV
+        settle(P0); // an empty settle used to reset the budget
+        uint256 hype = address(vault).balance;
+        vm.prank(keeper);
+        vm.expectRevert(LPVaultBase.Turnover.selector);
+        vault.swap(true, hype, P0); // another ~1x within the same day: > 2x
+        skip(1 days);
+        settle(P0);
+        vm.prank(keeper);
+        vault.swap(true, hype, P0); // new window
+        assertEq(vault.swapNotionalUsed(), hype * P0 / 1e18);
+    }
+
     function test_SwapMinOutFromKeeperPrice() public {
         deposit(alice, 100_000e6);
         settle(P0);

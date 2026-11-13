@@ -233,7 +233,7 @@ class Keeper:
                         chunk //= 2
                         continue
                     if "Turnover" in e.reason:
-                        self.alert("warn", "turnover", "swap turnover cap reached for this epoch")
+                        self.alert("warn", "turnover", "swap turnover cap (rolling day) reached")
                     else:
                         self.log("swap_probe_revert", reason=e.reason, chunk=chunk)
                     return done

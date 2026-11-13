@@ -123,7 +123,7 @@ class VaultReader:
             emergency=c("emergency"), total_supply=c("totalSupply"), queued_redeem_shares=queued,
             first_redeem_shares=first, redeem_head=head, hedge_drift_start=c("hedgeDriftStart"),
             hedge_drift_used=c("hedgeDriftUsed"), approved_hedge_equity=c("approvedHedgeEquity"),
-            approved_hedge_epoch=c("approvedHedgeEpoch"), swap_notional=c("swapNotionalThisEpoch"),
+            approved_hedge_epoch=c("approvedHedgeEpoch"), swap_notional=c("swapNotionalUsed"),
             treasury=self.treasury,
         )
         if self.treasury != ZERO:

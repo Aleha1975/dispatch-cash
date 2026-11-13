@@ -254,7 +254,7 @@ contract UniV4LPVault is LPVaultBase, IUnlockCallback {
     // ------------------------------------------------------------------ keeper: swaps
     /// @notice Exact-input swap through the configured pool only. minOut = fair value at `keeperPrice` minus
     ///         `maxSlippageBps`; `keeperPrice` must be within `poolBandBps` of the pool and `refDriftBps` of the last
-    ///         settled price; cumulative swap notional per epoch <= `swapTurnoverBps` of the last NAV.
+    ///         settled price; cumulative swap notional per rolling day <= `swapTurnoverBps` of the last NAV.
     function swap(bool sellBase, uint256 amountIn, uint256 keeperPrice)
         external
         nonReentrant
