@@ -74,15 +74,18 @@ contract SATrader is IUnlockCallback {
     receive() external payable {}
 
     function swap(bool zeroForOne, uint256 amountIn) external {
-        pm.unlock(abi.encode(zeroForOne, amountIn));
+        pm.unlock(abi.encode(zeroForOne, amountIn, zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1));
+    }
+
+    /// Move the pool exactly to `sqrtTarget` (amount bounded by the trader's balances).
+    function swapTo(bool zeroForOne, uint160 sqrtTarget) external {
+        pm.unlock(abi.encode(zeroForOne, uint256(1e30), sqrtTarget));
     }
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         require(msg.sender == address(pm));
-        (bool z, uint256 amt) = abi.decode(data, (bool, uint256));
-        BalanceDelta d = pm.swap(
-            key, SwapParams(z, -int256(amt), z ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1), ""
-        );
+        (bool z, uint256 amt, uint160 lim) = abi.decode(data, (bool, uint256, uint160));
+        BalanceDelta d = pm.swap(key, SwapParams(z, -int256(amt), lim), "");
         int128 dIn = z ? d.amount0() : d.amount1();
         int128 dOut = z ? d.amount1() : d.amount0();
         Currency cIn = z ? key.currency0 : key.currency1;
@@ -330,11 +333,7 @@ abstract contract SATestBase is Test {
             uint256 p = poolPrice();
             uint256 d = p > target ? p - target : target - p;
             if (d * 10_000 <= target * 3) return;
-            uint256 usd = d * 4_000_000 / p; // depth ~ $4M per 100% in the seeded replica
-            if (forked) usd = d * 300_000 / p;
-            if (usd < 50) usd = 50;
-            if (p < target) trader.swap(false, usd * 1e6);
-            else trader.swap(true, usd * 1e18 / (p / 1e6));
+            trader.swapTo(p > target, SALib.sqrtPriceAt(target, true));
         }
     }
 
@@ -494,8 +493,9 @@ abstract contract SATestBase is Test {
 
     /// 7702 exit: ONE transaction from the EOA to itself (execute is onlyEntryPointOrSelf).
     function _exit7702(address eoa, Delegation memory d, address to) internal {
+        bytes memory xs = abi.encode(_exitExecs(eoa, d, to));
         vm.prank(eoa, eoa);
-        IDeleGatorCore(eoa).execute(DelegationFramework.BATCH_DEFAULT, abi.encode(_exitExecs(eoa, d, to)));
+        IDeleGatorCore(eoa).execute(DelegationFramework.BATCH_DEFAULT, xs);
     }
 
     // ------------------------------------------------------------------ keeper flows
