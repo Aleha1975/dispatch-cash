@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import "../sa/SATestBase.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// Smart-account flow end to end on a local fork of Elysium mainnet (chain 99901): the real HYPE/USDC v4 pool, the real
 /// USDC (EIP-2612 permit), the DelegationManager / EIP7702StatelessDeleGator / TimestampEnforcer already deployed
@@ -86,10 +87,12 @@ contract SmartAccountForkTest is SATestBase {
         uint128 half = POSM.getPositionLiquidity(id) / 2;
         vm.prank(keeper);
         module.decreasePosition(a, id, half, 0, 0);
-        int256 profit = int256(module.accountValue(a, module.lastPrice())) - _contributed(a);
+        _reportEquity(a, 600e6); // a recent, unclipped hedge report is required for the fee (SA-1 L-12)
+        int256 profit = int256(module.accountValue(a, module.lastPrice())) - module.account(a).contributed;
+        uint256 maxFee = usdc.balanceOf(a) * 2000 / 10_000;
         vm.prank(keeper);
         uint256 f = module.chargeFee(a);
-        if (profit > 0) assertEq(f, uint256(profit) * 1500 / 10_000);
+        if (profit > 0) assertEq(f, Math.min(uint256(profit) * 1500 / 10_000, maxFee));
         else assertEq(f, 0);
         assertEq(usdc.balanceOf(feeTo), f);
         emit log_named_int("profit before fee (USDC 6d)", profit);
@@ -99,11 +102,18 @@ contract SmartAccountForkTest is SATestBase {
         _exitHybrid(ALICE_PK, a, d, a);
         emit log_named_uint("gas exit (handleOps)", g - gasleft());
         assertFalse(module.isActive(a));
+        assertTrue(DM.disabledDelegations(DM.getDelegationHash(d)));
         vm.expectRevert();
         POSM.ownerOf(id);
+        // margin comes back into the account itself (SA-1 H-1 / M-2), bounded by its own hedge equity
+        uint256 bal = usdc.balanceOf(a);
+        vm.prank(keeper);
+        vm.expectPartialRevert(LPManagerModule.HedgeCap.selector);
+        module.returnHedgeMargin(a, 600e6 + 1);
         vm.prank(keeper);
         module.returnHedgeMargin(a, 600e6);
-        assertEq(usdc.balanceOf(owner_), 600e6);
+        assertEq(usdc.balanceOf(a), bal + 600e6);
+        assertEq(module.account(a).hedgeEquity, 0);
     }
 
     function test_Fork_7702_EndToEnd() public {
@@ -122,9 +132,5 @@ contract SmartAccountForkTest is SATestBase {
         vm.prank(keeper);
         vm.expectRevert();
         module.swap(a, false, 10e6, p);
-    }
-
-    function _contributed(address a) internal view returns (int256 c) {
-        (,,, c,,,,,,,,) = module.accounts(a);
     }
 }
