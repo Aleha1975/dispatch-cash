@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "chainId": 99901,
+  "updatedAt": 1763020800,
+  "strategies": [
+    {
+      "id": "hype-usdc-hedged",
+      "vault": null,
+      "state": "live",
+      "feeApy7d": 0.284,
+      "feeApy30d": 0.251,
+      "netApy30d": 0.172,
+      "tvlUsdc": "412530.18",
+      "feeBps": 1500,
+      "pricePerShare": "1.031874",
+      "lastSettleAt": 1763019000,
+      "nextSettleAt": 1763022600,
+      "pendingDepositsUsdc": "1250.00",
+      "pendingRedeemsUsdc": "300.00"
+    },
+    {
+      "id": "hype-usdc-growth",
+      "vault": null,
+      "state": "live",
+      "feeApy7d": 0.412,
+      "feeApy30d": 0.366,
+      "netApy30d": 0.094,
+      "tvlUsdc": "96210.44",
+      "feeBps": 1500,
+      "pricePerShare": "1.008112",
+      "lastSettleAt": 1763019000,
+      "nextSettleAt": 1763022600,
+      "pendingDepositsUsdc": "0.00",
+      "pendingRedeemsUsdc": "0.00"
+    },
+    {
+      "id": "ramses-hype-usdc-hedged",
+      "vault": null,
+      "state": "coming_soon",
+      "feeApy7d": null,
+      "feeApy30d": null,
+      "netApy30d": null,
+      "tvlUsdc": null,
+      "feeBps": 1500,
+      "pricePerShare": null,
+      "lastSettleAt": null,
+      "nextSettleAt": null,
+      "pendingDepositsUsdc": null,
+      "pendingRedeemsUsdc": null
+    }
+  ]
+}

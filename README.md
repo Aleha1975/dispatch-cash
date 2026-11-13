@@ -92,6 +92,51 @@ pro-rata share of on-chain USDC, native HYPE and WHYPE; queued redeemers first `
 `cancelDeposit(id)`. Hedge margin at `hedgeTreasury` is off-chain: the operator must close the short and return it
 with `returnHedgeMargin`; it then accrues to shares still outstanding, so holders should wait for that return.
 
+## Client web page (`web/`)
+
+Static page, no build step: `index.html` (markup + CSS), `app.js` (vanilla JS + viem 2.21.54 from jsDelivr),
+`config.js` (chain, USDC, strategy list: fill `vault` and `deployBlock` after deployment), `mock/status.json`.
+Serve the folder as-is (e.g. `python3 -m http.server -d web 8787`).
+
+- Review without a wallet: `/?mock=1` (state switcher on top; `&s=<scenario>` deep-links one state).
+- Local fork: `/?rpc=http://127.0.0.1:8545&vaults=<hedged>,<growth>&from=<deployBlock>&status=mock/status.json`.
+  Without an injected wallet (or with `&devwallet=1`) the page uses the node's unlocked account `&acct=N`
+  (default 0); `&batch=1` makes that dev wallet advertise EIP-5792 atomic batches.
+- Deposit order: allowance already set -> `requestDeposit`; wallet reports `atomic.status == "supported"` ->
+  `wallet_sendCalls` (approve + `requestDeposit`, one confirmation); else EIP-2612 permit (domain checked against
+  `DOMAIN_SEPARATOR()`) + `requestDepositWithPermit`; else approve + `requestDeposit`.
+- Every shown value uses the contract's own formulas: value = `previewRedeemLast` math, partial withdraw shares =
+  `previewDepositLast` math, fees paid = the account's pro-rata part of each `Settled.feeShares` (reconstructed from
+  events with `_accrueFee`'s formulas), deposited/withdrawn = `Deposited`/`Redeemed` events.
+
+### Status endpoint `GET /elysium-api/status` (served by the keeper)
+
+```jsonc
+{
+  "version": 1,
+  "chainId": 99901,
+  "updatedAt": 1763020800,            // unix seconds
+  "strategies": [{
+    "id": "hype-usdc-hedged",          // matches web/config.js strategies[].id
+    "vault": "0x…" | null,
+    "state": "live" | "paused" | "emergency" | "coming_soon",
+    "feeApy7d": 0.284,                 // fraction; LP fees earned over 7 d / avg NAV, annualised (card headline)
+    "feeApy30d": 0.251,                // fraction or null
+    "netApy30d": 0.172,                // fraction or null; pps change over 30 d, after hedge cost and our fee
+    "tvlUsdc": "412530.18",            // decimal string = lastNav() / 1e6
+    "feeBps": 1500,                    // params().feeBps
+    "pricePerShare": "1.031874",       // decimal string, USDC per 1e12 shares at the last settlement
+    "lastSettleAt": 1763019000,        // unix seconds of the last Settled event
+    "nextSettleAt": 1763022600,        // unix seconds, keeper's plan
+    "pendingDepositsUsdc": "1250.00",  // pendingDepositAssets() / 1e6
+    "pendingRedeemsUsdc": "300.00"     // queued redeem shares valued at the last NAV
+  }]
+}
+```
+
+The page reads only `id`, `state`, `feeApy7d`, `tvlUsdc`, `feeBps`; everything about the client's own position is
+read on-chain. CORS: same origin as the page (or `Access-Control-Allow-Origin` if served elsewhere).
+
 ## Build and test
 
 ```
