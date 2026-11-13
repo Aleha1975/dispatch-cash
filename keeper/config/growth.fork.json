@@ -1,0 +1,10 @@
+{
+  "_comment": "Local anvil fork, unhedged growth vault with crash guard.",
+  "name": "growth-fork",
+  "chain": {"rpc_url": "http://127.0.0.1:8545", "vault": "0xVAULT", "keeper": "0xKEEPER", "signer": "unlocked"},
+  "strategy": {"mode": "growth"},
+  "state_path": "state/growth-fork.json",
+  "log_path": "state/growth-fork.log",
+  "status_port": 8782,
+  "loop_interval_s": 30
+}

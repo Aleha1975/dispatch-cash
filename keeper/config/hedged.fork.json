@@ -1,0 +1,11 @@
+{
+  "_comment": "Local anvil fork (anvil --fork-url https://rpc.elysium.kinetiq.xyz --auto-impersonate). Fill vault/keeper from the fork deploy.",
+  "name": "hedged-fork",
+  "chain": {"rpc_url": "http://127.0.0.1:8545", "vault": "0xVAULT", "keeper": "0xKEEPER", "signer": "unlocked"},
+  "strategy": {"mode": "hedged"},
+  "hl": {"adapter": "dry_run", "equity_source": "mock"},
+  "state_path": "state/hedged-fork.json",
+  "log_path": "state/hedged-fork.log",
+  "status_port": 8781,
+  "loop_interval_s": 30
+}

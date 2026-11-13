@@ -1,0 +1,22 @@
+# Template unit: one instance per vault config, e.g. systemctl enable --now elysium-keeper@hedged
+# Secrets (keystore password, TG token/chat) live in /etc/elysium-keeper/%i.env (chmod 600), never in the config.
+[Unit]
+Description=Elysium LP vault keeper (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=elysium-keeper
+WorkingDirectory=/opt/elysium-lp-vault/keeper
+EnvironmentFile=/etc/elysium-keeper/%i.env
+ExecStart=/usr/bin/python3 -m elysium_keeper run --config /etc/elysium-keeper/%i.json
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/elysium-keeper /var/log/elysium-keeper
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

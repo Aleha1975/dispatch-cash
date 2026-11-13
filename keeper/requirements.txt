@@ -1,0 +1,7 @@
+eth-account>=0.10   # local tx signing (live), keystore decrypt
+eth-abi>=4          # ABI encode/decode
+eth-utils>=2        # keccak, checksum
+# tests only
+pytest>=7
+# live HL orders only (LiveAdapter), not needed for dry-run:
+# hyperliquid-python-sdk

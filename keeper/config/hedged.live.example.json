@@ -1,0 +1,27 @@
+{
+  "_comment": "LIVE TEMPLATE - not used yet. Stage 1: signer=readonly (plan mode, sends nothing). Stage 2: keystore + allow_live_chain=true. HL stays dry_run until hl.live_enabled=true AND env ELYSIUM_KEEPER_HL_LIVE=I_UNDERSTAND.",
+  "name": "hedged-hype-usdc-v4",
+  "chain": {
+    "rpc_url": "https://rpc.elysium.kinetiq.xyz",
+    "vault": "0xVAULT",
+    "keeper": "0xKEEPER",
+    "signer": "readonly",
+    "keystore_path": "/etc/elysium-keeper/keeper.keystore.json",
+    "keystore_password_env": "ELYSIUM_KEEPER_KEYSTORE_PASSWORD",
+    "allow_live_chain": false
+  },
+  "strategy": {
+    "mode": "hedged", "k_vol": 2.5, "vol_lookback_h": 72, "min_half_width": 0.03, "max_half_width": 0.40,
+    "rehedge_drift": 0.10, "rehedge_interval_s": 14400, "hedge_leverage": 3.0, "settle_interval_s": 3600,
+    "idle_buffer_bps": 500, "swap_chunk_usd": 1500, "max_adverse_dev_bps": 50, "max_clamp_dev_bps": 300
+  },
+  "hl": {
+    "adapter": "dry_run", "live_enabled": false, "equity_source": "account",
+    "account": "0xHL_HEDGE_ACCOUNT", "agent_keystore": "/etc/elysium-keeper/hl-agent.keystore.json"
+  },
+  "alerts": {"sink": "telegram", "min_level": "warn"},
+  "state_path": "/var/lib/elysium-keeper/hedged.json",
+  "log_path": "/var/log/elysium-keeper/hedged.log",
+  "status_port": 8781,
+  "loop_interval_s": 60
+}
