@@ -64,3 +64,22 @@ transaction each way (redemptions are pushed).
 3. Elysium RPC/sequencer: v4 already requires Cancun (TSTORE) there; the vault uses transient reentrancy guard too.
 4. Keeper must keep enough idle USDC buffer (e.g. 5-10% NAV) so routine redemptions settle without unwinding.
 5. Ramses CL subclass (v3-style NPM: `positions()` view, `collect`, WHYPE ERC-20 base).
+
+## Self-review round 1 (before external audit)
+
+Fixed: swap turnover budget was reset by every `settle`; a keeper could settle with empty queues between swaps and
+churn unbounded notional (each swap can lose up to band + slippage). Now a rolling 24 h window
+(`swapNotionalUsed`, `swapWindowStart`), test `test_TurnoverNotResetBySettle`.
+
+Accepted risks (no code change):
+- Pause blocks `swap`, so while paused redemptions larger than idle USDC + USDC freed from LP wait for unpause
+  (now timelocked) or for emergency. Allowing sell-base swaps while paused would reopen the keeper extraction path the
+  pause exists to stop.
+- A live but hostile keeper can keep settling with `maxRedeems = 0`, which keeps `emergencyUnwind` locked; remedy is
+  rotating the keeper through the timelock (48 h).
+- Fund-level HWM: capital that enters during a drawdown recovers to the mark without a fee (free ride).
+- Fake hedge equity within the 5%/day budget also mints performance fee on the fake gain; the HWM then sits above
+  the true pps until real gains catch up. Bounded by the budget; guardian bot must watch HL equity.
+- After a full exit (supply 0), anything left (dust, late hedge return) stays with the virtual shares and makes share
+  units coarse (pps ~ leftover / 1e6); later depositors lose at most one share unit to rounding, no fee is charged.
+- Emergency in-kind payouts exclude hedge margin not yet returned; early emergency redeemers forgo it.
