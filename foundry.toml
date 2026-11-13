@@ -1,0 +1,28 @@
+[profile.default]
+src = "src"
+test = "test"
+script = "script"
+libs = ["lib"]
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 1
+via_ir = true
+remappings = [
+  "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+  "@uniswap/v4-core/=lib/v4-periphery/lib/v4-core/",
+  "@uniswap/v4-periphery/=lib/v4-periphery/",
+  "forge-std/=lib/forge-std/src/",
+]
+ignored_warnings_from = ["lib"]
+
+[profile.default.fuzz]
+runs = 256
+
+[profile.default.invariant]
+runs = 64
+depth = 64
+fail_on_revert = false
+
+[rpc_endpoints]
+elysium = "${ELYSIUM_RPC}"
