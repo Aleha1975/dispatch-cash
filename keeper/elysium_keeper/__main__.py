@@ -4,6 +4,9 @@
   python -m elysium_keeper status --config cfg.json            # snapshot + plan inputs, sends nothing
   python -m elysium_keeper margin --config cfg.json --in-transit 1234.5   # operator: USDC bridging treasury->HL
   python -m elysium_keeper margin --config cfg.json --credit 1234.5       # dry-run only: mock HL equity credit
+  python -m elysium_keeper sa-run     --config cfg.json [--once]   # per-client smart accounts (LPManagerModule)
+  python -m elysium_keeper sa-status  --config cfg.json            # accounts, ledger, fees; sends nothing
+  python -m elysium_keeper sa-onboard --config cfg.json --request req.json   # relayer: deploy account + onboard
 """
 from __future__ import annotations
 
@@ -17,7 +20,8 @@ from .infra import State
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="elysium_keeper")
-    ap.add_argument("cmd", choices=["run", "status", "margin"])
+    ap.add_argument("cmd", choices=["run", "status", "margin", "sa-run", "sa-status", "sa-onboard"])
+    ap.add_argument("--request", default=None, help="sa-onboard: onboarding request JSON (from the web flow)")
     ap.add_argument("--config", required=True)
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--in-transit", type=float, default=None, help="USDC currently in transit treasury<->HL")
@@ -37,6 +41,32 @@ def main(argv=None):
         st.save()
         print(json.dumps({"in_transit_usdc": st.d.get("in_transit_usdc", 0) / 1e6,
                           "hl_sim": st.d.get("hl_sim")}))
+        return
+
+    if a.cmd.startswith("sa-"):
+        from .sa_keeper import SAKeeper
+
+        if a.cmd == "sa-status":
+            cfg.chain.signer = "readonly"
+        k = SAKeeper(cfg)
+        if a.cmd == "sa-onboard":
+            from .sa_chain import Relayer
+
+            with open(a.request) as fh:
+                req = json.load(fh)
+            acct, _ = Relayer(k.r, k.chain, cfg.chain.chain_id, k.log).onboard(req)
+            print(json.dumps({"account": acct}))
+            return
+        if a.cmd == "sa-status":
+            out = {"global": vars(k.r.global_snap()), "accounts": {}}
+            for acct in k.accounts():
+                s = k.r.account(acct)
+                out["accounts"][acct] = dict(vars(s), positions=[vars(p) for p in s.positions], profit=s.profit,
+                                             ledger=k.ledger.clients().get(acct))
+            out["fees_by_account"] = k.state.d.get("fees_by_account", {})
+            print(json.dumps(out, default=str, indent=1))
+            return
+        k.run(once=a.once)
         return
 
     from .keeper import Keeper

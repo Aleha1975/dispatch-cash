@@ -1,0 +1,2664 @@
+[
+ {
+  "type": "constructor",
+  "inputs": [
+   {
+    "name": "c",
+    "type": "tuple",
+    "internalType": "struct LPManagerModule.Config",
+    "components": [
+     {
+      "name": "delegationManager",
+      "type": "address",
+      "internalType": "contract IDelegationManager"
+     },
+     {
+      "name": "enforcer",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "timestampEnforcer",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "hybridImpl",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "eip7702Impl",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "poolManager",
+      "type": "address",
+      "internalType": "contract IPoolManager"
+     },
+     {
+      "name": "positionManager",
+      "type": "address",
+      "internalType": "contract IPositionManagerMin"
+     },
+     {
+      "name": "permit2",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "swapExecutor",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "key",
+      "type": "tuple",
+      "internalType": "struct PoolKey",
+      "components": [
+       {
+        "name": "currency0",
+        "type": "address",
+        "internalType": "Currency"
+       },
+       {
+        "name": "currency1",
+        "type": "address",
+        "internalType": "Currency"
+       },
+       {
+        "name": "fee",
+        "type": "uint24",
+        "internalType": "uint24"
+       },
+       {
+        "name": "tickSpacing",
+        "type": "int24",
+        "internalType": "int24"
+       },
+       {
+        "name": "hooks",
+        "type": "address",
+        "internalType": "contract IHooks"
+       }
+      ]
+     },
+     {
+      "name": "asset",
+      "type": "address",
+      "internalType": "contract IERC20"
+     },
+     {
+      "name": "hedgeTreasury",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "feeRecipient",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "owner",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "keeper",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "guardian",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "params",
+      "type": "tuple",
+      "internalType": "struct LPManagerModule.Params",
+      "components": [
+       {
+        "name": "feeBps",
+        "type": "uint16",
+        "internalType": "uint16"
+       },
+       {
+        "name": "hedgeCapBps",
+        "type": "uint16",
+        "internalType": "uint16"
+       },
+       {
+        "name": "poolBandBps",
+        "type": "uint16",
+        "internalType": "uint16"
+       },
+       {
+        "name": "maxSlippageBps",
+        "type": "uint16",
+        "internalType": "uint16"
+       },
+       {
+        "name": "hedgeStepBps",
+        "type": "uint16",
+        "internalType": "uint16"
+       },
+       {
+        "name": "refDriftBps",
+        "type": "uint16",
+        "internalType": "uint16"
+       },
+       {
+        "name": "swapTurnoverBps",
+        "type": "uint32",
+        "internalType": "uint32"
+       },
+       {
+        "name": "feeInterval",
+        "type": "uint32",
+        "internalType": "uint32"
+       },
+       {
+        "name": "maxPriceAge",
+        "type": "uint32",
+        "internalType": "uint32"
+       }
+      ]
+     }
+    ]
+   }
+  ],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "MAX_FEE_BPS",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "MAX_HEDGE_CAP_BPS",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "MAX_POSITIONS",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "MIN_DELEGATION_LIFETIME",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "MIN_FEE_INTERVAL",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "acceptOwnership",
+  "inputs": [],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "accountValue",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "price",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "accounts",
+  "inputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "delegationHash",
+    "type": "bytes32",
+    "internalType": "bytes32"
+   },
+   {
+    "name": "kind",
+    "type": "uint8",
+    "internalType": "uint8"
+   },
+   {
+    "name": "until",
+    "type": "uint64",
+    "internalType": "uint64"
+   },
+   {
+    "name": "contributed",
+    "type": "int256",
+    "internalType": "int256"
+   },
+   {
+    "name": "hwm",
+    "type": "int256",
+    "internalType": "int256"
+   },
+   {
+    "name": "hedgeEquity",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "netMargin",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeEpoch",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "snapAsset",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "snapBase",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "lastFeeTime",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "feesPaid",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "approveHedgeEquity",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "value",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "until",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "approvePrice",
+  "inputs": [
+   {
+    "name": "lo",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hi",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "until",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "asset",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "contract IERC20"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "baseIsCurrency0",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bool",
+    "internalType": "bool"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "budgets",
+  "inputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "priceUsed",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "priceTime",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeUsed",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeTime",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "turnoverUsed",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "turnoverTime",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeApproved",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeApprovedEpoch",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeApprovedUntil",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "priceApprovedLo",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "priceApprovedHi",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "priceApprovedUntil",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "burnPosition",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "tokenId",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "amount0Min",
+    "type": "uint128",
+    "internalType": "uint128"
+   },
+   {
+    "name": "amount1Min",
+    "type": "uint128",
+    "internalType": "uint128"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "chargeFee",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "f",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "decreasePosition",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "tokenId",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "liquidity",
+    "type": "uint128",
+    "internalType": "uint128"
+   },
+   {
+    "name": "amount0Min",
+    "type": "uint128",
+    "internalType": "uint128"
+   },
+   {
+    "name": "amount1Min",
+    "type": "uint128",
+    "internalType": "uint128"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "delegationManager",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "contract IDelegationManager"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "deposit",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "amount",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "eip7702Impl",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "enforcer",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "enforcerTermsHash",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bytes32",
+    "internalType": "bytes32"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "feeRecipient",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "guardian",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "hedgeTreasury",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "hybridImpl",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "increasePosition",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "tokenId",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "liquidity",
+    "type": "uint128",
+    "internalType": "uint128"
+   },
+   {
+    "name": "amount0Max",
+    "type": "uint128",
+    "internalType": "uint128"
+   },
+   {
+    "name": "amount1Max",
+    "type": "uint128",
+    "internalType": "uint128"
+   },
+   {
+    "name": "keeperPrice",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "isActive",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bool",
+    "internalType": "bool"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "keeper",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "lastPrice",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "lastPriceClipped",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bool",
+    "internalType": "bool"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "lastPriceTime",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "mintPosition",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "tickLower",
+    "type": "int24",
+    "internalType": "int24"
+   },
+   {
+    "name": "tickUpper",
+    "type": "int24",
+    "internalType": "int24"
+   },
+   {
+    "name": "liquidity",
+    "type": "uint128",
+    "internalType": "uint128"
+   },
+   {
+    "name": "amount0Max",
+    "type": "uint128",
+    "internalType": "uint128"
+   },
+   {
+    "name": "amount1Max",
+    "type": "uint128",
+    "internalType": "uint128"
+   },
+   {
+    "name": "keeperPrice",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "tokenId",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "multicall",
+  "inputs": [
+   {
+    "name": "data",
+    "type": "bytes[]",
+    "internalType": "bytes[]"
+   },
+   {
+    "name": "allowFailure",
+    "type": "bool",
+    "internalType": "bool"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "res",
+    "type": "bytes[]",
+    "internalType": "bytes[]"
+   }
+  ],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "onboard",
+  "inputs": [
+   {
+    "name": "d",
+    "type": "tuple",
+    "internalType": "struct Delegation",
+    "components": [
+     {
+      "name": "delegate",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "delegator",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "authority",
+      "type": "bytes32",
+      "internalType": "bytes32"
+     },
+     {
+      "name": "caveats",
+      "type": "tuple[]",
+      "internalType": "struct Caveat[]",
+      "components": [
+       {
+        "name": "enforcer",
+        "type": "address",
+        "internalType": "address"
+       },
+       {
+        "name": "terms",
+        "type": "bytes",
+        "internalType": "bytes"
+       },
+       {
+        "name": "args",
+        "type": "bytes",
+        "internalType": "bytes"
+       }
+      ]
+     },
+     {
+      "name": "salt",
+      "type": "uint256",
+      "internalType": "uint256"
+     },
+     {
+      "name": "signature",
+      "type": "bytes",
+      "internalType": "bytes"
+     }
+    ]
+   },
+   {
+    "name": "amount",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "deadline",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "v",
+    "type": "uint8",
+    "internalType": "uint8"
+   },
+   {
+    "name": "r",
+    "type": "bytes32",
+    "internalType": "bytes32"
+   },
+   {
+    "name": "s",
+    "type": "bytes32",
+    "internalType": "bytes32"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "owner",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "params",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "feeBps",
+    "type": "uint16",
+    "internalType": "uint16"
+   },
+   {
+    "name": "hedgeCapBps",
+    "type": "uint16",
+    "internalType": "uint16"
+   },
+   {
+    "name": "poolBandBps",
+    "type": "uint16",
+    "internalType": "uint16"
+   },
+   {
+    "name": "maxSlippageBps",
+    "type": "uint16",
+    "internalType": "uint16"
+   },
+   {
+    "name": "hedgeStepBps",
+    "type": "uint16",
+    "internalType": "uint16"
+   },
+   {
+    "name": "refDriftBps",
+    "type": "uint16",
+    "internalType": "uint16"
+   },
+   {
+    "name": "swapTurnoverBps",
+    "type": "uint32",
+    "internalType": "uint32"
+   },
+   {
+    "name": "feeInterval",
+    "type": "uint32",
+    "internalType": "uint32"
+   },
+   {
+    "name": "maxPriceAge",
+    "type": "uint32",
+    "internalType": "uint32"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "paused",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bool",
+    "internalType": "bool"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "payoutAddress",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "pendingOwner",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "permissionContext",
+  "inputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bytes",
+    "internalType": "bytes"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "permit2",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "poolId",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bytes32",
+    "internalType": "PoolId"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "poolKey",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "tuple",
+    "internalType": "struct PoolKey",
+    "components": [
+     {
+      "name": "currency0",
+      "type": "address",
+      "internalType": "Currency"
+     },
+     {
+      "name": "currency1",
+      "type": "address",
+      "internalType": "Currency"
+     },
+     {
+      "name": "fee",
+      "type": "uint24",
+      "internalType": "uint24"
+     },
+     {
+      "name": "tickSpacing",
+      "type": "int24",
+      "internalType": "int24"
+     },
+     {
+      "name": "hooks",
+      "type": "address",
+      "internalType": "contract IHooks"
+     }
+    ]
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "poolManager",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "contract IPoolManager"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "poolPrice",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "positionManager",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "contract IPositionManagerMin"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "positionsOf",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "tuple[]",
+    "internalType": "struct V4PositionMath.Position[]",
+    "components": [
+     {
+      "name": "tokenId",
+      "type": "uint256",
+      "internalType": "uint256"
+     },
+     {
+      "name": "tickLower",
+      "type": "int24",
+      "internalType": "int24"
+     },
+     {
+      "name": "tickUpper",
+      "type": "int24",
+      "internalType": "int24"
+     }
+    ]
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "priceBudget",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "priceUsed",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "priceTime",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeUsed",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeTime",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "turnoverUsed",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "turnoverTime",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeApproved",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeApprovedEpoch",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeApprovedUntil",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "priceApprovedLo",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "priceApprovedHi",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "priceApprovedUntil",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "register",
+  "inputs": [
+   {
+    "name": "d",
+    "type": "tuple",
+    "internalType": "struct Delegation",
+    "components": [
+     {
+      "name": "delegate",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "delegator",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "authority",
+      "type": "bytes32",
+      "internalType": "bytes32"
+     },
+     {
+      "name": "caveats",
+      "type": "tuple[]",
+      "internalType": "struct Caveat[]",
+      "components": [
+       {
+        "name": "enforcer",
+        "type": "address",
+        "internalType": "address"
+       },
+       {
+        "name": "terms",
+        "type": "bytes",
+        "internalType": "bytes"
+       },
+       {
+        "name": "args",
+        "type": "bytes",
+        "internalType": "bytes"
+       }
+      ]
+     },
+     {
+      "name": "salt",
+      "type": "uint256",
+      "internalType": "uint256"
+     },
+     {
+      "name": "signature",
+      "type": "bytes",
+      "internalType": "bytes"
+     }
+    ]
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "renounceOwnership",
+  "inputs": [],
+  "outputs": [],
+  "stateMutability": "pure"
+ },
+ {
+  "type": "function",
+  "name": "reportHedgeEquity",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "value",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "reportPrice",
+  "inputs": [
+   {
+    "name": "price",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "returnHedgeMargin",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "amount",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "sendHedgeMargin",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "amount",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "setGuardian",
+  "inputs": [
+   {
+    "name": "g",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "setKeeper",
+  "inputs": [
+   {
+    "name": "k",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "setParams",
+  "inputs": [
+   {
+    "name": "p",
+    "type": "tuple",
+    "internalType": "struct LPManagerModule.Params",
+    "components": [
+     {
+      "name": "feeBps",
+      "type": "uint16",
+      "internalType": "uint16"
+     },
+     {
+      "name": "hedgeCapBps",
+      "type": "uint16",
+      "internalType": "uint16"
+     },
+     {
+      "name": "poolBandBps",
+      "type": "uint16",
+      "internalType": "uint16"
+     },
+     {
+      "name": "maxSlippageBps",
+      "type": "uint16",
+      "internalType": "uint16"
+     },
+     {
+      "name": "hedgeStepBps",
+      "type": "uint16",
+      "internalType": "uint16"
+     },
+     {
+      "name": "refDriftBps",
+      "type": "uint16",
+      "internalType": "uint16"
+     },
+     {
+      "name": "swapTurnoverBps",
+      "type": "uint32",
+      "internalType": "uint32"
+     },
+     {
+      "name": "feeInterval",
+      "type": "uint32",
+      "internalType": "uint32"
+     },
+     {
+      "name": "maxPriceAge",
+      "type": "uint32",
+      "internalType": "uint32"
+     }
+    ]
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "setPaused",
+  "inputs": [
+   {
+    "name": "p",
+    "type": "bool",
+    "internalType": "bool"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "snapLiquidity",
+  "inputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint128",
+    "internalType": "uint128"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "swap",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "sellBase",
+    "type": "bool",
+    "internalType": "bool"
+   },
+   {
+    "name": "amountIn",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "keeperPrice",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "out",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "swapExecutor",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "timestampEnforcer",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "transferOwnership",
+  "inputs": [
+   {
+    "name": "newOwner",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "event",
+  "name": "CallFailed",
+  "inputs": [
+   {
+    "name": "index",
+    "type": "uint256",
+    "indexed": true,
+    "internalType": "uint256"
+   },
+   {
+    "name": "reason",
+    "type": "bytes",
+    "indexed": false,
+    "internalType": "bytes"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "FeeCharged",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "fee",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "profit",
+    "type": "int256",
+    "indexed": false,
+    "internalType": "int256"
+   },
+   {
+    "name": "hwm",
+    "type": "int256",
+    "indexed": false,
+    "internalType": "int256"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "Flow",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "value",
+    "type": "int256",
+    "indexed": false,
+    "internalType": "int256"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "HedgeEquityApproved",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "epoch",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "value",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "until",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "HedgeEquityReported",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "reported",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "applied",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "clipped",
+    "type": "bool",
+    "indexed": false,
+    "internalType": "bool"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "HedgeMarginReturned",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "to",
+    "type": "address",
+    "indexed": false,
+    "internalType": "address"
+   },
+   {
+    "name": "amount",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeEquity",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "netMargin",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "HedgeMarginSent",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "amount",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeEquity",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "netMargin",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "OwnershipTransferStarted",
+  "inputs": [
+   {
+    "name": "previousOwner",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "newOwner",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "OwnershipTransferred",
+  "inputs": [
+   {
+    "name": "previousOwner",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "newOwner",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "ParamsSet",
+  "inputs": [
+   {
+    "name": "p",
+    "type": "tuple",
+    "indexed": false,
+    "internalType": "struct LPManagerModule.Params",
+    "components": [
+     {
+      "name": "feeBps",
+      "type": "uint16",
+      "internalType": "uint16"
+     },
+     {
+      "name": "hedgeCapBps",
+      "type": "uint16",
+      "internalType": "uint16"
+     },
+     {
+      "name": "poolBandBps",
+      "type": "uint16",
+      "internalType": "uint16"
+     },
+     {
+      "name": "maxSlippageBps",
+      "type": "uint16",
+      "internalType": "uint16"
+     },
+     {
+      "name": "hedgeStepBps",
+      "type": "uint16",
+      "internalType": "uint16"
+     },
+     {
+      "name": "refDriftBps",
+      "type": "uint16",
+      "internalType": "uint16"
+     },
+     {
+      "name": "swapTurnoverBps",
+      "type": "uint32",
+      "internalType": "uint32"
+     },
+     {
+      "name": "feeInterval",
+      "type": "uint32",
+      "internalType": "uint32"
+     },
+     {
+      "name": "maxPriceAge",
+      "type": "uint32",
+      "internalType": "uint32"
+     }
+    ]
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "Paused",
+  "inputs": [
+   {
+    "name": "paused",
+    "type": "bool",
+    "indexed": false,
+    "internalType": "bool"
+   },
+   {
+    "name": "by",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "PositionBurned",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "tokenId",
+    "type": "uint256",
+    "indexed": true,
+    "internalType": "uint256"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "PositionDecreased",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "tokenId",
+    "type": "uint256",
+    "indexed": true,
+    "internalType": "uint256"
+   },
+   {
+    "name": "liquidity",
+    "type": "uint128",
+    "indexed": false,
+    "internalType": "uint128"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "PositionIncreased",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "tokenId",
+    "type": "uint256",
+    "indexed": true,
+    "internalType": "uint256"
+   },
+   {
+    "name": "liquidity",
+    "type": "uint128",
+    "indexed": false,
+    "internalType": "uint128"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "PositionMinted",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "tokenId",
+    "type": "uint256",
+    "indexed": true,
+    "internalType": "uint256"
+   },
+   {
+    "name": "tickLower",
+    "type": "int24",
+    "indexed": false,
+    "internalType": "int24"
+   },
+   {
+    "name": "tickUpper",
+    "type": "int24",
+    "indexed": false,
+    "internalType": "int24"
+   },
+   {
+    "name": "liquidity",
+    "type": "uint128",
+    "indexed": false,
+    "internalType": "uint128"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "PriceApproved",
+  "inputs": [
+   {
+    "name": "lo",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "hi",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "until",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "PriceReported",
+  "inputs": [
+   {
+    "name": "reported",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "applied",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "clipped",
+    "type": "bool",
+    "indexed": false,
+    "internalType": "bool"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "Registered",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "delegationHash",
+    "type": "bytes32",
+    "indexed": false,
+    "internalType": "bytes32"
+   },
+   {
+    "name": "kind",
+    "type": "uint8",
+    "indexed": false,
+    "internalType": "uint8"
+   },
+   {
+    "name": "until",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "first",
+    "type": "bool",
+    "indexed": false,
+    "internalType": "bool"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "RoleSet",
+  "inputs": [
+   {
+    "name": "role",
+    "type": "bytes32",
+    "indexed": true,
+    "internalType": "bytes32"
+   },
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": false,
+    "internalType": "address"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
+  "name": "Swapped",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "sellBase",
+    "type": "bool",
+    "indexed": false,
+    "internalType": "bool"
+   },
+   {
+    "name": "amountIn",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "amountOut",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "keeperPrice",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "error",
+  "name": "BadParam",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BadPrice",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BadWiring",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BelowMinOut",
+  "inputs": [
+   {
+    "name": "out",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "minOut",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "FeeNeedsIdle",
+  "inputs": [
+   {
+    "name": "fee",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "idle",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "FeeTooEarly",
+  "inputs": [
+   {
+    "name": "next",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "HedgeCap",
+  "inputs": [
+   {
+    "name": "after_",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "cap",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "IsPaused",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "MintFailed",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "NoAnchor",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "NotGuardian",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "NotKeeper",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "NotOwnAccount",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "NotRegistered",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "OwnableInvalidOwner",
+  "inputs": [
+   {
+    "name": "owner",
+    "type": "address",
+    "internalType": "address"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "OwnableUnauthorizedAccount",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "internalType": "address"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "PoolPriceOff",
+  "inputs": [
+   {
+    "name": "poolPrice",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "keeperPrice",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "ReentrancyGuardReentrantCall",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "SafeERC20FailedOperation",
+  "inputs": [
+   {
+    "name": "token",
+    "type": "address",
+    "internalType": "address"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "StalePrice",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "TooManyPositions",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "TransferMismatch",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "UnknownPosition",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "ZeroAmount",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "AddValue",
+  "inputs": [
+   {
+    "name": "got",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "paid",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "BadAccount",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BadDelegation",
+  "inputs": [
+   {
+    "name": "code",
+    "type": "uint8",
+    "internalType": "uint8"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "Turnover",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "ActionNotAllowed",
+  "inputs": [
+   {
+    "name": "action",
+    "type": "uint8",
+    "internalType": "uint8"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "BadAmount",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BadExecution",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BadExpiration",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BadMode",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BadPool",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BadRecipient",
+  "inputs": [
+   {
+    "name": "to",
+    "type": "address",
+    "internalType": "address"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "BadRedeemer",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BadSpender",
+  "inputs": [
+   {
+    "name": "spender",
+    "type": "address",
+    "internalType": "address"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "BadTerms",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BadToken",
+  "inputs": [
+   {
+    "name": "token",
+    "type": "address",
+    "internalType": "address"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "BadValue",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "FeeTooLarge",
+  "inputs": [
+   {
+    "name": "amount",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "max",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "FeeTooSoon",
+  "inputs": [
+   {
+    "name": "next",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "HedgeBudget",
+  "inputs": [
+   {
+    "name": "usedWad",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "capWad",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "HookDataNotEmpty",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "NonCanonical",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "NotDelegationManager",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "NotOwnedByDelegator",
+  "inputs": [
+   {
+    "name": "tokenId",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "SelectorNotAllowed",
+  "inputs": [
+   {
+    "name": "target",
+    "type": "address",
+    "internalType": "address"
+   },
+   {
+    "name": "selector",
+    "type": "bytes4",
+    "internalType": "bytes4"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "TargetNotAllowed",
+  "inputs": [
+   {
+    "name": "target",
+    "type": "address",
+    "internalType": "address"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "NotPoolManager",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "RefundFailed",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "SafeCastOverflowedUintDowncast",
+  "inputs": [
+   {
+    "name": "bits",
+    "type": "uint8",
+    "internalType": "uint8"
+   },
+   {
+    "name": "value",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "SafeCastOverflowedUintToInt",
+  "inputs": [
+   {
+    "name": "value",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "CannotUseADisabledDelegation",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "InvalidDelegate",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "InvalidDelegator",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "InvalidERC1271Signature",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "InvalidEOASignature",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "EnforcedPause",
+  "inputs": []
+ }
+]

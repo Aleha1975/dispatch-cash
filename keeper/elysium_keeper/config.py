@@ -89,12 +89,29 @@ class AlertCfg:
 
 
 @dataclass
+class SACfg:
+    """Per-client smart accounts (LPManagerModule). Used by `sa-run` / `sa-status` / `sa-onboard`."""
+    module: str = ""
+    accounts: list = field(default_factory=list)  # static list; Registered events are scanned as well
+    discover_from_block: int = 0  # 0 = no event scan (static list only)
+    stagger_s: float = 2.0  # pause between accounts that sent transactions (nonce / mempool / gas spikes)
+    margin_frac: float = 0.25  # hedge margin target as a share of account value (on-chain cap 35%)
+    buffer_bps: int = 300  # USDC kept idle per account (fees, the enforcer's %-of-idle limits)
+    min_deploy_usd: float = 50.0
+    fee_idle_margin: float = 1.1  # free idle USDC to fee x 5 x this before chargeFee (enforcer: fee <= 20% idle)
+    report_every_s: int = 1800  # re-report the anchor at least this often (fees need maxPriceAge freshness)
+    ledger_path: str = "sa_ledger.json"
+    requests_dir: str = ""  # relayer: onboarding requests (*.json) dropped by the web backend
+
+
+@dataclass
 class Config:
     name: str = "vault"
     chain: ChainCfg = field(default_factory=ChainCfg)
     strategy: StrategyCfg = field(default_factory=StrategyCfg)
     hl: HLCfg = field(default_factory=HLCfg)
     alerts: AlertCfg = field(default_factory=AlertCfg)
+    sa: SACfg = field(default_factory=SACfg)
     state_path: str = "keeper_state.json"
     log_path: str = ""
     status_host: str = "127.0.0.1"
@@ -112,7 +129,7 @@ def _build(cls, d: dict):
         raise ValueError(f"unknown config keys for {cls.__name__}: {sorted(unknown)}")
     kw = {}
     for k, v in d.items():
-        sub = {"chain": ChainCfg, "strategy": StrategyCfg, "hl": HLCfg, "alerts": AlertCfg}.get(k)
+        sub = {"chain": ChainCfg, "strategy": StrategyCfg, "hl": HLCfg, "alerts": AlertCfg, "sa": SACfg}.get(k)
         kw[k] = _build(sub, v) if (cls is Config and sub) else v
     return cls(**kw)
 
