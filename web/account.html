@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Elysium Account</title>
+<meta name="description" content="Your own HYPE/USDC liquidity account on Elysium: you keep custody, leave with one transaction.">
+<meta name="theme-color" content="#0d1117" media="(prefers-color-scheme: dark)">
+<meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
+<link rel="stylesheet" href="style.css">
+<style>
+.steps { margin: 12px 0 4px; padding: 0; list-style: none; }
+.steps li { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; }
+.steps .n { flex: none; width: 22px; height: 22px; border-radius: 50%; background: var(--surface-2); color: var(--muted);
+  font-size: 12px; font-weight: 700; display: grid; place-items: center; }
+.steps li.done .n { background: var(--accent); color: var(--accent-ink); }
+.steps li.now .n { background: var(--accent-soft); color: var(--accent); }
+.addrline { font-size: 13px; color: var(--muted); word-break: break-all; }
+.check { display: flex; gap: 8px; align-items: flex-start; font-size: 14px; margin: 4px 0 12px; }
+.danger-btn { background: var(--danger-soft); color: var(--danger); }
+.btn + .btn { margin-top: 8px; }
+</style>
+</head>
+<body>
+<div id="mockbar" class="mockbar hidden"><div class="wrap" id="mockbar-inner"></div></div>
+<header class="top"><div class="wrap">
+  <div class="brand"><span class="brand-mark" aria-hidden="true"></span><span>Elysium Account</span></div>
+  <button id="wallet-btn" class="wallet-btn">Connect</button>
+</div></header>
+<main class="wrap" id="app"></main>
+<script type="module" src="account.js"></script>
+</body>
+</html>
