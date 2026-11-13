@@ -1,0 +1,75 @@
+Elysium LP Vault: async keeper-settled Uniswap v4 LP vault (optionally hedged) with owner timelock - audit round 2
+
+SOURCE
+{{REPO_URL}} at commit {{COMMIT}}. Round 1 report: docs/audit/round1_report_1222.md; our response per finding:
+docs/audit/round1_response.md. README.md and DESIGN.md (budgets, per-channel damage bounds, accepted risks) are
+in scope as specification. solc 0.8.26, via-IR, optimizer runs 1, evm cancun. OZ 5.4.0. NOT deployed.
+UniV4LPVault runtime 24,326 B (EIP-170 margin 250 B). Foundry: 85 unit/invariant + 7 fork tests.
+
+SCOPE (focus on what changed since round 1)
+- src/RiskBudgets.sol (new, linked library): one decaying-day primitive (used' = used*(1d-dt)/1d + new) for three
+  keeper budgets: price anchor (relative, WAD), hedge equity decreases, swap/LP-add turnover; guardian approvals.
+- src/LPVaultBase.sol: settle core (anchor move, hedge move, clipped settlement = redeems only, no deposits, no
+  fee), partial redeem head, liveness = redeem progress, two-step emergency, netMargin cap, claimTo, _pay.
+- src/UniV4LPVault.sol: LP-add value check at the anchor (_checkAddAt), UNWIND_MIN_GAS pre-check, sync before
+  native settle.
+- src/V4PositionMath.sol: liquidityValue (liquidity valued at a price), PositionManager calldata.
+- src/VaultTimelock.sol: MixedBatch, GRACE_PERIOD 7 d expiry, MAX_DELAY 30 d.
+- script/Deploy.s.sol: input validation.
+
+CHAIN CONTEXT
+Elysium mainnet, chain id 99901, Arbitrum Orbit L2, native gas HYPE. Pool: native HYPE / USDC, fee 3000,
+tickSpacing 60, no hooks, depth a few hundred thousand USD (addresses in script/Deploy.s.sol).
+
+DESIGN RULES (do not report as findings; report if the code breaks them)
+- Limits are relative to NAV or to the anchor, never small absolute caps, and must never block a withdrawal.
+- Keeper = semi-trusted hot key. A compromised keeper's damage must stay within the per-channel bounds in
+  DESIGN.md ("Compromised-keeper damage per day"). Keeper + guardian together are trusted.
+- A budget never reverts settle: over-budget price/equity is clipped, redeems still go through.
+
+TRUST MODEL CHANGES SINCE ROUND 1
+- Price: settle requires the keeper price within poolBandBps (1.5%) of the pool; NAV uses the anchor lastPrice,
+  which moves toward the report at most refDriftBps (10%) per decaying day, freely only inside guardian
+  approvePrice(lo, hi, until) and on the first settle. Paused = anchor frozen. swap/mint/increase need the keeper
+  price within the band of the pool AND of the anchor.
+- Hedge equity: keeper alone may only lower it (hedgeStepBps x lastNav per decaying day); any increase needs the
+  guardian's approveHedgeEquity(value, until), exact, epoch-bound, one-shot, cleared by margin send/return.
+  sendHedgeMargin caps max(hedgeEquity, netMargin) + amount <= hedgeCapBps x lastNav.
+- LP adds: paid = drop of held value at the anchor; got = liquidityValue at the anchor; revert unless
+  got >= paid x (1 - maxSlippageBps); turnover charged paid x slippage / (band + slippage).
+- Emergency: after 72 h without redeem-queue progress, anyone arms; execute >= 6 h later unless a settlement made
+  progress. >= 1M gas per burn attempt. emergencyRedeem refused while positions are open, for up to 7 d.
+
+LENSES REQUESTED (seven did not run in round 1; please run each explicitly)
+1. Economic security: the cheapest end-to-end extraction for a compromised keeper with accomplice capital and pool
+   pushes, over 1, 3 and 7 days, all channels at once (anchor walk, band skew, swaps/adds, hedge, fee). Does any combination beat the per-channel bounds in DESIGN.md, or the sum of them?
+   Is the decaying budget compounding (relative anchor steps, e^x) larger than we state?
+2. Execution trace: multi-call sequences in one block or one transaction (code-executing keeper / EIP-7702):
+   settle -> swap -> mint -> settle; partial redeem fill + clipped settle + deposit cancel; arm -> settle that does
+   not progress -> execute.
+3. Periphery / native plumbing: native HYPE through PositionManager (SETTLE_PAIR, SWEEP), PoolManager sync/settle/
+   take in unlockCallback, WHYPE unwrap, receive(), emergencyRedeem native leg; _heldValue on an increase that
+   also collects fees.
+4. First principles: is "paid vs value at the anchor" the right invariant for an LP add? Can a range be chosen
+   whose value at the anchor passes while its value at the true price is much lower (wide vs narrow, out of range)?
+5. Asymmetry: paths that differ by direction (price up vs down clip, hedge up vs down, sell base vs buy base,
+   currency0 vs currency1 base) or by role (keeper vs guardian vs anyone); round-trip a value through them.
+6. Boundary: ref == 0 first settle, budget exactly exhausted, dt = 0 and dt >= 1 day, approval at until, epoch
+   wrap of hedgeApprovedEpoch (epoch + 1), supply 0 restart, redeem head partial fill with idle = 0 or 1 wei,
+   gasleft exactly UNWIND_MIN_GAS, timelock ts == 1 (done) and expiry boundary.
+7. Flow gaps: value that enters or leaves without passing a check (fees collected by increase/decrease, sweep
+   leftovers, failed pushes to claimable, late hedge return after emergency, donations), and whether every keeper
+   path keeps _checkReserve true.
+
+QUESTIONS
+1. Are H-1..H-3 and M-1..M-10 fixed at the root or only for the PoC? Re-run each PoC on the new code.
+2. Can any clipped-settlement state be abused (redeems at the clipped price while deposits wait, repeated clipped
+   settles, clip + guardian approval later)?
+3. Is the liveness clock (lastProgressTime) sound: can the keeper fake progress with dust redeems or a
+   self-requested redeem to keep emergency closed while larger redeems wait?
+4. Any way to block or grief a withdrawal with the new partial fill, claimTo, zero-share refund or PositionsOpen?
+5. Timelock: MixedBatch counting, expiry for execute vs executeBatch, two-step guardian rotation: any gap?
+6. Deploy.s.sol: any default or unchecked input that ships an unsafe config?
+
+OUT OF SCOPE
+keeper/ bot, web/, Hyperliquid and bridge, Uniswap v4, Permit2, USDC; keeper behaviour inside the bounds.

@@ -34,14 +34,19 @@ account. The tests run on a local anvil fork, with HL in dry-run.
    is in emergency, do nothing.
 2. Price: `P` = HL mid. If it is within 0.8 x band of the pool, use it. If it is up to 3% off, clamp it into the band.
    Beyond that, skip the tick and alert. The keeper never forces a price.
-3. If `P` is close to `refDriftBps` away from the last settled price, settle first (swaps and mints check refDrift).
+3. Anchor: if `P` is within 25 bps of the vault's anchor `lastPrice`, report the anchor (no budget used). If `P` is
+   more than half the pool band from the anchor, settle first (swaps and adds must quote within the band of the
+   anchor). A move beyond the anchor's daily budget is clipped on-chain; the keeper alerts the guardian
+   (`approvePrice`).
 4. Free liquidity for queued redeems: sell idle HYPE, then decrease (or burn) LP pro rata, then sell the freed
    HYPE. Hedged vault: pull margin from the treasury (`returnHedgeMargin`, needs the treasury's approval), else
    send a MANUAL alert asking for an HL withdraw.
 5. Settle when due (interval, queued deposits, or the first queued redeem is payable). Loop over long queues. The
-   reported hedge equity is treasury USDC + HL equity + operator-declared in-transit. It is pre-checked against
-   the 5%/day drift budget. If it would exceed the budget, the keeper skips and alerts the guardian
-   (`approveHedgeEquity`) when queues exist, otherwise it clamps and alerts.
+   reported hedge equity is treasury USDC + HL equity + operator-declared in-transit. The real value is always
+   reported. The keeper alone can only lower it (5% of NAV per decaying day); an increase, or a larger drop, is
+   clipped on-chain (redeems only, no deposits, no fee). The keeper alerts the guardian (`approveHedgeEquity`) and,
+   with redeems queued, waits up to `guardian_wait_s` (2 h) before settling clipped. LP adds are sized to the
+   remaining turnover budget.
 6. LP. Growth vault in crash mode: burn everything and sell HYPE to USDC. Otherwise, if the price is out of range,
    burn and re-mint at `P +- k x vol` (k = 2.5, 72h vol from HL 1h candles, clipped to 3-40%). Idle funds are
    deployed by minting a position, or adding to it with `increasePosition`. The keeper keeps 5% of NAV as a USDC
