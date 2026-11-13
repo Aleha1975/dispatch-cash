@@ -9,8 +9,8 @@ SCOPE
 - src/VaultTimelock.sol (90 lines): OpenZeppelin 5.4 TimelockController subclass, vault owner.
 - src/interfaces/IExternal.sol (26 lines).
 - script/Deploy.s.sol (wiring).
-solc 0.8.26, via-IR, optimizer runs 1, evm cancun (transient storage). OpenZeppelin 5.4.0, v4-core/v4-periphery
-from the lib/ submodules. NOT deployed. Vault runtime 24,041 bytes (EIP-170). Foundry: 61 unit/invariant tests +
+solc 0.8.26, via-IR, optimizer runs 1, evm cancun (transient storage). OpenZeppelin 5.4.0, v4-core/periphery
+from lib/. NOT deployed. Vault runtime 24,041 bytes (EIP-170). Foundry: 61 unit/invariant tests +
 4 fork tests against the live pool.
 
 SOURCE
@@ -51,7 +51,7 @@ OUT OF SCOPE (INTENTIONAL)
 - Keeper honesty within the on-chain bounds (price inside the band, hedge equity inside the daily budget, swap
   timing): we want to know if the bounds are wrong or bypassable, not that a keeper can act badly inside them.
 - Hyperliquid, the bridge, the treasury's off-chain custody and the HL short itself.
-- Uniswap v4 core/periphery, Permit2, the bridged USDC, the keeper bot (keeper/) and the web page (web/).
+- Uniswap v4, Permit2, bridged USDC, keeper/ bot and web/ page.
 
 QUESTIONS FOR THE AUDITOR
 1. Band-price extraction: with the keeper able to pick any price inside poolBandBps and an accomplice queueing
