@@ -1,0 +1,78 @@
+Elysium LP Vault: async keeper-settled Uniswap v4 LP vault (optionally hedged) with owner timelock - audit round 1
+
+SCOPE
+- src/LPVaultBase.sol (652 lines): ERC-20 shares, async deposit/redeem queues, settlement, perf fee + HWM, hedge
+  margin, roles, pause, emergency wind-down.
+- src/UniV4LPVault.sol (315 lines): venue for one fixed Uniswap v4 pool (PositionManager mint/increase/decrease/
+  burn, swaps via PoolManager.unlock).
+- src/V4PositionMath.sol (69 lines): linked library, pool price and position amounts from PoolManager storage.
+- src/VaultTimelock.sol (90 lines): OpenZeppelin 5.4 TimelockController subclass, vault owner.
+- src/interfaces/IExternal.sol (26 lines).
+- script/Deploy.s.sol for deployment wiring.
+solc 0.8.26, via-IR, optimizer runs 1, evm cancun (transient storage). OpenZeppelin 5.4.0, v4-core/v4-periphery
+from the lib/ submodules. NOT deployed. Vault runtime 24,041 bytes (EIP-170). Foundry: 61 unit/invariant tests +
+4 fork tests against the live pool.
+
+SOURCE
+Public repo link will be inserted: {{REPO_URL}} at commit {{COMMIT}}. README.md and DESIGN.md (threat model,
+accepted risks) are part of the submission.
+
+CHAIN CONTEXT
+Elysium mainnet, chain id 99901, Arbitrum Orbit L2, native gas token HYPE. Pool: PoolKey(native HYPE, USDC
+0xb47c4C8F73F009CC0C0d3f92B388d13E293F0B65, fee 3000, tickSpacing 60, hooks 0), poolId
+0xb3032695ffb0a66e6342876dd2386835471466cb2bb70f341947d98a69e265cc. PoolManager
+0xE2e105d3F7209A9DA11f83cCf3E7398a753823F1, PositionManager 0x1d1C51b9d07fD27d36412A2b66CC23D19Eb3E518,
+Permit2 0x000000000022D473030F116dDEE9F6B43aC78BA3, WHYPE 0xbA876237B0F021A6c6D852d6c26E107997cC5E81.
+Pool virtual depth is a few hundred thousand USD, so single swaps move price materially.
+
+DESIGN IN ONE PARAGRAPH
+Clients deposit USDC (permit or approve) into a queue and request redeems by locking shares. Only the keeper's
+settle(price, hedgeEquity) mints/burns shares, at NAV = idle USDC (minus queued deposits and unpaid claims) + idle
+HYPE/WHYPE and LP amounts valued at the keeper price + reported hedge equity. Settle reverts unless the keeper price
+is within poolBandBps (1.5%) of the pool price. Redeem USDC is pushed; failed pushes become claimable. 15% fee on
+pps gain above a non-decreasing HWM, minted as shares. 6-decimal virtual-share offset.
+
+TRUST MODEL AND ROLES
+- owner = VaultTimelock (48 h default, hard floor 24 h, delay only changeable through itself, no admin). Operator
+  multisig is proposer and executor; operator and guardian can cancel; the guardian cannot cancel operations that
+  target the timelock itself (so it cannot veto its own rotation). Owner can set keeper, guardian, fee recipient,
+  params within hard caps, unpause. Owner can never move funds.
+- keeper (hot key): settle; mint/increase/decrease/burn positions in the fixed pool; exact-input swaps through the
+  fixed pool with min-out from its price; send USDC margin only to the immutable hedgeTreasury; pull it back.
+  Turnover <= 2x NAV per rolling day; keeper price within band of pool and within 10% of last settled price.
+- guardian: instant pause (deposits, mints, increases, swaps, hedge sends; never redeems/settle/claims/cancels);
+  co-confirms one exact hedge equity value per epoch when the drift exceeds 5% of NAV per rolling day.
+- hedgeTreasury: operator-controlled address bridging to a Hyperliquid account that holds the HYPE short. Up to
+  hedgeCapBps (35%, hard cap 50%) of NAV is under operator custody off-chain by design.
+- anyone: emergencyUnwind after 72 h without settlement (10% price band until day 7, then unconditional), then
+  pro-rata in-kind emergencyRedeem.
+
+OUT OF SCOPE (INTENTIONAL)
+- Keeper honesty within the on-chain bounds (price inside the band, hedge equity inside the daily budget, swap
+  timing): we want to know if the bounds are wrong or bypassable, not that a keeper can act badly inside them.
+- Hyperliquid, the bridge, the treasury's off-chain custody and the HL short itself.
+- Uniswap v4 core/periphery, Permit2, the bridged USDC, the keeper bot (keeper/) and the web page (web/).
+
+QUESTIONS FOR THE AUDITOR
+1. Band-price extraction: with the keeper able to pick any price inside poolBandBps and an accomplice queueing
+   deposits/redeems, what is the realistic per-settlement extraction, and can pool manipulation by a third party
+   push settlement, mint or swap outside what the band check assumes?
+2. Hedge equity budget: is the rolling-day absolute drift budget (5% of lastNav) plus the guardian's exact-value
+   override sound? Any way to compound it (window reset, approval reuse, interplay with sendHedgeMargin /
+   returnHedgeMargin, fee minted on fake gains)?
+3. Emergency unwind: is the 72 h / 7 d / 10% band logic safe against manipulation at trigger time, and is the
+   in-kind pro-rata emergencyRedeem (incl. cancelRedeem for queued redeems, failed positions, late hedge return)
+   free of value leakage between holders?
+4. Queue FIFO: can any client or third party block, reorder or grief the deposit/redeem queues (head-of-line
+   redeem, cancelled entries, blocked USDC recipients, zero-share deposits)?
+5. Fee and HWM: is the fee-share formula exact and is the HWM safe across drawdown, recovery, full exit
+   (supply 0 restart) and deposits/redeems in the same settlement? Rounding direction everywhere?
+6. Native HYPE: reentrancy and accounting around receive(), PositionManager SWEEP of native leftovers,
+   PoolManager settle/take with native, WHYPE unwrap, and native payout in emergencyRedeem.
+7. Inflation / donation: is the 1e6 virtual-share offset with settle-only minting enough, including donations of
+   USDC, HYPE or WHYPE right before the first settlement or after a full exit?
+8. Reserve segregation: can queued deposits or unpaid claims ever be spent by any keeper path (Permit2 sub-
+   allowances, PositionManager CLOSE_CURRENCY/SWEEP, swap callback)?
+9. Timelock: any path that changes a vault parameter or role without the delay, or that lets the guardian or
+   operator block the other permanently?
+10. V4PositionMath: correctness of amounts + uncollected fees (feeGrowthInside wraparound) vs what burn returns.
