@@ -399,7 +399,8 @@ contract UniV4LPVaultForkTest is Test {
         (uint256 b, uint256 a) = vault.positionAmounts();
         uint256 deployed = a + b * vault.lastPrice() / 1e18;
         assertGt(deployed, 0);
-        assertApproxEqRel(used - before, deployed, 0.02e18); // the deployed value is charged
+        // the deployed value is charged, weighted slippage / (band + slippage) = 150 / 300
+        assertApproxEqRel(used - before, deployed / 2, 0.02e18);
     }
 
     /// M-8: an emergencyUnwind caller who under-supplies gas so the burn runs out of gas reverts the whole call

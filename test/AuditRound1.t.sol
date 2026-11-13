@@ -132,16 +132,17 @@ contract AuditRound1Test is VaultTestBase {
         assertLe(vault.lastPrice(), P0 * 12215 / 10_000);
     }
 
-    /// H-3 (venue-independent part): LP adds count against the same decaying turnover budget as swaps and must
-    /// quote within the band of the anchor. Range/value checks: see the fork tests.
+    /// H-3 (venue-independent part): LP adds count against the same decaying turnover budget as swaps (weighted by
+    /// their smaller loss bound, slippage instead of band + slippage) and must quote within the band of the anchor. Range/value checks: see the fork tests.
     function test_H3_AddsChargeTurnoverAndNeedAnchorBand() public {
         deposit(alice, M);
         settle(P0);
         vm.startPrank(keeper);
-        vault.addLiquidity(0, M, P0);
-        vault.removeLiquidity(0, M);
-        vault.addLiquidity(0, M, P0); // 2x NAV used
-        vault.removeLiquidity(0, M);
+        // an add is charged its paid value x slippage / (band + slippage) = 0.4 x M: five adds use the 2x NAV budget
+        for (uint256 i; i < 5; ++i) {
+            vault.addLiquidity(0, M, P0);
+            vault.removeLiquidity(0, M);
+        }
         vm.expectRevert(RiskBudgets.Turnover.selector);
         vault.addLiquidity(0, 1e6, P0);
         vm.stopPrank();

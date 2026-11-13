@@ -551,8 +551,10 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
     /// @dev Value of an LP add at the anchor: what the position is worth must be within `maxSlippageBps` of what the
     ///      vault paid, and the paid value counts against the turnover budget (an add is a swap in effect).
     function _checkAdd(uint256 got, uint256 paid) internal {
-        if (got * BPS < paid * (BPS - params.maxSlippageBps)) revert AddValue(got, paid);
-        _useTurnover(paid);
+        uint256 s = params.maxSlippageBps;
+        if (got * BPS < paid * (BPS - s)) revert AddValue(got, paid);
+        // turnover counts loss exposure in swap units (band + slippage per unit); an add can lose only `s` per unit
+        _useTurnover(Math.mulDiv(paid, s, s + params.poolBandBps, Math.Rounding.Ceil));
     }
 
     /// @dev Asset-denominated value at `price` of the asset and base the vault holds (raw balances).
