@@ -10,8 +10,8 @@ SCOPE
 - src/interfaces/IExternal.sol (26 lines).
 - script/Deploy.s.sol (wiring).
 solc 0.8.26, via-IR, optimizer runs 1, evm cancun (transient storage). OpenZeppelin 5.4.0, v4-core/periphery
-from lib/. NOT deployed. Vault runtime 24,041 bytes (EIP-170). Foundry: 61 unit/invariant tests +
-4 fork tests against the live pool.
+from lib/. NOT deployed. Vault runtime 24,041 bytes (EIP-170). Foundry: 61 unit/invariant + 4 fork
+tests.
 
 SOURCE
 Public repo link will be inserted: {{REPO_URL}} at commit {{COMMIT}}. README.md and DESIGN.md (threat model,
