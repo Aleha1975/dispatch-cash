@@ -15,6 +15,7 @@ remappings = [
   "forge-std/=lib/forge-std/src/",
 ]
 ignored_warnings_from = ["lib"]
+fs_permissions = [{ access = "read", path = "./test/fixtures" }]
 
 [profile.default.fuzz]
 runs = 256
