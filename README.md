@@ -11,8 +11,9 @@ strategy) a HYPE perp short on Hyperliquid. Nothing in this repo has been deploy
 | `src/LPVaultBase.sol` | Venue-independent core: ERC-20 shares, async deposit/redeem queues, settlement, performance fee + HWM, hedge margin, roles, pause, emergency wind-down. |
 | `src/UniV4LPVault.sol` | Venue for one fixed Uniswap v4 pool (no hooks): PositionManager mint/increase/decrease/collect/burn, swaps via `PoolManager.unlock`. |
 | `src/V4PositionMath.sol` | Linked library: pool price and position amounts (principal + unclaimed fees) read straight from PoolManager storage. |
+| `src/VaultTimelock.sol` | Vault owner: OZ `TimelockController` (48 h default, 24 h floor, no admin); operator multisig proposes/executes, operator + guardian cancel. |
 | `src/interfaces/IExternal.sol` | Minimal PositionManager / Permit2 / WHYPE interfaces. |
-| `script/Deploy.s.sol` | One vault per strategy (hedged or growth); not executed. |
+| `script/Deploy.s.sol` | Timelock (or reuse `TIMELOCK=`) + one vault per strategy (hedged or growth); not executed. |
 
 One deployment = one strategy. The UI lists vaults; e.g. `HYPE/USDC v4 hedged` (hedgeTreasury set, hedge cap 35%)
 and `HYPE/USDC v4 growth` (hedgeTreasury = 0, hedge cap 0). A Ramses CL vault later is another `LPVaultBase`
@@ -38,7 +39,7 @@ poolId `0xb303…65cc`; PoolManager `0xE2e1…23F1`, PositionManager `0x1d1C…E
 
 | Role | Can | Cannot |
 |---|---|---|
-| owner (multisig) | set keeper, guardian, fee recipient, parameters within hard caps; unpause | move funds, change pool, asset, hedgeTreasury (immutable) |
+| owner = `VaultTimelock` (operator multisig proposes, 48 h delay) | set keeper, guardian, fee recipient, parameters within hard caps; unpause; all only after the delay, cancellable by operator or guardian | move funds, change pool, asset, hedgeTreasury (immutable) |
 | keeper (hot key) | `settle`; mint/increase/decrease/burn positions in the fixed pool (recipient always the vault); swap through the fixed pool with min-out; send margin to `hedgeTreasury` up to `hedgeCapBps` of NAV; pull margin back | send tokens anywhere else; spend queued deposits or unpaid claims; settle outside the pool price band; jump hedge equity > `hedgeStepBps`/day |
 | guardian | pause (new deposits, mints, increases, swaps, hedge sends); co-confirm one exact large hedge equity value per epoch | unpause, move funds, change params |
 | anyone | `emergencyUnwind()` after 72 h without settlement | anything before that |
@@ -51,8 +52,8 @@ reference drift <= 30%, swap turnover <= 5x NAV per rolling day. Defaults: fee 1
 hedge step 5%/day, drift 10%, turnover 2x.
 
 Trust assumptions: the keeper reports the HYPE price and the off-chain hedge equity (bounded as above); the operator
-holds the Hyperliquid account behind `hedgeTreasury`; the owner is a multisig (a timelock is recommended before
-launch); Uniswap v4 PoolManager/PositionManager/Permit2 and the bridged USDC are trusted.
+holds the Hyperliquid account behind `hedgeTreasury`; the owner is `VaultTimelock` driven by the operator multisig
+(every config change is public for >= 48 h before it applies, so holders can exit first); Uniswap v4 PoolManager/PositionManager/Permit2 and the bridged USDC are trusted.
 
 ## NAV and fees
 

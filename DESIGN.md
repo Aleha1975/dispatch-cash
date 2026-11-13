@@ -35,8 +35,8 @@ transaction each way (redemptions are pushed).
 | 10 | Redeemer that cannot receive USDC blocks the queue | `trySafeTransfer`; failure credits `claimable` | none |
 | 11 | Queue spam | Keeper processes `maxDeposits`/`maxRedeems` per call; cancelled entries skipped | Gas cost to the keeper; `minDeposit` (<= 100 USDC) only for deposits |
 | 12 | Guardian abuse | Guardian can only pause risk-increasing actions and approve one hedge value per epoch; cannot unpause or move funds | A malicious pause stops new deposits only |
-| 13 | Owner key stolen | Cannot move funds; can swap keeper, widen params up to hard caps (band 5%, slippage 5%, turnover 5x) | Recommend a timelock on owner actions before TVL grows |
-| 14 | Fee rate raised retroactively | Capped at 20%; applies from the next settlement to gains above the HWM | Gains between the last settlement and the change are charged at the new rate |
+| 13 | Owner key stolen | Owner is `VaultTimelock`: every change waits >= 48 h (floor 24 h, the delay itself timelocked); guardian can cancel; guardian pause is instant. Cannot move funds in any case | After the delay: keeper swap, params up to hard caps. Guardian cannot cancel ops on the timelock itself (role/delay changes), so a rogue guardian cannot veto its own removal; a rogue operator can therefore remove the guardian's cancel right, but only with 48 h notice |
+| 14 | Fee rate raised retroactively | Capped at 20%; timelocked 48 h; applies from the next settlement to gains above the HWM | Gains between the last settlement and the change are charged at the new rate |
 | 15 | Permit front-running | `permit` in try/catch; proceeds if allowance exists | none |
 | 16 | Stuck positions in emergency | Per-position try/catch; `emergencyUnwind` can be re-called | Value in a position that never unwinds is excluded from in-kind payouts |
 
@@ -58,7 +58,9 @@ transaction each way (redemptions are pushed).
 ## Open items before launch
 
 1. External audit; fuzz on fork with real HL-pool divergence data.
-2. Owner timelock (e.g. OZ TimelockController) and multisig guardian bot that checks HL equity independently.
+2. Multisig guardian bot that checks HL equity independently and watches `VaultTimelock` `CallScheduled` events.
+   (Owner timelock: done, `src/VaultTimelock.sol`.) Unpause is timelocked too, which is intentional: an owner-key
+   thief cannot lift a guardian pause instantly; pause never blocks exits.
 3. Elysium RPC/sequencer: v4 already requires Cancun (TSTORE) there; the vault uses transient reentrancy guard too.
 4. Keeper must keep enough idle USDC buffer (e.g. 5-10% NAV) so routine redemptions settle without unwinding.
 5. Ramses CL subclass (v3-style NPM: `positions()` view, `collect`, WHYPE ERC-20 base).
