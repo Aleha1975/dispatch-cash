@@ -1,0 +1,121 @@
+Elysium LP smart accounts: per-client MetaMask Delegation Framework accounts managed through one module, with a custom custody caveat enforcer - audit round 1
+
+SCOPE
+- src/sa/ElysiumCustodyEnforcer.sol: ICaveatEnforcer (Delegation Framework v1.3.0) signed by every client. Decodes
+  PositionManager.modifyLiquidities (v4 action list), SwapExecutor.swap, Permit2.approve, ERC-20 approve/transfer;
+  default deny; stateful %-limits for hedge-margin and fee transfers.
+- src/sa/LPManagerModule.sol: the keeper's only delegate. Builds every execution itself (owner / recipient = client
+  account), redeems through the DelegationManager; global price anchor, per-account budgets, hedge margin and hedge
+  equity, per-account HWM fee, onboarding, pause, multicall.
+- src/sa/SALib.sol: external linked library (delegation shape check, account kind, HWM fee, execution builders,
+  contribution flows, LP-add check).
+- src/sa/SwapExecutor.sol: v4 unlock-callback router paying only msg.sender.
+- src/sa/vendor/DelegationFramework.sol: vendored v1.3.0 types and interfaces (check against the tag).
+- Reused, already audited in vault round 1 (re-check only their use here): src/V4PositionMath.sol,
+  src/RiskBudgets.sol, src/VaultTimelock.sol.
+- script/DeploySA.s.sol (wiring; canonical CREATE2 deploys of HybridDeleGatorImpl / SimpleFactory from
+  test/fixtures/delegation-framework-v1.3.0).
+solc 0.8.26, via-IR, optimizer runs 1, evm cancun (transient storage). OpenZeppelin 5.4.0, v4-core/periphery from lib/.
+NOT deployed. Runtime: module 23,947 B, enforcer 7,529 B, SALib 8,065 B, SwapExecutor 3,402 B. Foundry: 26 enforcer +
+31 module + 3 fork tests (SA), 85 pre-existing vault tests; keeper (Python) unit + anvil-fork e2e.
+
+SOURCE
+Public repo link will be inserted: {{REPO_URL}} at commit {{COMMIT}}. docs/SMART_ACCOUNT_DESIGN.md (section 6 is the as-built
+design) and docs/audit/round1_report_1222.md (vault round 1, whose constraints are carried over) are part of the submission.
+
+CHAIN CONTEXT
+Elysium mainnet, chain id 99901, Arbitrum Orbit (Nitro) L2, native gas token HYPE, Prague/7702 active. Pool: PoolKey(native
+HYPE, USDC 0xb47c4C8F73F009CC0C0d3f92B388d13E293F0B65, fee 3000, tickSpacing 60, hooks 0), poolId
+0xb3032695ffb0a66e6342876dd2386835471466cb2bb70f341947d98a69e265cc. PoolManager 0xE2e105d3F7209A9DA11f83cCf3E7398a753823F1,
+PositionManager 0x1d1C51b9d07fD27d36412A2b66CC23D19Eb3E518, Permit2 0x000000000022D473030F116dDEE9F6B43aC78BA3.
+Delegation Framework v1.3.0 at canonical addresses: DelegationManager 0xdb9B1e94B5b69Df7e401DDbedE43491141047dB3 (owner can
+pause redemptions), EIP7702StatelessDeleGator 0x63c0c19a282a1B52b07dD5a65b58948A07DAE32B, TimestampEnforcer
+0x1046bb45C8d673d4ea75321280DB34899413c069 (live); HybridDeleGatorImpl 0x48dBe696A4D990079e039489bA2053B36E8FFEC4 and
+SimpleFactory 0x69Aa2f9fe1572F1B640E1bbc512f5c3a734fc77c (deployed by us via CREATE2). EntryPoint v0.7
+0x0000000071727De22E5E9d8BAf0edAc6f37da032. Pool depth is a few hundred thousand USD.
+
+DESIGN IN ONE PARAGRAPH
+Each client owns a smart account: a HybridDeleGator proxy owned by its EOA (deployed by our relayer) or its EOA upgraded
+with EIP-7702 to the MetaMask delegator. The client signs ONE root delegation account -> LPManagerModule with two caveats:
+ElysiumCustodyEnforcer(terms = module, hedgeTreasury, feeRecipient) and TimestampEnforcer(expiry). The keeper calls the
+module; the module builds single-call executions (approvals, PositionManager actions, SwapExecutor swaps, USDC transfers to
+the hedge treasury / fee recipient) and redeems them via DelegationManager.redeemDelegations. The module measures client
+contributions on-chain (any balance or position-liquidity change between two module actions is a client flow), values the
+account at a global price anchor, and charges 15% of profit above each account's HWM. Hedge margin (<= 35% of account value)
+goes to an operator treasury that funds ONE Hyperliquid short for all clients; an off-chain ledger splits it, and the
+module only accepts per-account hedge-equity decreases from the keeper (increases need the guardian). The client exits with
+one transaction (revoke the delegation + burn positions into its account); nothing in the module can block that.
+
+TRUST MODEL AND ROLES
+- client: owns the account, every token and every position NFT; can act directly and revoke at any time.
+- module owner = VaultTimelock (48 h default, floor 24 h): keeper/guardian rotation, params within hard caps, unpause.
+  Cannot move client funds; enforcer, treasury, fee recipient, pool, executor are immutable.
+- keeper (hot key): every module action within the on-chain budgets. Never submits raw executions.
+- guardian: pause (stops mints, increases, swaps, fees, anchor movement; never decreases, burns, margin moves or client
+  actions), price-range and per-account hedge-equity co-signatures.
+- relayer: deploys accounts and calls onboard (permissionless function).
+- hedgeTreasury / feeRecipient: operator addresses; the hedge treasury approves the module so margin can be returned.
+- DelegationManager owner (third party): can pause redemptions (halts management, never client exits).
+
+OUT OF SCOPE (INTENTIONAL)
+- Keeper honesty within the bounds (price inside the band, swap timing, hedge equity inside the daily budget).
+- Hyperliquid, the bridge, the treasury's custody, the off-chain ledger's arithmetic (keeper/), web/.
+- Uniswap v4, Permit2, USDC, the Delegation Framework itself (but its INTERACTION with our enforcer and module is in scope).
+
+FOCUS 1: ENFORCER v4 DECODING
+1. Can any calldata accepted by beforeHook make PositionManager send tokens, native HYPE or a position NFT anywhere but the
+   delegator, or touch a pool other than the fixed one? Consider: action codes outside the list, MSG_SENDER / ADDRESS_THIS
+   sentinels, CLOSE_CURRENCY / SWEEP interplay, native value left in PositionManager, deltas from one action consumed by
+   another, ownerOf races inside the same unlock, tokenIds minted in the same call, positions in foreign pools.
+2. Is "canonical encoding" (re-encode and compare) complete: dirty high bits, overlapping offsets, trailing bytes, length
+   mismatches between actions and params, nested bytes in hookData, the outer modifyLiquidities calldata and deadline?
+3. Does abi.decode in the enforcer interpret every params blob exactly like v4-periphery's CalldataDecoder does (which reads
+   calldata with assembly and does not re-encode)? Any blob both accept with different meanings is a finding.
+4. Permit2 / ERC-20 approvals: can a same-block allowance survive into a later redemption, or be used by a third party in
+   the same transaction (SwapExecutor callback, PositionManager unlock)? Expiration 0 semantics.
+5. Stateful limits: hedge 35% per decaying day of idle USDC and fee 20% once per 7 days. Can they be reset or multiplied
+   (balance inflation by a flash transfer in the same batch, several delegations for one delegator, afterHook absence)?
+
+FOCUS 2: DELEGATION SCOPE
+6. Is the module truly the only way to exercise the delegation (redeemer check, delegate check, terms binding), and can a
+   second delegation by the same client, a redelegation, or a delegation with extra caveats widen what the keeper can do?
+7. register / onboard: can anyone register a malicious delegation for someone else's account, redirect a permit, poison
+   permissionContext, or block a client's re-registration? Account-kind detection (proxy getImplementation, 7702
+   designator) and ERC-1271 signature checks.
+8. Exit: is "revoke + burn" always possible in one transaction for both account kinds, including while the module or the
+   DM is paused, with many positions, or with a position the keeper is about to touch in the same block?
+9. EIP-7702 accounts: anything the EOA owner or a re-delegation of the EOA to another implementation can do to the
+   module's bookkeeping (kind changes after registration).
+
+FOCUS 3: FEE AND HEDGE LEDGER
+10. Contribution flows (_sync/_snap): can a client, a donor or the keeper make a gain look like a contribution or a
+    contribution look like a gain (fee theft or fee avoidance beyond the documented leakage)? Positions dropped when not
+    owned, positions burned by the client, uncollected fees, HYPE valued at the anchor vs the pool.
+11. HWM fee: exactness and rounding; interplay with hedge equity (reported value enters profit), anchor clipping, the 20%
+    idle cap and the enforcer's once-per-7-days rule.
+12. Hedge: cap on max(hedgeEquity, netMargin), keeper-only decreases, guardian approvals bound to account/epoch/value/expiry
+    and cleared by margin moves (vault round 1 H-1, M-2, M-5). returnHedgeMargin destination after revoke/expiry.
+    Can one client's hedge accounting affect another's (shared treasury allowance, shared anchor)?
+
+THE SEVEN LENSES THAT DID NOT RUN IN VAULT ROUND 1 (please run all of them here)
+Vault round 1 lost the economic-security, execution-trace, periphery, first-principles, asymmetry, boundary and flow-gap
+agents (see docs/audit/round1_report_1222.md, coverage caveat). For this codebase:
+- economic-security: price-band and anchor extraction per account and across accounts, sandwiching keeper swaps / LP adds
+  within band + slippage, turnover budget as a loss bound, cost of manipulating the shared anchor vs gain.
+- execution-trace: full traces of redeemDelegations -> beforeAllHook/beforeHook -> executeFromExecutor ->
+  PositionManager/PoolManager unlock -> SwapExecutor callback; reentrancy across the module's transient guard, the DM
+  and the account; multicall self-delegatecall.
+- periphery: native HYPE plumbing (msg.value, SWEEP, settle with sync, refunds), Permit2 sub-allowances, EntryPoint v0.7
+  zero-fee user operations, SimpleFactory/CREATE2 assumptions, the vendored interfaces vs the deployed bytecode.
+- first-principles: what must hold for "tokens only ever go to the account, the pool, the treasury (<= cap) or the fee
+  recipient (<= fee)"; find any path the two layers (module build + enforcer check) both miss.
+- asymmetry: mint vs burn, sell vs buy, send vs return margin, register vs re-register, hybrid vs 7702, paused vs not;
+  any check present on one side only.
+- boundary: zero amounts, MAX_POSITIONS, uint128 liquidity, int24 ticks at the range ends, expiry exactly now, fee
+  interval exactly elapsed, 35%/20% exactly reached, empty permissionContext, accounts with no code.
+- flow-gap: money flows that bypass _sync/_snap bookkeeping (direct transfers in the same block as a keeper action,
+  donations, positions transferred in, NFTs received from a third party, hedge margin returned to an EOA).
+
+DELIVERABLE
+Findings with severity, a concrete trace or test, and the smallest fix. Note explicitly which lenses ran and which areas
+received less coverage.

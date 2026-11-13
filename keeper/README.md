@@ -101,3 +101,24 @@ Secrets are never in code or config: `ELYSIUM_KEEPER_KEYSTORE_PASSWORD`, `ELYSIU
 range, half-width/vol, hedge (target/short/delta%), margin (plan/capital/treasury/in-transit), crash guard, queues,
 holdings, the last actions and the last alerts. `ok` turns false on step errors, when the last settlement is older
 than 3h, or when the last tick is older than 5 loop intervals.
+
+## Per-client smart accounts (`sa-*` commands, branch `smart-account`)
+
+One process drives every client account through `LPManagerModule` (design: `../docs/SMART_ACCOUNT_DESIGN.md`, section 6).
+
+| Path | Role |
+|---|---|
+| `elysium_keeper/sa_keeper.py` | Per-account tick (re-read each account from the chain, staggered): margin first, LP, fee, hedge target, hedge-equity report; exited accounts are wound down |
+| `elysium_keeper/sa_chain.py` | Module reader, EIP-712 payloads (delegation, permit, user operation), counterfactual HybridDeleGator address, relayer (deploy + onboard in one Multicall3 tx) |
+| `elysium_keeper/ledger.py` | Per-client split of the one HL short and its margin (mark-to-market, netted fills, reconciliation) |
+| `abi/LPManagerModule.json` | Module ABI (+ SALib / RiskBudgets / enforcer / executor / DM errors for decoding) |
+
+```
+python3 -m elysium_keeper sa-run     --config sa.json [--once]
+python3 -m elysium_keeper sa-status  --config sa.json                  # read only
+python3 -m elysium_keeper sa-onboard --config sa.json --request r.json # relayer, one request
+```
+Config: the usual `chain` / `strategy` / `hl` sections plus `sa: {module, accounts, discover_from_block, stagger_s,
+margin_frac, buffer_bps, ledger_path, requests_dir}`. HL stays `dry_run` by default; the `unlocked` signer is local only and
+`keystore` needs `chain.allow_live_chain`. Tests: `tests/test_sa_unit.py`; `ELYSIUM_FORK=1 python3 -m pytest -s
+tests/test_sa_e2e_fork.py` (anvil fork, deploys with `script/DeploySA.s.sol`, nothing broadcast outside the fork).

@@ -101,6 +101,9 @@ with `returnHedgeMargin`; it then accrues to shares still outstanding, so holder
 
 ## Client web page (`web/`)
 
+Per-client smart accounts have their own page, `web/account.html` (config in `web/config.js` `smartAccount`; `?mock=1`
+walks through onboarding, the account view and the exit without a wallet). See `docs/SMART_ACCOUNT_DESIGN.md` section 6.
+
 Static page, no build step: `index.html` (markup + CSS), `app.js` (vanilla JS + viem 2.21.54 from jsDelivr),
 `config.js` (chain, USDC, strategy list: fill `vault` and `deployBlock` after deployment), `mock/status.json`.
 Serve the folder as-is (e.g. `python3 -m http.server -d web 8787`).
