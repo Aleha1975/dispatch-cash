@@ -133,6 +133,8 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
 
     uint256 public approvedHedgeEquity;
     uint256 public approvedHedgeEpoch; // epoch + 1 when set (0 = none)
+    uint256 public hedgeDriftStart; // rolling-day window for reported hedge equity drift
+    uint256 public hedgeDriftUsed;
 
     // ------------------------------------------------------------------ events
     event DepositRequested(uint256 indexed id, address indexed owner, uint256 assets);
@@ -146,7 +148,7 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
     event HedgeMarginSent(uint256 amount, uint256 hedgeEquity);
     event HedgeMarginReturned(uint256 amount, uint256 hedgeEquity);
     event HedgeEquityApproved(uint256 indexed epoch, uint256 value);
-    event Paused(bool paused, address by);
+    event Paused(bool paused, address indexed by);
     event EmergencyUnwind(address indexed by);
     event EmergencyRedeemed(address indexed owner, address to, uint256 shares, uint256 assetOut, uint256 baseOut, uint256 wrappedOut);
     event ParamsSet(Params p);
@@ -473,11 +475,22 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
         if (diff * BPS > price * params.poolBandBps) revert PoolPriceOff(p, price);
     }
 
+    /// @dev The reported off-chain equity may drift (in absolute terms, summed) by at most `hedgeStepBps` of the last
+    ///      NAV per rolling day, so a compromised keeper cannot compound small jumps over many quick settlements.
+    ///      Larger moves need the guardian's exact co-confirmation for this epoch (which does not consume budget).
     function _checkHedgeEquity(uint256 v) internal {
         uint256 old = hedgeEquity;
         uint256 diff = v > old ? v - old : old - v;
         if (diff == 0) return;
-        if (diff * BPS <= lastNav * params.hedgeStepBps) return;
+        if (block.timestamp >= hedgeDriftStart + 1 days) {
+            hedgeDriftStart = block.timestamp;
+            hedgeDriftUsed = 0;
+        }
+        uint256 used = hedgeDriftUsed + diff;
+        if (used * BPS <= lastNav * params.hedgeStepBps) {
+            hedgeDriftUsed = used;
+            return;
+        }
         if (approvedHedgeEpoch == epoch + 1 && approvedHedgeEquity == v) {
             approvedHedgeEpoch = 0;
             return;

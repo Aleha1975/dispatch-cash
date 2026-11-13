@@ -350,6 +350,23 @@ contract LPVaultBaseTest is VaultTestBase {
         assertEq(vault.approvedHedgeEpoch(), 0);
     }
 
+    function test_HedgeEquityDriftBudgetIsPerRollingDay() public {
+        deposit(alice, 100_000e6);
+        settle(P0);
+        vm.prank(keeper);
+        vault.sendHedgeMargin(30_000e6);
+        settle(P0, 33_000e6); // +3% of NAV
+        uint256 nav = vault.lastNav();
+        LPVaultBase.Report memory r = report(P0, 33_000e6 + nav * 3 / 100); // another +3%: 6% > 5% in one day
+        vm.prank(keeper);
+        vm.expectRevert();
+        vault.settle(r);
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(keeper);
+        vault.settle(r);
+        assertEq(vault.hedgeEquity(), 33_000e6 + nav * 3 / 100);
+    }
+
     function test_UnhedgedVaultCannotSendMargin() public {
         MockLPVault v = new MockLPVault(config(address(0)), P0);
         vm.prank(keeper);

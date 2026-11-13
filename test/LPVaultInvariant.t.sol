@@ -93,7 +93,7 @@ contract VaultHandler is Test {
             vault.simulateLp(vault.lpBase(), lpA * lpPnlBps / 10_000);
         }
         uint256 h = vault.hedgeEquity();
-        uint256 step = vault.lastNav() * 400 / 10_000;
+        uint256 step = vault.lastNav() * 100 / 10_000;
         hedgeMoveBps = bound(hedgeMoveBps, -10_000, 10_000);
         uint256 d = Math.mulDiv(step, uint256(hedgeMoveBps < 0 ? -hedgeMoveBps : hedgeMoveBps), 10_000);
         h = hedgeMoveBps < 0 ? (h > d ? h - d : 0) : h + d;
