@@ -118,7 +118,8 @@ def make_keeper(fork, tmp, module, hl, alerts, name="sa"):
         "chain": {"rpc_url": fork.url, "keeper": KEEPER, "signer": "unlocked"},
         "hl": {"adapter": "dry_run", "equity_source": "mock"},
         "sa": {"module": module, "discover_from_block": int(fork.rpc.call("eth_blockNumber"), 16) - 50,
-               "stagger_s": 0, "ledger_path": os.path.join(tmp, "ledger.json")},
+               "stagger_s": 0, "ledger_path": os.path.join(tmp, "ledger.json"),
+               "requests_dir": os.path.join(tmp, "requests")},
         "state_path": os.path.join(tmp, "sa.state.json"),
         "log_path": os.path.join(tmp, "sa.log"),
     })
@@ -128,7 +129,7 @@ def make_keeper(fork, tmp, module, hl, alerts, name="sa"):
     return SAKeeper(cfg, hl_info=hl, adapter=adapter, log=log, alert_sink=lambda lvl, t: alerts.append((lvl, t)))
 
 
-def onboard(fork, k, module_addr, pk: bytes, usd: int) -> str:
+def onboard(fork, k, module_addr, pk: bytes, usd: int, via_dir: str | None = None):
     acct = Account.from_key(pk)
     owner = acct.address
     fork.deal_usdc(owner, usd * E6)
@@ -151,6 +152,11 @@ def onboard(fork, k, module_addr, pk: bytes, usd: int) -> str:
            "permit": {"amount": usd * E6, "deadline": deadline, "v": sig.v, "r": hex(sig.r), "s": hex(sig.s)}}
     req["permit"]["r"] = "0x" + sig.r.to_bytes(32, "big").hex()
     req["permit"]["s"] = "0x" + sig.s.to_bytes(32, "big").hex()
+    if via_dir:  # the web backend drops the request; the keeper's relayer picks it up on its next tick
+        os.makedirs(via_dir, exist_ok=True)
+        with open(os.path.join(via_dir, f"{owner}.json"), "w") as fh:
+            json.dump(req, fh)
+        return a, d
     acct_addr, _ = Relayer(k.r, k.chain, 99901, k.log).onboard(json.loads(json.dumps(req)))
     assert acct_addr == a
     assert int(fork.rpc.call("eth_getTransactionCount", [owner, "latest"]), 16) == 0, "client sent nothing"
@@ -209,12 +215,13 @@ def test_sa_end_to_end(env):
 
     pk1, pk2 = keccak(text="sa-e2e-alice"), keccak(text="sa-e2e-bob")
     a1, d1 = onboard(fork, k, module, pk1, 3000)
-    a2, d2 = onboard(fork, k, module, pk2, 1500)
+    a2, d2 = onboard(fork, k, module, pk2, 1500, via_dir=k.sa.requests_dir)
     assert usdc.call("balanceOf", a1) == 3000 * E6
 
-    # first tick: margin, swap, mint for both; one netted short
+    # first tick: relayer onboards client 2 from the request queue; margin, swap, mint for both; one netted short
     st = k.tick()
     assert not st["errors"], st["errors"]
+    assert os.listdir(os.path.join(k.sa.requests_dir, "done")) and usdc.call("balanceOf", a2) < 1500 * E6
     for a, usd in ((a1, 3000), (a2, 1500)):
         row = st["accounts"][a]
         assert len(row["positions"]) == 1, row

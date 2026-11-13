@@ -18,6 +18,7 @@ simulation, the event-scan cursor and fee records.
 """
 from __future__ import annotations
 
+import json
 import os
 import signal
 import threading
@@ -401,6 +402,33 @@ class SAKeeper:
         self.status["hedge"] = {"target_short": round(target, 4), "short": -self.adapter.position(),
                                 "ledger_short": round(self.ledger.total_short(), 4), "adapter": self.adapter.name}
 
+    # ------------------------------------------------------------ relayer queue
+    def process_requests(self):
+        """Onboarding requests dropped by the web backend into sa.requests_dir (*.json): each is checked, simulated
+        and sent (Relayer), then moved to done/ or failed/ with the outcome. Needs an anchor (first tick reports)."""
+        d = self.sa.requests_dir
+        if not d or not os.path.isdir(d):
+            return
+        from .sa_chain import Relayer
+
+        rel = Relayer(self.r, self.chain, self.cfg.chain.chain_id, self.log)
+        for name in sorted(os.listdir(d)):
+            if not name.endswith(".json"):
+                continue
+            path = os.path.join(d, name)
+            try:
+                with open(path) as fh:
+                    req = json.load(fh)
+                acct, _ = rel.onboard(req)
+                out, res = "done", {"account": acct}
+            except Exception as e:  # bad signature, expired permit, already registered...
+                out, res = "failed", {"error": str(e)}
+                self.alert("warn", f"onboard_{name}", f"onboarding request {name} failed: {e}")
+            os.makedirs(os.path.join(d, out), exist_ok=True)
+            with open(os.path.join(d, out, name), "w") as fh:
+                json.dump({"request": req if out == "done" else None, "result": res}, fh)
+            os.remove(path)
+
     # ------------------------------------------------------------ tick
     def tick(self) -> dict:
         t0 = time.time()
@@ -408,6 +436,10 @@ class SAKeeper:
         errors: list[str] = []
         self.ledger.mark_to_market(self.info.mid(self.cfg.hl.coin))
         price, g = self.anchor(now)
+        try:
+            self.process_requests()
+        except Exception as e:
+            errors.append(f"relayer: {e}")
         hw = self.half_width(now, self.info.mid(self.cfg.hl.coin))
         rows = {}
         for a in self.accounts():
