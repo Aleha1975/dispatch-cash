@@ -256,6 +256,8 @@ abstract contract SATestBase is Test {
             timestampEnforcer: TIMESTAMP_ENFORCER,
             hybridImpl: HYBRID_IMPL,
             eip7702Impl: EIP7702_IMPL,
+            factory: SIMPLE_FACTORY,
+            accountSalt: ACCOUNT_SALT,
             poolManager: PM,
             positionManager: POSM,
             permit2: PERMIT2,
@@ -449,12 +451,19 @@ abstract contract SATestBase is Test {
     }
 
     // ------------------------------------------------------------------ client exit
+    /// ERC-7579 batch call, TRY exec type: a failing leg does not undo the others (audit SA-1 M-8).
+    ModeCode internal constant BATCH_TRY = ModeCode.wrap(bytes32((uint256(1) << 248) | (uint256(1) << 240)));
+
+    /// Exit batch: revoke at the module (cannot fail for the account itself), disable the delegation at the DM, then
+    /// burn every tracked position into `to` with zero minimums. Run in TRY mode: a burn that fails (a racing keeper
+    /// burn, a subscriber, a pool move) cannot undo the revocation.
     function _exitExecs(address a, Delegation memory d, address to) internal view returns (Execution[] memory xs) {
         V4PositionMath.Position[] memory ps = module.positionsOf(a);
-        xs = new Execution[](1 + ps.length);
-        xs[0] = Execution(DM_ADDR, 0, abi.encodeCall(IDelegationManager.disableDelegation, (d)));
+        xs = new Execution[](2 + ps.length);
+        xs[0] = Execution(address(module), 0, abi.encodeCall(LPManagerModule.revoke, (a)));
+        xs[1] = Execution(DM_ADDR, 0, abi.encodeCall(IDelegationManager.disableDelegation, (d)));
         for (uint256 i; i < ps.length; ++i) {
-            xs[1 + i] = Execution(
+            xs[2 + i] = Execution(
                 POSM_ADDR,
                 0,
                 abi.encodeCall(
@@ -466,10 +475,10 @@ abstract contract SATestBase is Test {
     }
 
     /// Hybrid exit: ONE transaction from the client EOA (EntryPoint.handleOps with a zero-fee userOp the EOA signed as
-    /// EIP-712 typed data): revoke the delegation and burn every position into `to`.
+    /// EIP-712 typed data): revoke, disable the delegation and burn every position into `to` (TRY mode). The result
+    /// is verified by state (isActive, disabledDelegations), never by the transaction status.
     function _exitHybrid(uint256 pk, address a, Delegation memory d, address to) internal {
-        bytes memory callData =
-            abi.encodeCall(IDeleGatorCore.execute, (DelegationFramework.BATCH_DEFAULT, abi.encode(_exitExecs(a, d, to))));
+        bytes memory callData = abi.encodeCall(IDeleGatorCore.execute, (BATCH_TRY, abi.encode(_exitExecs(a, d, to))));
         PackedUserOperation memory op = PackedUserOperation({
             sender: a,
             nonce: IEntryPointV07(ENTRYPOINT).getNonce(a, 0),
@@ -495,7 +504,7 @@ abstract contract SATestBase is Test {
     function _exit7702(address eoa, Delegation memory d, address to) internal {
         bytes memory xs = abi.encode(_exitExecs(eoa, d, to));
         vm.prank(eoa, eoa);
-        IDeleGatorCore(eoa).execute(DelegationFramework.BATCH_DEFAULT, xs);
+        IDeleGatorCore(eoa).execute(BATCH_TRY, xs);
     }
 
     // ------------------------------------------------------------------ keeper flows
@@ -513,4 +522,80 @@ abstract contract SATestBase is Test {
         vm.prank(keeper);
         module.swap(a, false, usd, p);
     }
+
+    // ------------------------------------------------------------------ test helpers
+    function _acct(address a) internal view returns (SALib.Account memory) {
+        return module.account(a);
+    }
+
+    function _turnoverUsed(address a) internal view returns (uint256 u) {
+        (u,,) = module.windows(a);
+    }
+
+    function _profit(address a) internal view returns (int256) {
+        return int256(module.accountValue(a, module.lastPrice())) - _acct(a).contributed;
+    }
+
+    /// Onboard, buy ~40% HYPE, mint ±3%.
+    function _invested(uint256 pk, uint256 usd) internal returns (address a, Delegation memory d, uint256 id) {
+        (a, d) = _onboardHybrid(pk, usd);
+        _buyBase(a, usd * 2 / 5);
+        id = _mintAll(a);
+    }
+
+    function _syncTouch(address a) internal {
+        // decrease(0) = fee collect: a module action that syncs flows; allowed in every state
+        V4PositionMath.Position[] memory ps = module.positionsOf(a);
+        uint256 p = poolPrice();
+        vm.prank(keeper);
+        if (ps.length > 0) module.decreasePosition(a, ps[0].tokenId, 0, 0, 0);
+        else module.swap(a, false, 1e6, p);
+    }
+
+    function _schedule(address target, bytes memory data) internal {
+        vm.prank(operator);
+        timelock.schedule(target, 0, data, bytes32(0), bytes32(0), 2 days);
+        vm.warp(vm.getBlockTimestamp() + 2 days + 1);
+        vm.prank(operator);
+        timelock.execute(target, 0, data, bytes32(0), bytes32(0));
+    }
+
+    /// The client (owner EOA) runs executions on its HybridDeleGator with one EntryPoint transaction.
+    function _clientExecMode(uint256 pk, address a, Execution[] memory xs, ModeCode mode) internal {
+        bytes memory callData = abi.encodeCall(IDeleGatorCore.execute, (mode, abi.encode(xs)));
+        PackedUserOperation memory op = PackedUserOperation(
+            a,
+            IEntryPointV07(ENTRYPOINT).getNonce(a, 0),
+            "",
+            callData,
+            bytes32((uint256(300_000) << 128) | uint256(2_000_000)),
+            0,
+            bytes32(0),
+            "",
+            ""
+        );
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, IDeleGatorUserOp(a).getPackedUserOperationTypedDataHash(op));
+        op.signature = abi.encodePacked(r, s, v);
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = op;
+        address eoa = vm.addr(pk);
+        vm.prank(eoa, eoa);
+        IEntryPointV07(ENTRYPOINT).handleOps(ops, payable(eoa));
+    }
+
+    function _clientExec(uint256 pk, address a, Execution[] memory xs) internal {
+        _clientExecMode(pk, a, xs, DelegationFramework.BATCH_DEFAULT);
+    }
+
+    function _clientExec1(uint256 pk, address a, address target, uint256 value, bytes memory data) internal {
+        Execution[] memory xs = new Execution[](1);
+        xs[0] = Execution(target, value, data);
+        _clientExec(pk, a, xs);
+    }
+
+    function _reportEquity(address a, uint256 v) internal {
+        vm.prank(keeper);
+        module.reportHedgeEquity(a, v);
+    }
+
 }

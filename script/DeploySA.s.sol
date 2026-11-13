@@ -89,6 +89,8 @@ contract DeploySA is Script {
                 timestampEnforcer: TIMESTAMP_ENFORCER,
                 hybridImpl: HYBRID_IMPL,
                 eip7702Impl: EIP7702_IMPL,
+                factory: SIMPLE_FACTORY,
+                accountSalt: bytes32("ELYSIUM-LP-V1"),
                 poolManager: IPoolManager(PM),
                 positionManager: IPositionManagerMin(POSM),
                 permit2: PERMIT2,

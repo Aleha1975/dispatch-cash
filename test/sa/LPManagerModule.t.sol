@@ -3,104 +3,19 @@ pragma solidity 0.8.26;
 
 import "./SATestBase.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {RiskBudgets} from "../../src/RiskBudgets.sol";
+import {SAWindow} from "../../src/sa/SAWindow.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 /// LPManagerModule on the offline replica (real v4 + Delegation Framework bytecode): onboarding, keeper actions,
-/// per-account budgets (audit-1 constraints H-1, H-2, H-3, M-2, M-5, M-6, L-13, L-15), HWM fee, client exit.
+/// per-account budgets, HWM fee, client exit. Audit regressions are in SARegressions.t.sol.
 contract LPManagerModuleTest is SATestBase {
     uint256 internal constant ALICE_PK = uint256(keccak256("alice"));
     uint256 internal constant BOB_PK = uint256(keccak256("bob"));
     uint256 internal constant CAROL_PK = uint256(keccak256("carol"));
     address internal attacker = makeAddr("attacker");
 
-    function setUp() public {
+    function setUp() public virtual {
         _setUpEnv(false);
-    }
-
-    // ------------------------------------------------------------------ helpers
-    function _acct(address a) internal view returns (LPManagerModule.Account memory s) {
-        (
-            s.delegationHash,
-            s.kind,
-            s.until,
-            s.contributed,
-            s.hwm,
-            s.hedgeEquity,
-            s.netMargin,
-            s.hedgeEpoch,
-            s.snapAsset,
-            s.snapBase,
-            s.lastFeeTime,
-            s.feesPaid
-        ) = module.accounts(a);
-    }
-
-    function _budgets(address a) internal view returns (RiskBudgets.Budgets memory b) {
-        (
-            b.priceUsed,
-            b.priceTime,
-            b.hedgeUsed,
-            b.hedgeTime,
-            b.turnoverUsed,
-            b.turnoverTime,
-            b.hedgeApproved,
-            b.hedgeApprovedEpoch,
-            b.hedgeApprovedUntil,
-            b.priceApprovedLo,
-            b.priceApprovedHi,
-            b.priceApprovedUntil
-        ) = module.budgets(a);
-    }
-
-    function _profit(address a) internal view returns (int256) {
-        return int256(module.accountValue(a, module.lastPrice())) - _acct(a).contributed;
-    }
-
-    /// Onboard, buy ~40% HYPE, mint ±3%.
-    function _invested(uint256 pk, uint256 usd) internal returns (address a, Delegation memory d, uint256 id) {
-        (a, d) = _onboardHybrid(pk, usd);
-        _buyBase(a, usd * 2 / 5);
-        id = _mintAll(a);
-    }
-
-    function _syncTouch(address a) internal {
-        // decrease(0) = fee collect: a module action that syncs flows; allowed in every state
-        V4PositionMath.Position[] memory ps = module.positionsOf(a);
-        uint256 p = poolPrice();
-        vm.prank(keeper);
-        if (ps.length > 0) module.decreasePosition(a, ps[0].tokenId, 0, 0, 0);
-        else module.swap(a, false, 1e6, p);
-    }
-
-    function _schedule(address target, bytes memory data) internal {
-        vm.prank(operator);
-        timelock.schedule(target, 0, data, bytes32(0), bytes32(0), 2 days);
-        vm.warp(vm.getBlockTimestamp() + 2 days + 1);
-        vm.prank(operator);
-        timelock.execute(target, 0, data, bytes32(0), bytes32(0));
-    }
-
-    /// The client (owner EOA) runs arbitrary executions on its HybridDeleGator with one EntryPoint transaction.
-    function _clientExec(uint256 pk, address a, Execution[] memory xs) internal {
-        bytes memory callData = abi.encodeCall(IDeleGatorCore.execute, (DelegationFramework.BATCH_DEFAULT, abi.encode(xs)));
-        PackedUserOperation memory op = PackedUserOperation(
-            a,
-            IEntryPointV07(ENTRYPOINT).getNonce(a, 0),
-            "",
-            callData,
-            bytes32((uint256(300_000) << 128) | uint256(2_000_000)),
-            0,
-            bytes32(0),
-            "",
-            ""
-        );
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, IDeleGatorUserOp(a).getPackedUserOperationTypedDataHash(op));
-        op.signature = abi.encodePacked(r, s, v);
-        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
-        ops[0] = op;
-        address eoa = vm.addr(pk);
-        vm.prank(eoa, eoa);
-        IEntryPointV07(ENTRYPOINT).handleOps(ops, payable(eoa));
     }
 
     // ------------------------------------------------------------------ onboarding
@@ -110,9 +25,10 @@ contract LPManagerModuleTest is SATestBase {
         assertEq(vm.getNonce(owner_), 0, "client sent no transaction");
         assertEq(usdc.balanceOf(owner_), 0);
         assertEq(usdc.balanceOf(a), 10_000e6);
-        LPManagerModule.Account memory s = _acct(a);
+        SALib.Account memory s = _acct(a);
         assertEq(s.delegationHash, DM.getDelegationHash(d));
         assertEq(s.kind, 1);
+        assertEq(s.owner, owner_, "owner pinned (derived from the address)");
         assertEq(s.contributed, 0); // registered before the funds arrived
         assertTrue(module.isActive(a));
         _buyBase(a, 1_000e6); // first keeper touch books the deposit
@@ -123,6 +39,7 @@ contract LPManagerModuleTest is SATestBase {
         (address a,) = _onboard7702(BOB_PK, 5_000e6);
         assertEq(a, vm.addr(BOB_PK));
         assertEq(_acct(a).kind, 2);
+        assertEq(_acct(a).owner, a);
         assertEq(_acct(a).contributed, 5_000e6); // already in the EOA at registration
         _buyBase(a, 2_000e6);
         uint256 id = _mintAll(a);
@@ -143,8 +60,8 @@ contract LPManagerModuleTest is SATestBase {
     }
 
     function test_Onboard_FundsOnlyIntoTheOwnersAccount() public {
-        // the victim's permit cannot be pointed at the attacker's account: the module pulls only from the owner
-        // of the account being onboarded
+        // the victim's permit cannot be pointed at the attacker's account: the module pulls only from the pinned
+        // owner of the account being onboarded
         address victim = vm.addr(ALICE_PK);
         _deal(victim, 1_000e6);
         uint256 atkPk = uint256(keccak256("atk"));
@@ -156,8 +73,7 @@ contract LPManagerModuleTest is SATestBase {
         module.onboard(d, 1_000e6, dl, v, r, s);
         assertEq(usdc.balanceOf(victim), 1_000e6);
         // a 7702 account cannot take an amount at all
-        (address b, Delegation memory db) = _onboard7702(BOB_PK, 0);
-        b;
+        (, Delegation memory db) = _onboard7702(BOB_PK, 0);
         vm.expectRevert(LPManagerModule.NotOwnAccount.selector);
         module.onboard(db, 1, dl, v, r, s);
     }
@@ -222,6 +138,21 @@ contract LPManagerModuleTest is SATestBase {
         vm.expectRevert(abi.encodeWithSelector(SALib.BadDelegation.selector, 6));
         module.register(d);
 
+        // L-1: an expiry the module cannot store
+        d = _delegation(a, address(module), T, uint256(type(uint64).max) + 1, 1);
+        d.caveats[0].enforcer = address(enforcer);
+        d = _sign(d, ALICE_PK);
+        vm.expectRevert(abi.encodeWithSelector(SALib.BadDelegation.selector, 6));
+        module.register(d);
+
+        // L-5: unsigned caveat args
+        d = _delegation(a, address(module), T, until, 1);
+        d.caveats[0].enforcer = address(enforcer);
+        d = _sign(d, ALICE_PK);
+        d.caveats[1].args = new bytes(4096);
+        vm.expectRevert(abi.encodeWithSelector(SALib.BadDelegation.selector, 9));
+        module.register(d);
+
         d = _delegation(a, address(module), T, until, 1);
         d.caveats[0].enforcer = address(enforcer);
         d = _sign(d, BOB_PK);
@@ -249,6 +180,7 @@ contract LPManagerModuleTest is SATestBase {
         module.register(d);
         d = _delegation(address(trader), address(module), T, until, 1);
         d.caveats[0].enforcer = address(enforcer);
+        d.signature = new bytes(65);
         vm.expectRevert(SALib.BadAccount.selector);
         module.register(d);
     }
@@ -308,16 +240,16 @@ contract LPManagerModuleTest is SATestBase {
         }
         vm.prank(keeper);
         vm.expectRevert(LPManagerModule.NotGuardian.selector);
-        module.approvePrice(0, type(uint256).max, block.timestamp + 1 days);
+        module.approvePrice(1, type(uint256).max, block.timestamp + 1 hours);
         vm.prank(keeper);
         vm.expectRevert(LPManagerModule.NotGuardian.selector);
-        module.approveHedgeEquity(a, 1, block.timestamp + 1 days);
+        module.approveHedgeEquity(a, 0, 0, 1, block.timestamp + 1 hours);
         vm.prank(keeper);
         vm.expectRevert(LPManagerModule.NotGuardian.selector);
         module.setPaused(true);
     }
 
-    function test_L13_RolesAndParams() public {
+    function test_L8_L13_RolesAndParams() public {
         vm.expectRevert(LPManagerModule.BadParam.selector);
         new LPManagerModule(_config(address(timelock), keeper, keeper));
         LPManagerModule.Config memory c = _config(address(timelock), keeper, guardian);
@@ -333,7 +265,21 @@ contract LPManagerModuleTest is SATestBase {
         vm.expectRevert(LPManagerModule.BadParam.selector);
         new LPManagerModule(c);
         c = _config(address(timelock), keeper, guardian);
+        c.params.maxSlippageBps = 0; // I-3: would brick every swap and add
+        vm.expectRevert(LPManagerModule.BadParam.selector);
+        new LPManagerModule(c);
+        c = _config(address(timelock), keeper, guardian);
         c.feeRecipient = treasury;
+        vm.expectRevert(LPManagerModule.BadParam.selector);
+        new LPManagerModule(c);
+        // L-8: the hot key may not be the treasury or the fee recipient; the owner is distinct too
+        c = _config(address(timelock), treasury, guardian);
+        vm.expectRevert(LPManagerModule.BadParam.selector);
+        new LPManagerModule(c);
+        c = _config(address(timelock), keeper, feeTo);
+        vm.expectRevert(LPManagerModule.BadParam.selector);
+        new LPManagerModule(c);
+        c = _config(keeper, keeper, guardian);
         vm.expectRevert(LPManagerModule.BadParam.selector);
         new LPManagerModule(c);
         // the enforcer / executor must be wired to the same venue
@@ -346,19 +292,25 @@ contract LPManagerModuleTest is SATestBase {
         vm.prank(operator);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, operator));
         module.setKeeper(attacker);
-        vm.expectRevert(LPManagerModule.BadParam.selector);
-        vm.prank(address(timelock));
-        module.setKeeper(guardian);
+        address[4] memory bad = [guardian, treasury, feeTo, address(timelock)];
+        for (uint256 i; i < 4; ++i) {
+            vm.expectRevert(LPManagerModule.BadParam.selector);
+            vm.prank(address(timelock));
+            module.setKeeper(bad[i]);
+        }
         vm.expectRevert(LPManagerModule.BadParam.selector);
         vm.prank(address(timelock));
         module.setGuardian(keeper);
+        vm.expectRevert(LPManagerModule.BadParam.selector);
+        vm.prank(address(timelock));
+        module.setGuardian(treasury);
         vm.expectRevert(LPManagerModule.BadParam.selector);
         module.renounceOwnership();
         _schedule(address(module), abi.encodeCall(LPManagerModule.setKeeper, (attacker)));
         assertEq(module.keeper(), attacker);
     }
 
-    // ------------------------------------------------------------------ price anchor and keeper price (H-2, M-10)
+    // ------------------------------------------------------------------ price anchor and keeper price
     function test_M10_KeeperPriceWithinBandOfPoolAndAnchor() public {
         (address a,) = _onboardHybrid(ALICE_PK, 10_000e6);
         _buyBase(a, 2_000e6);
@@ -386,11 +338,11 @@ contract LPManagerModuleTest is SATestBase {
         module.reportPrice(p);
         assertTrue(module.lastPriceClipped());
         assertApproxEqRel(module.lastPrice(), anchor * 110 / 100, 1e15);
-        // budget used up: a second report within the same block cannot move it further
+        // budget used up: a second report cannot move it further
         vm.prank(keeper);
         module.reportPrice(p);
         assertApproxEqRel(module.lastPrice(), anchor * 110 / 100, 1e15);
-        vm.warp(vm.getBlockTimestamp() + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 27 hours); // the sliding window has passed
         vm.prank(keeper);
         module.reportPrice(p);
         assertFalse(module.lastPriceClipped());
@@ -430,7 +382,7 @@ contract LPManagerModuleTest is SATestBase {
         (address a,) = _onboardHybrid(ALICE_PK, 10_000e6);
         (address b,) = _onboardHybrid(BOB_PK, 10_000e6);
         uint256 p = poolPrice();
-        // 2x account value per decaying day: 10k account -> ~20k notional
+        // 2x account value per 24 h window: 10k account -> ~20k notional
         for (uint256 i; i < 2; ++i) {
             vm.prank(keeper);
             module.swap(a, false, 4_000e6, p);
@@ -440,11 +392,11 @@ contract LPManagerModuleTest is SATestBase {
             _moveTo(p);
         }
         vm.prank(keeper);
-        vm.expectRevert(RiskBudgets.Turnover.selector);
+        vm.expectRevert(SAWindow.WindowOverflow.selector);
         module.swap(a, false, 5_000e6, p);
         vm.prank(keeper);
         module.swap(b, false, 5_000e6, p); // bob's budget is his own
-        vm.warp(vm.getBlockTimestamp() + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 27 hours);
         _report();
         p = poolPrice();
         vm.prank(keeper);
@@ -470,20 +422,19 @@ contract LPManagerModuleTest is SATestBase {
     function test_H3_MintChargesTurnover() public {
         (address a,) = _onboardHybrid(ALICE_PK, 10_000e6);
         _buyBase(a, 4_000e6);
-        uint256 before = _budgets(a).turnoverUsed;
+        uint256 before = _turnoverUsed(a);
         _mintAll(a);
-        assertGt(_budgets(a).turnoverUsed, before);
+        assertGt(_turnoverUsed(a), before);
     }
 
     function test_TooManyPositionsAndUnknownPosition() public {
-        (address a,, uint256 id) = _invested(ALICE_PK, 20_000e6);
+        (address a,,) = _invested(ALICE_PK, 20_000e6);
         vm.prank(keeper);
         vm.expectRevert(LPManagerModule.UnknownPosition.selector);
         module.decreasePosition(a, 1, 1, 0, 0); // lp's NFT, not tracked for this account
-        id;
     }
 
-    // ------------------------------------------------------------------ hedge (M-5, H-1, M-2)
+    // ------------------------------------------------------------------ hedge (M-5 of round 1, H-1, M-2)
     function test_M5_HedgeCapOnMaxOfEquityAndNetMargin() public {
         (address a,) = _onboardHybrid(ALICE_PK, 10_000e6);
         _syncTouch(a);
@@ -496,8 +447,7 @@ contract LPManagerModuleTest is SATestBase {
         vm.expectPartialRevert(LPManagerModule.HedgeCap.selector);
         module.sendHedgeMargin(a, 20e6);
         // reporting a lower equity does not free room: net margin still counts
-        vm.prank(keeper);
-        module.reportHedgeEquity(a, (cap - 10e6) * 95 / 100);
+        _reportEquity(a, (cap - 10e6) * 95 / 100);
         vm.prank(keeper);
         vm.expectPartialRevert(LPManagerModule.HedgeCap.selector);
         module.sendHedgeMargin(a, 20e6);
@@ -505,7 +455,7 @@ contract LPManagerModuleTest is SATestBase {
         vm.prank(keeper);
         module.returnHedgeMargin(a, 1_000e6);
         assertEq(_acct(a).netMargin, cap - 10e6 - 1_000e6);
-        vm.warp(vm.getBlockTimestamp() + 1 days); // the enforcer's own 35%/day budget on idle USDC
+        vm.warp(vm.getBlockTimestamp() + 27 hours); // the enforcer's own 35% / 24 h window on idle USDC
         _report();
         vm.prank(keeper);
         module.sendHedgeMargin(a, 500e6);
@@ -519,49 +469,48 @@ contract LPManagerModuleTest is SATestBase {
         vm.startPrank(keeper);
         module.sendHedgeMargin(a, 3_000e6);
         module.sendHedgeMargin(b, 3_000e6);
-        // fake increase: clipped, never reverts
+        uint256 ep = _acct(a).hedgeEpoch;
+        // fake increase: refused, never reverts, does not move the epoch (L-7)
         module.reportHedgeEquity(a, 5_000e6);
         assertEq(_acct(a).hedgeEquity, 3_000e6);
+        assertEq(_acct(a).hedgeEpoch, ep);
         // decrease beyond 5% of the account value per day: clipped to the budget
         module.reportHedgeEquity(a, 1_000e6);
         assertApproxEqAbs(_acct(a).hedgeEquity, 3_000e6 - 500e6, 1e6);
+        assertTrue(_acct(a).hedgeClipped);
         vm.stopPrank();
-        // guardian: exact value for this account and epoch
-        uint256 ep = _acct(a).hedgeEpoch;
+        // guardian: exact value for this account, epoch and stored value
+        SALib.Account memory s = _acct(a);
         vm.prank(guardian);
-        module.approveHedgeEquity(a, 4_000e6, block.timestamp + 1 hours);
+        module.approveHedgeEquity(a, s.hedgeEpoch, s.hedgeEquity, 4_000e6, block.timestamp + 1 hours);
         // the approval does not apply to another account
-        vm.prank(keeper);
-        module.reportHedgeEquity(b, 4_000e6);
+        _reportEquity(b, 4_000e6);
         assertEq(_acct(b).hedgeEquity, 3_000e6);
-        vm.prank(keeper);
-        module.reportHedgeEquity(a, 4_000e6);
+        _reportEquity(a, 4_000e6);
         assertEq(_acct(a).hedgeEquity, 4_000e6);
-        assertEq(_acct(a).hedgeEpoch, ep + 1);
+        assertEq(_acct(a).hedgeEpoch, s.hedgeEpoch + 1);
+        assertFalse(_acct(a).hedgeClipped);
         // one-shot
-        vm.prank(keeper);
-        module.reportHedgeEquity(a, 3_000e6);
+        _reportEquity(a, 3_900e6);
+        s = _acct(a);
         vm.prank(guardian);
-        module.approveHedgeEquity(a, 4_000e6, block.timestamp + 1 hours);
-        // M-2: cleared by a margin move (judged against the old baseline)
+        module.approveHedgeEquity(a, s.hedgeEpoch, s.hedgeEquity, 4_000e6, block.timestamp + 1 hours);
+        // cleared by a margin move (judged against the old state)
         vm.prank(keeper);
         module.returnHedgeMargin(a, 100e6);
-        vm.prank(keeper);
-        module.reportHedgeEquity(a, 4_000e6);
+        _reportEquity(a, 4_000e6);
         assertLt(_acct(a).hedgeEquity, 4_000e6);
         // expired approvals do nothing
-        uint256 h = _acct(a).hedgeEquity;
+        s = _acct(a);
         vm.prank(guardian);
-        module.approveHedgeEquity(a, h + 1_000e6, block.timestamp + 1 hours);
+        module.approveHedgeEquity(a, s.hedgeEpoch, s.hedgeEquity, s.hedgeEquity + 1_000e6, block.timestamp + 1 hours);
         vm.warp(vm.getBlockTimestamp() + 2 hours);
-        vm.prank(keeper);
-        module.reportHedgeEquity(a, h + 1_000e6);
-        assertEq(_acct(a).hedgeEquity, h);
+        _reportEquity(a, s.hedgeEquity + 1_000e6);
+        assertEq(_acct(a).hedgeEquity, s.hedgeEquity);
     }
 
-    // ------------------------------------------------------------------ pause (M-6, L-16)
+    // ------------------------------------------------------------------ pause (round 1 M-6 / L-16; SA-1 L-6)
     function test_M6_PauseStopsRiskNotExits() public {
-        // margin goes out first: the enforcer's hedge budget is a share of the account's idle USDC
         (address a, Delegation memory d) = _onboardHybrid(ALICE_PK, 10_000e6);
         (address b,) = _onboardHybrid(BOB_PK, 10_000e6);
         _syncTouch(b);
@@ -581,9 +530,13 @@ contract LPManagerModuleTest is SATestBase {
         module.increasePosition(a, id, 1, 1, 1, p);
         vm.expectRevert(LPManagerModule.IsPaused.selector);
         module.chargeFee(a);
+        // SA-1 L-6: the pause is a stop for custody growth and keeper-only equity cuts
+        vm.expectRevert(LPManagerModule.IsPaused.selector);
+        module.sendHedgeMargin(b, 100e6);
+        module.reportHedgeEquity(a, 500e6);
+        assertEq(_acct(a).hedgeEquity, 1_000e6, "frozen while paused");
         // risk-reducing actions continue
         module.decreasePosition(a, id, POSM.getPositionLiquidity(id) / 2, 0, 0);
-        module.sendHedgeMargin(b, 100e6);
         module.returnHedgeMargin(a, 200e6);
         vm.stopPrank();
         vm.prank(guardian);
@@ -591,7 +544,7 @@ contract LPManagerModuleTest is SATestBase {
         module.setPaused(false);
         // the client exits while paused
         _exitHybrid(ALICE_PK, a, d, a);
-        assertEq(module.positionsOf(a).length, 1); // module bookkeeping only; the NFT is burned
+        assertFalse(module.isActive(a));
         vm.expectRevert();
         POSM.ownerOf(id);
         _schedule(address(module), abi.encodeCall(LPManagerModule.setPaused, (false)));
@@ -621,7 +574,7 @@ contract LPManagerModuleTest is SATestBase {
         vm.prank(keeper);
         vm.expectPartialRevert(LPManagerModule.FeeTooEarly.selector);
         module.chargeFee(a);
-        // a drawdown below the mark charges nothing; recovering to the mark charges nothing either
+        // a drawdown below the mark charges nothing
         vm.warp(vm.getBlockTimestamp() + 7 days);
         _report();
         vm.prank(keeper);
@@ -649,15 +602,16 @@ contract LPManagerModuleTest is SATestBase {
         xs[0] = Execution(address(usdc), 0, abi.encodeCall(IERC20.transfer, (owner_, 3_000e6)));
         xs[1] = Execution(owner_, 1 ether, "");
         _clientExec(ALICE_PK, a, xs);
+        uint256 hi = Math.max(module.lastPrice(), poolPrice()); // an outflow is booked at the higher price (L-2)
         _syncTouch(a);
         assertEq(c1, c0 + 5_000e6);
-        assertApproxEqAbs(_acct(a).contributed, c1 - 3_000e6 - int256(module.lastPrice()), 2);
+        assertApproxEqAbs(_acct(a).contributed, c1 - 3_000e6 - int256(hi), 2);
         assertApproxEqAbs(_profit(a), p0, 1e6);
         // no fee on any of it
         vm.warp(vm.getBlockTimestamp() + 7 days);
         _report();
         vm.prank(keeper);
-        assertEq(module.chargeFee(a), 0);
+        assertLe(module.chargeFee(a), 1e6 * 1500 / 10_000);
     }
 
     function test_Fee_DirectBurnByClientIsNotAFlowOfValue() public {
@@ -678,11 +632,11 @@ contract LPManagerModuleTest is SATestBase {
         vm.prank(keeper);
         module.swap(a, false, 10e6, p);
         assertEq(module.positionsOf(a).length, 0, "untracked after the client burned it");
-        assertApproxEqRel(uint256(_acct(a).contributed), 10_000e6, 2e15);
-        assertApproxEqAbs(_profit(a), p0, 30e6); // only the 10 USDC swap's fee and the anchor/pool mismatch
+        assertApproxEqRel(uint256(_acct(a).contributed), 10_000e6, 3e15);
+        assertApproxEqAbs(_profit(a), p0, 30e6); // only the 10 USDC swap's fee and the anchor/pool spread
     }
 
-    function test_Fee_NeedsFreshUnclippedPriceAndIdle() public {
+    function test_Fee_NeedsFreshUnclippedPriceAndChargesAtMostTheIdleSlice() public {
         (address a,,) = _invested(ALICE_PK, 10_000e6);
         _volume(200_000, 25);
         _moveTo(module.lastPrice());
@@ -691,32 +645,33 @@ contract LPManagerModuleTest is SATestBase {
         vm.expectRevert(LPManagerModule.StalePrice.selector);
         module.chargeFee(a);
         _report();
-        // almost everything is in the position: the fee may not exceed 20% of idle USDC
+        _syncTouch(a);
         int256 profit = _profit(a);
         assertGt(profit, 0);
-        if (uint256(profit) * 1500 / 10_000 * 5 > usdc.balanceOf(a)) {
-            vm.prank(keeper);
-            vm.expectPartialRevert(LPManagerModule.FeeNeedsIdle.selector);
-            module.chargeFee(a);
+        uint256 full = uint256(profit) * 1500 / 10_000;
+        uint256 idle = usdc.balanceOf(a);
+        // L-11: almost everything is in the position: charge the 20%-of-idle slice, advance the mark by its gain
+        vm.prank(keeper);
+        uint256 f = module.chargeFee(a);
+        assertEq(f, Math.min(full, idle * 2000 / 10_000));
+        if (f < full) {
+            assertEq(_acct(a).hwm, int256(f * 10_000 / 1500) - int256(f));
+            assertLt(_acct(a).hwm, profit - int256(full));
         }
-        uint256 id = module.positionsOf(a)[0].tokenId;
-        uint128 half = POSM.getPositionLiquidity(id) / 2;
-        vm.prank(keeper);
-        module.decreasePosition(a, id, half, 0, 0);
-        vm.prank(keeper);
-        assertGt(module.chargeFee(a), 0);
     }
 
-    function testFuzz_HwmFee(int128 profit, int128 hwm, uint16 bps) public pure {
-        bps = uint16(bound(bps, 0, 2000));
-        (uint256 f, int256 h) = SALib.hwmFee(profit, hwm, bps);
+    function testFuzz_HwmFee(int128 profit, int128 hwm, uint16 bps, uint64 maxFee) public pure {
+        bps = uint16(bound(bps, 1, 2000));
+        (uint256 f, int256 h) = SALib.hwmFee(profit, hwm, bps, maxFee);
         if (profit <= hwm) {
             assertEq(f, 0);
             assertEq(h, hwm);
         } else {
-            assertEq(f, uint256(int256(profit) - hwm) * bps / 10_000);
-            assertEq(h, int256(profit) - int256(f));
+            uint256 full = uint256(int256(profit) - hwm) * bps / 10_000;
+            assertEq(f, Math.min(full, maxFee));
             assertGe(h, hwm);
+            assertLe(h, int256(profit) - int256(f)); // never marks more gain than was charged for
+            if (f == full) assertEq(h, int256(profit) - int256(f));
         }
     }
 
@@ -731,6 +686,7 @@ contract LPManagerModuleTest is SATestBase {
         uint256 usdc0 = usdc.balanceOf(a);
         _exitHybrid(ALICE_PK, a, d, a);
         assertTrue(DM.disabledDelegations(DM.getDelegationHash(d)));
+        assertTrue(_acct(a).revoked);
         assertFalse(module.isActive(a));
         assertGt(usdc.balanceOf(a), usdc0);
         vm.expectRevert();
@@ -738,14 +694,18 @@ contract LPManagerModuleTest is SATestBase {
         // the keeper can no longer act on the account
         uint256 p = poolPrice();
         vm.prank(keeper);
-        vm.expectRevert(bytes4(keccak256("CannotUseADisabledDelegation()")));
+        vm.expectRevert(LPManagerModule.NotLive.selector);
         module.swap(a, false, 10e6, p);
-        // hedge margin comes back to the owner EOA
-        address owner_ = vm.addr(ALICE_PK);
+        // hedge margin comes back into the account (B: always bracketed, never to an address the account reports)
+        int256 c0 = _acct(a).contributed;
+        uint256 bal = usdc.balanceOf(a);
         vm.prank(keeper);
         module.returnHedgeMargin(a, 1_500e6);
-        assertEq(usdc.balanceOf(owner_), 1_500e6);
+        assertEq(usdc.balanceOf(a), bal + 1_500e6);
         assertEq(_acct(a).netMargin, 0);
+        // the margin coming back is not a deposit; the client's burn is booked conservatively (in at min, out at max)
+        assertApproxEqRel(_acct(a).contributed, c0, 1e15);
+        assertLt(_acct(a).contributed, c0 + 1_000e6);
     }
 
     function test_Exit_7702_OneTransaction() public {
@@ -754,6 +714,7 @@ contract LPManagerModuleTest is SATestBase {
         uint256 id = _mintAll(a);
         _exit7702(a, d, a);
         assertTrue(DM.disabledDelegations(DM.getDelegationHash(d)));
+        assertFalse(module.isActive(a));
         vm.expectRevert();
         POSM.ownerOf(id);
         assertGt(usdc.balanceOf(a), 5_000e6);
@@ -771,15 +732,19 @@ contract LPManagerModuleTest is SATestBase {
         // the client's own exit never goes through redeemDelegations
         _exitHybrid(ALICE_PK, a, d, vm.addr(ALICE_PK));
         assertGt(usdc.balanceOf(vm.addr(ALICE_PK)), 0);
+        assertFalse(module.isActive(a));
     }
 
-    function test_ReRegister_KeepsBooks() public {
+    function test_ReRegister_ByTheClientKeepsBooks() public {
         (address a,,) = _invested(ALICE_PK, 10_000e6);
         _syncTouch(a);
         int256 c0 = _acct(a).contributed;
         Delegation memory d2 = _delegation(a, address(module), _terms(address(module)), block.timestamp + 360 days, 2);
         d2.caveats[0].enforcer = address(enforcer);
         d2 = _sign(d2, ALICE_PK);
+        vm.expectRevert(SALib.NotOwnAccount.selector); // M-1: not by a third party
+        module.register(d2);
+        vm.prank(vm.addr(ALICE_PK)); // the owner EOA, one plain transaction
         module.register(d2);
         assertEq(_acct(a).delegationHash, DM.getDelegationHash(d2));
         assertEq(_acct(a).contributed, c0);

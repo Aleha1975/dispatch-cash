@@ -7,6 +7,7 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 
 import {ICaveatEnforcer, ModeCode} from "./vendor/DelegationFramework.sol";
+import {SAWindow} from "./SAWindow.sol";
 
 interface IPositionManagerView {
     function ownerOf(uint256 tokenId) external view returns (address);
@@ -35,14 +36,17 @@ interface IPositionManagerView {
 ///         |                   |                                    | this block (exp 0 or now); amt 0 always allowed     |
 ///         | pool ERC-20       | approve(Permit2, amt)              | amt <= delegator balance                            |
 ///         | asset (USDC)      | transfer(hedgeTreasury, amt)       | <= HEDGE_DAY_BPS (35%) of the delegator's USDC per  |
-///         |                   |                                    | decaying day (fraction of the balance at each send) |
+///         |                   |                                    | sliding 24 h window (fraction of the balance at each|
+///         |                   |                                    | send; a rate on idle USDC, not a cap on the total)  |
 ///         | asset (USDC)      | transfer(feeRecipient, amt)        | <= FEE_MAX_BPS (20%) of the USDC balance, at most   |
 ///         |                   |                                    | once per FEE_INTERVAL (7 days)                      |
 ///
 ///         Execution mode must be single call, revert-on-failure, no selector/payload (ModeCode 0). The redeemer
 ///         must be the module named in the signed terms. Terms (signed by the client, 96 bytes):
 ///         abi.encode(address module, address hedgeTreasury, address feeRecipient).
-///         Stateful hooks run only for the DelegationManager; state is per delegator.
+///         Stateful hooks run only for the DelegationManager; state is per (delegator, keccak256(terms)), so a
+///         second delegation the client signs with other terms cannot consume this one's limits (audit SA-1 M-6), and
+///         a renewal with the same terms keeps its history.
 contract ElysiumCustodyEnforcer is ICaveatEnforcer {
     // v4-periphery Actions codes
     uint8 internal constant INCREASE_LIQUIDITY = 0x00;
@@ -77,12 +81,11 @@ contract ElysiumCustodyEnforcer is ICaveatEnforcer {
     bytes32 public immutable poolKeyHash;
 
     struct Spend {
-        uint128 hedgeUsedWad; // decaying fraction of the USDC balance sent to hedgeTreasury
-        uint64 hedgeTime;
+        SAWindow.W hedge; // fractions (WAD) of the USDC balance sent to hedgeTreasury, sliding 24 h window
         uint64 lastFeeTime;
     }
 
-    mapping(address delegator => Spend) public spend;
+    mapping(address delegator => mapping(bytes32 termsHash => Spend)) internal _spend;
 
     event HedgeTransfer(address indexed delegator, address indexed to, uint256 amount, uint256 usedWad);
     event FeeTransfer(address indexed delegator, address indexed to, uint256 amount);
@@ -188,7 +191,7 @@ contract ElysiumCustodyEnforcer is ICaveatEnforcer {
                 if (amount > IERC20(target).balanceOf(delegator)) revert BadAmount();
             } else if (sel == ERC20_TRANSFER && target == asset) {
                 (address to, uint256 amount) = _addrUint(cd[4:]);
-                _checkTransfer(delegator, to, amount, hedgeTreasury, feeRecipient);
+                _checkTransfer(_spend[delegator][keccak256(terms)], delegator, to, amount, hedgeTreasury, feeRecipient);
             } else {
                 revert SelectorNotAllowed(target, sel);
             }
@@ -309,20 +312,28 @@ contract ElysiumCustodyEnforcer is ICaveatEnforcer {
         if (amount > IERC20(token).balanceOf(delegator)) revert BadAmount();
     }
 
-    function _checkTransfer(address delegator, address to, uint256 amount, address hedgeTreasury, address feeRecipient)
-        internal
-    {
+    /// @notice Hedge fraction used in the current 24 h window and the last fee time, for (delegator, terms).
+    function spend(address delegator, bytes32 termsHash) external view returns (uint256 hedgeUsedWad, uint64 lastFeeTime) {
+        Spend storage s = _spend[delegator][termsHash];
+        return (SAWindow.used(s.hedge), s.lastFeeTime);
+    }
+
+    function _checkTransfer(
+        Spend storage s,
+        address delegator,
+        address to,
+        uint256 amount,
+        address hedgeTreasury,
+        address feeRecipient
+    ) internal {
         uint256 bal = IERC20(asset).balanceOf(delegator);
         if (amount == 0 || amount > bal) revert BadAmount();
-        Spend storage s = spend[delegator];
         if (to == hedgeTreasury) {
-            uint256 dt = block.timestamp - s.hedgeTime;
-            uint256 used = dt >= 1 days ? 0 : uint256(s.hedgeUsedWad) * (1 days - dt) / 1 days;
-            used += Math.mulDiv(amount, WAD, bal, Math.Rounding.Ceil);
+            uint256 frac = Math.mulDiv(amount, WAD, bal, Math.Rounding.Ceil);
             uint256 cap = HEDGE_DAY_BPS * (WAD / BPS);
+            uint256 used = SAWindow.used(s.hedge) + frac;
             if (used > cap) revert HedgeBudget(used, cap);
-            s.hedgeUsedWad = uint128(used);
-            s.hedgeTime = uint64(block.timestamp);
+            SAWindow.add(s.hedge, frac);
             emit HedgeTransfer(delegator, to, amount, used);
         } else if (to == feeRecipient) {
             uint256 max = bal * FEE_MAX_BPS / BPS;

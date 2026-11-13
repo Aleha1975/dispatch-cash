@@ -427,7 +427,7 @@ contract CustodyEnforcerTest is SATestBase {
     }
 
     // ------------------------------------------------------------------ hedge and fee budgets
-    function test_HedgeBudget_35PercentPerDecayingDay() public {
+    function test_HedgeBudget_35PercentPerSliding24h() public {
         bytes memory x20 = _x(address(usdc), 0, abi.encodeCall(IERC20.transfer, (treasury, 20_000e6)));
         _hook(x20); // 20% of 100k
         vm.prank(del);
@@ -438,10 +438,32 @@ contract CustodyEnforcerTest is SATestBase {
             ElysiumCustodyEnforcer.HedgeBudget.selector
         );
         _hook(_x(address(usdc), 0, abi.encodeCall(IERC20.transfer, (treasury, 12_000e6)))); // 15% -> 35%
-        vm.warp(block.timestamp + 12 hours); // half restored
-        _hook(_x(address(usdc), 0, abi.encodeCall(IERC20.transfer, (treasury, 13_000e6))));
-        vm.warp(block.timestamp + 1 days);
+        // SA-1 I-1 / M-7: nothing comes back within 24 h (the old decay restored half after 12 h)
+        vm.warp(block.timestamp + 23 hours);
+        _expectHookRevert(
+            _x(address(usdc), 0, abi.encodeCall(IERC20.transfer, (treasury, 1e6))), ElysiumCustodyEnforcer.HedgeBudget.selector
+        );
+        vm.warp(block.timestamp + 4 hours); // 27 h: every bucket of the first spend has left the window
         _hook(_x(address(usdc), 0, abi.encodeCall(IERC20.transfer, (treasury, 28_000e6))));
+        (uint256 usedWad,) = enforcer.spend(del, keccak256(T));
+        assertEq(usedWad, 0.35e18); // 28k of the 80k still idle
+    }
+
+    /// SA-1 M-6: the client's own second delegation (other terms) has its own slot and cannot consume ours.
+    function test_M6_StateKeyedByTerms() public {
+        bytes memory own = abi.encode(attacker, address(0xbeef), address(0xfee)); // client-chosen redeemer / recipients
+        vm.prank(DM_ADDR);
+        enforcer.beforeHook(own, "", DelegationFramework.SINGLE_DEFAULT, _x(address(usdc), 0, abi.encodeCall(IERC20.transfer, (address(0xfee), 1))), bytes32(0), del, attacker);
+        vm.prank(DM_ADDR);
+        enforcer.beforeHook(own, "", DelegationFramework.SINGLE_DEFAULT, _x(address(usdc), 0, abi.encodeCall(IERC20.transfer, (address(0xbeef), 35_000e6))), bytes32(0), del, attacker);
+        // our terms: the fee clock and the hedge window are untouched
+        _hook(_x(address(usdc), 0, abi.encodeCall(IERC20.transfer, (feeTo, 1_000e6))));
+        _hook(_x(address(usdc), 0, abi.encodeCall(IERC20.transfer, (treasury, 35_000e6))));
+        (uint256 usedOwn, uint64 feeOwn) = enforcer.spend(del, keccak256(own));
+        (uint256 usedOurs, uint64 feeOurs) = enforcer.spend(del, keccak256(T));
+        assertEq(usedOwn, 0.35e18);
+        assertEq(usedOurs, 0.35e18);
+        assertEq(feeOwn, feeOurs);
     }
 
     function test_FeeBudget_20PercentOncePerWeek() public {
