@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
 import {Test, console2} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -300,6 +300,9 @@ contract UniV4LPVaultForkTest is Test {
         uint256 id = _mintAll();
         vm.warp(block.timestamp + 72 hours + 1);
         vm.prank(makeAddr("anyone"));
+        vault.emergencyUnwind(); // arm
+        vm.warp(vm.getBlockTimestamp() + 6 hours);
+        vm.prank(makeAddr("anyone"));
         vault.emergencyUnwind();
         assertTrue(vault.emergency());
         assertEq(vault.positions().length, 0);
@@ -356,5 +359,74 @@ contract UniV4LPVaultForkTest is Test {
 
     function _positions() internal view returns (V4PositionMath.Position[] memory) {
         return vault.positions();
+    }
+
+    // ------------------------------------------------------------------ audit round 1 regressions (fork)
+    /// H-3: a narrow single-sided range just below a displaced spot is a resting limit order at an off-market
+    /// price. The keeper price must sit within the band of pool and anchor, so spot can be at most ~3% off the
+    /// anchor; valued at the anchor the position is then worth > maxSlippageBps less than what the vault pays and
+    /// the mint reverts. (Smaller displacements cost the vault at most maxSlippageBps per add, charged to turnover.)
+    function test_fork_H3_LimitOrderMintAtDisplacedSpotReverts() public {
+        vm.prank(alice);
+        vault.requestDeposit(20_000e6);
+        _settle();
+        uint256 anchor = vault.lastPrice();
+        // the keeper's wallet pushes the pool up ~2.5% (keeper price must stay within 1.5% of pool AND anchor)
+        deal(USDC, address(trader), 1_000_000e6);
+        while (_price() < anchor * 1027 / 1000) trader.swap(false, 100e6);
+        uint256 kp = anchor * 10_145 / 10_000;
+        assertLe(_price() - kp, kp * 150 / 10_000); // inside the pool band
+        (, int24 tick,,) = PM.getSlot0(key.toId());
+        int24 tu = tick / 60 * 60 - 60; // just below spot: USDC-only position
+        int24 tl = tu - 60;
+        uint128 liq = LiquidityAmounts.getLiquidityForAmount1(
+            TickMath.getSqrtPriceAtTick(tl), TickMath.getSqrtPriceAtTick(tu), 10_000e6
+        );
+        vm.prank(keeper);
+        vm.expectPartialRevert(LPVaultBase.AddValue.selector);
+        vault.mintPosition(tl, tu, liq, 0, 10_000e6, kp);
+    }
+
+    /// H-3: honest mints count against the same decaying turnover budget as swaps.
+    function test_fork_H3_MintChargesTurnover() public {
+        vm.prank(alice);
+        vault.requestDeposit(10_000e6);
+        _settle();
+        _swapIn(false, 500e6);
+        (,,,, uint256 before,,,,,,,) = vault.budgets();
+        _mintAll();
+        (,,,, uint256 used,,,,,,,) = vault.budgets();
+        (uint256 b, uint256 a) = vault.positionAmounts();
+        uint256 deployed = a + b * vault.lastPrice() / 1e18;
+        assertGt(deployed, 0);
+        assertApproxEqRel(used - before, deployed, 0.02e18); // the deployed value is charged
+    }
+
+    /// M-8: an emergencyUnwind caller who under-supplies gas so the burn runs out of gas reverts the whole call
+    /// instead of leaving a healthy position open while holders start redeeming.
+    function test_fork_M8_UnwindOutOfGasReverts() public {
+        vm.prank(alice);
+        vault.requestDeposit(10_000e6);
+        _settle();
+        _swapIn(false, 500e6);
+        _mintAll();
+        vm.warp(block.timestamp + 72 hours + 1);
+        vault.emergencyUnwind(); // arm
+        vm.warp(vm.getBlockTimestamp() + 6 hours);
+        // under-supplied gas: the whole call reverts instead of leaving a healthy position open
+        bool sawOog;
+        for (uint256 g = 100_000; g < 2_000_000; g += 50_000) {
+            (bool ok, bytes memory ret) = address(vault).call{gas: g}(abi.encodeCall(LPVaultBase.emergencyUnwind, ()));
+            if (ok) {
+                // whatever gas got it through, the position must be gone
+                assertEq(vault.positions().length, 0);
+                break;
+            }
+            if (ret.length >= 4 && bytes4(ret) == UniV4LPVault.UnwindOutOfGas.selector) sawOog = true;
+            assertFalse(vault.emergency());
+        }
+        assertTrue(sawOog);
+        assertTrue(vault.emergency());
+        assertEq(vault.positions().length, 0);
     }
 }

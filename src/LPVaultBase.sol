@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -9,6 +9,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Ownable, Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {RiskBudgets} from "./RiskBudgets.sol";
 
 /// @title LPVaultBase
 /// @notice Venue-independent core of a client-facing (optionally hedged) LP vault with asynchronous, keeper-settled
@@ -19,30 +20,40 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 ///           pulled into the vault at once and queued. Until the next settlement the client may `cancelDeposit`.
 ///         - Exit: `requestRedeem(shares)` (1 tx). The shares are locked in the vault. At the next settlement the
 ///           keeper prices them at a fresh NAV, burns them and PUSHES the USDC to the client: no claim tx. If the
-///           vault lacks idle USDC the request stays queued (FIFO) until the keeper frees liquidity.
+///           vault lacks idle USDC the head request is paid partially with all idle USDC and the rest stays queued
+///           (FIFO) until the keeper frees liquidity.
 ///         - There is no absolute withdrawal limit of any kind.
 ///
+///         PRICE ANCHOR. `lastPrice` is the only price the vault trusts. Only `settle` moves it, toward the keeper's
+///         report, by at most `refDriftBps` of cumulative movement per (decaying) day, and not at all while paused,
+///         unless the guardian approved a price range for the report. Swaps and LP adds must quote within
+///         `poolBandBps` of both the pool and the anchor; LP adds are valued at the anchor and count as turnover.
+///
 ///         NAV (see `grossAssets`): idle asset (excluding queued deposits and unpaid claims) + idle base token valued at
-///         the keeper price + LP positions (amounts from the pool's current sqrtPrice, valued at the keeper price) +
-///         the keeper-reported off-chain hedge equity. Settlement reverts unless the pool price is within
-///         `poolBandBps` of the keeper price, and the hedge equity may move at most `hedgeStepBps` of the last NAV per
-///         settlement unless the guardian pre-approved the exact value for that epoch.
+///         the anchored settlement price + LP positions (amounts from the pool's current sqrtPrice, valued at the same
+///         price) + the off-chain hedge equity. The keeper alone may only LOWER the hedge equity (at most
+///         `hedgeStepBps` of the last NAV per decaying day); raising it needs the guardian's co-signature. A report
+///         that the price or hedge budgets had to clip is applied conservatively: the clipped values are used, no
+///         deposits are processed and no fee is taken in that settlement; redemptions are always processed.
 ///
 ///         FEES: `feeBps` (default 15%, hard cap 20%) of the gain of price-per-share above the high-water mark, taken
-///         at settlement by minting shares to `feeRecipient`. The HWM never decreases.
+///         at settlement by minting shares to `feeRecipient`. The HWM never decreases while shares exist (it restarts
+///         from the current pps after a full exit).
 ///
-///         ROLES: owner (multisig; sets keeper/guardian/fee recipient and bounded parameters, can never move funds),
+///         ROLES: owner (timelock; sets keeper/guardian/fee recipient and bounded parameters, can never move funds),
 ///         keeper (settles, manages LP and hedge margin through allowlisted, relatively bounded calls only),
-///         guardian (pauses new deposits and risk-increasing keeper actions, co-signs large hedge equity jumps; can
-///         never move funds). Pause never blocks redemptions, cancellations, liquidity removal or hedge returns.
+///         guardian (pauses new deposits and risk-increasing keeper actions, freezes the price anchor and fees while
+///         paused, co-signs hedge equity increases and price moves beyond the budget; can never move funds). Pause
+///         never blocks redemptions, cancellations, liquidity removal, hedge sends/returns.
 ///
-///         LIVENESS: if no settlement happens for `SETTLE_TIMEOUT` (72 h) anyone may call `emergencyUnwind()`. It
-///         removes all LP liquidity into tokens and switches the vault into permanent wind-down. Holders (and holders
-///         of queued redeem requests, after `cancelRedeem`) then `emergencyRedeem` a pro-rata share of every token the
-///         vault holds on-chain. The hedge margin sitting at `hedgeTreasury` (on Hyperliquid) is NOT on-chain: it is
-///         the keeper operator's off-chain obligation to close the hedge and send that USDC back with
-///         `returnHedgeMargin`, after which it is distributed pro-rata to the shares still outstanding. Holders who
-///         want their part of the hedge margin should wait for that return before calling `emergencyRedeem`.
+///         LIVENESS: if the redeem queue makes no progress (nothing paid while requests are pending) for
+///         `SETTLE_TIMEOUT` (72 h) after the first settlement, anyone may arm `emergencyUnwind()` and execute it
+///         `UNWIND_NOTICE` later unless a settlement made progress in between. It removes all LP liquidity into tokens
+///         and switches the vault into permanent wind-down. Holders (and holders of queued redeem requests, after
+///         `cancelRedeem`) then `emergencyRedeem` a pro-rata share of every token the vault holds on-chain. The hedge
+///         margin sitting at `hedgeTreasury` (on Hyperliquid) is NOT on-chain: it is the keeper operator's off-chain
+///         obligation to close the hedge and send that USDC back with `returnHedgeMargin`, after which it is
+///         distributed pro-rata to the shares still outstanding.
 abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
 
@@ -52,16 +63,18 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
     uint8 internal constant DECIMALS_OFFSET = 6;
     uint256 internal constant VIRTUAL_SHARES = 10 ** DECIMALS_OFFSET;
 
+    // hard caps for `setParams` (fee 20%, hedge cap 50%, pool band 5%, slippage 5%, hedge step 20%/day, anchor drift
+    // 20%/day, turnover 5x NAV/day)
     uint256 public constant MAX_FEE_BPS = 2_000;
-    uint256 public constant MAX_HEDGE_CAP_BPS = 5_000;
-    uint256 public constant MAX_POOL_BAND_BPS = 500;
-    uint256 public constant MAX_SLIPPAGE_BPS = 500;
-    uint256 public constant MAX_HEDGE_STEP_BPS = 2_000;
-    uint256 public constant MAX_REF_DRIFT_BPS = 3_000;
-    uint256 public constant MAX_TURNOVER_BPS = 50_000;
+    uint256 internal constant MAX_HEDGE_CAP_BPS = 5_000;
+    uint256 internal constant MAX_POOL_BAND_BPS = 500;
+    uint256 internal constant MAX_SLIPPAGE_BPS = 500;
+    uint256 internal constant MAX_HEDGE_STEP_BPS = 2_000;
+    uint256 internal constant MAX_REF_DRIFT_BPS = 2_000;
+    uint256 internal constant MAX_TURNOVER_BPS = 50_000;
     uint256 public constant SETTLE_TIMEOUT = 72 hours;
-    uint256 public constant EMERGENCY_FORCE_DELAY = 7 days;
-    uint256 public constant EMERGENCY_BAND_BPS = 1_000;
+    uint256 public constant UNWIND_NOTICE = 6 hours;
+    uint256 public constant EMERGENCY_GRACE = 7 days;
 
     // ------------------------------------------------------------------ immutables
     IERC20 public immutable asset;
@@ -79,9 +92,9 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
         uint16 hedgeCapBps;
         uint16 poolBandBps;
         uint16 maxSlippageBps;
-        uint16 hedgeStepBps;
-        uint16 refDriftBps;
-        uint32 swapTurnoverBps;
+        uint16 hedgeStepBps; // keeper-only hedge equity decrease budget, of last NAV per decaying day
+        uint16 refDriftBps; // price anchor movement budget per decaying day
+        uint32 swapTurnoverBps; // swap + LP-add notional budget, of last NAV per decaying day
         uint256 minDeposit;
     }
 
@@ -119,23 +132,25 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
     uint256 public redeemTail;
 
     uint256 public pendingDepositAssets; // asset held for queued deposits (not part of NAV)
-    uint256 public lockedShares; // shares held by the vault for queued redeems
-    uint256 public totalClaimable; // asset owed to redeemers whose push transfer failed
+    uint256 public lockedShares; // shares held by the vault for queued redeems (== balanceOf(this))
+    uint256 public totalClaimable; // asset owed to clients whose push transfer failed
     mapping(address => uint256) public claimable;
 
     uint256 public hedgeEquity;
+    uint256 public netMargin; // margin sent to hedgeTreasury minus margin returned (floored at 0)
     uint256 public highWaterMark; // price per share, WAD-scaled assets per share unit
     uint256 public lastNav;
-    uint256 public lastPrice;
+    uint256 public lastPrice; // the price anchor (see contract NatSpec)
     uint256 public lastSettleTime;
+    uint256 public lastProgressTime; // last settlement after which the redeem queue was empty or had been paid from
     uint256 public epoch;
-    uint256 public swapNotionalUsed; // swap notional in the current rolling-day window
-    uint256 public swapWindowStart;
 
-    uint256 public approvedHedgeEquity;
-    uint256 public approvedHedgeEpoch; // epoch + 1 when set (0 = none)
-    uint256 public hedgeDriftStart; // rolling-day window for reported hedge equity drift
-    uint256 public hedgeDriftUsed;
+    /// Decaying-day budgets for anchor movement, keeper-only hedge decreases and turnover, and the guardian's
+    /// co-signatures (see RiskBudgets).
+    RiskBudgets.Budgets public budgets;
+
+    uint256 public unwindArmedAt;
+    uint256 public emergencySince;
 
     // ------------------------------------------------------------------ events
     event DepositRequested(uint256 indexed id, address indexed owner, uint256 assets);
@@ -145,11 +160,15 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
     event RedeemCancelled(uint256 indexed id, address indexed owner, uint256 shares);
     event Redeemed(uint256 indexed id, address indexed owner, uint256 shares, uint256 assets, bool pushed);
     event Claimed(address indexed owner, uint256 assets);
+    /// `price` and `hedgeEquity` are the values APPLIED (after the anchor / hedge budgets); compare with the report
+    /// to detect a clipped settlement (which processed no deposits and took no fee).
     event Settled(uint256 indexed epoch, uint256 nav, uint256 price, uint256 hedgeEquity, uint256 feeShares, uint256 pps);
     event HedgeMarginSent(uint256 amount, uint256 hedgeEquity);
     event HedgeMarginReturned(uint256 amount, uint256 hedgeEquity);
-    event HedgeEquityApproved(uint256 indexed epoch, uint256 value);
+    event HedgeEquityApproved(uint256 indexed epoch, uint256 value, uint256 until);
+    event PriceApproved(uint256 lo, uint256 hi, uint256 until);
     event Paused(bool paused, address indexed by);
+    event EmergencyArmed(address indexed by);
     event EmergencyUnwind(address indexed by);
     event EmergencyRedeemed(address indexed owner, address to, uint256 shares, uint256 assetOut, uint256 baseOut, uint256 wrappedOut);
     event ParamsSet(Params p);
@@ -166,7 +185,6 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
     error BadEpoch();
     error BadPrice();
     error PoolPriceOff(uint256 poolPrice, uint256 keeperPrice);
-    error HedgeEquityJump(uint256 oldValue, uint256 newValue);
     error HedgeCap(uint256 after_, uint256 cap);
     error NoHedge();
     error NotRequestOwner();
@@ -174,7 +192,8 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
     error ReserveBreached();
     error TransferFailed();
     error BadParam();
-    error Turnover();
+    error PositionsOpen();
+    error AddValue(uint256 got, uint256 paid);
 
     // ------------------------------------------------------------------ construction
     struct BaseConfig {
@@ -193,7 +212,9 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
 
     constructor(BaseConfig memory c) ERC20(c.name, c.symbol) Ownable(c.owner) {
         if (address(c.asset).code.length == 0) revert BadParam();
-        if (c.keeper == address(0) || c.guardian == address(0) || c.feeRecipient == address(0)) revert BadParam();
+        if (c.wrappedBase != address(0) && c.wrappedBase.code.length == 0) revert BadParam();
+        if (c.keeper == address(0) || c.guardian == address(0) || c.keeper == c.guardian) revert BadParam();
+        if (c.feeRecipient == address(0) || c.feeRecipient == address(this)) revert BadParam();
         if (c.hedgeTreasury == address(this)) revert BadParam();
         asset = c.asset;
         baseToken = c.baseToken;
@@ -213,6 +234,11 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
     // ------------------------------------------------------------------ modifiers
     modifier onlyKeeper() {
         if (msg.sender != keeper) revert NotKeeper();
+        _;
+    }
+
+    modifier onlyGuardian() {
+        if (msg.sender != guardian) revert NotGuardian();
         _;
     }
 
@@ -272,7 +298,7 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
     }
 
     /// @notice Asset value of `shares` at the last settled NAV (indicative; the real price is set at settlement).
-    function previewRedeemLast(uint256 shares) external view returns (uint256) {
+    function previewRedeemLast(uint256 shares) public view returns (uint256) {
         return Math.mulDiv(shares, lastNav + 1, totalSupply() + VIRTUAL_SHARES);
     }
 
@@ -293,7 +319,7 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
     }
 
     function canEmergencyUnwind() public view returns (bool) {
-        return emergency || block.timestamp > lastSettleTime + SETTLE_TIMEOUT;
+        return emergency || (epoch != 0 && block.timestamp > lastProgressTime + SETTLE_TIMEOUT);
     }
 
     // ------------------------------------------------------------------ client: deposits
@@ -313,7 +339,6 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
     }
 
     function _requestDeposit(uint256 assets) internal whenNotPaused notEmergency returns (uint256 id) {
-        if (assets == 0) revert ZeroAmount();
         if (assets < params.minDeposit) revert BelowMinDeposit();
         uint256 before = asset.balanceOf(address(this));
         asset.safeTransferFrom(msg.sender, address(this), assets);
@@ -324,7 +349,8 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
         emit DepositRequested(id, msg.sender, assets);
     }
 
-    /// @notice Cancel a queued deposit and get the asset back. Never paused; works in emergency too.
+    /// @notice Cancel a queued deposit and get the asset back. Never paused; works in emergency too. If the transfer
+    ///         to the owner fails (e.g. a blocked address) the amount becomes `claimable` (see `claimTo`).
     function cancelDeposit(uint256 id) external nonReentrant {
         DepositRequest storage d = depositRequests[id];
         if (d.owner != msg.sender) revert NotRequestOwner();
@@ -332,15 +358,15 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
         if (a == 0) revert ZeroAmount();
         d.assets = 0;
         pendingDepositAssets -= a;
-        asset.safeTransfer(msg.sender, a);
+        _pay(msg.sender, a);
         emit DepositCancelled(id, msg.sender, a);
     }
 
     // ------------------------------------------------------------------ client: redeems
     /// @notice Lock `shares` for redemption at the next settlement; USDC is pushed to the caller. Never paused.
     function requestRedeem(uint256 shares) external nonReentrant notEmergency returns (uint256 id) {
-        if (shares == 0) revert ZeroAmount();
-        _transfer(msg.sender, address(this), shares);
+        if (previewRedeemLast(shares) == 0) revert ZeroAmount(); // dust that would burn for nothing
+        super._update(msg.sender, address(this), shares); // the only way shares enter the vault
         lockedShares += shares;
         id = redeemTail++;
         redeemRequests[id] = RedeemRequest(msg.sender, shares);
@@ -360,37 +386,58 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
         emit RedeemCancelled(id, msg.sender, sh);
     }
 
-    /// @notice Pull asset owed from a redemption whose push transfer failed.
-    function claim() external nonReentrant {
+    /// @notice Pull asset owed from a redemption / cancellation whose push transfer failed.
+    function claim() external {
+        claimTo(msg.sender);
+    }
+
+    /// @notice Same as `claim`, paid to `to` (e.g. when the owner's address is blocked by the asset).
+    function claimTo(address to) public nonReentrant {
+        if (to == address(0) || to == address(this)) revert BadParam();
         uint256 a = claimable[msg.sender];
         if (a == 0) revert ZeroAmount();
         claimable[msg.sender] = 0;
         totalClaimable -= a;
-        asset.safeTransfer(msg.sender, a);
+        asset.safeTransfer(to, a);
         emit Claimed(msg.sender, a);
+    }
+
+    /// @dev Push `a` asset to `to`; on failure reserve it as `claimable[to]`. Returns false if it was not pushed.
+    function _pay(address to, uint256 a) internal returns (bool) {
+        if (a == 0 || asset.trySafeTransfer(to, a)) return true;
+        claimable[to] += a;
+        totalClaimable += a;
+        return false;
     }
 
     // ------------------------------------------------------------------ keeper: settlement
     /// @notice Apply a fresh NAV, take the performance fee, process queued deposits and redeems.
-    /// @dev    Allowed while paused (then only redeems are processed) so a pause never blocks exits.
+    /// @dev    Allowed while paused so a pause never blocks exits; then the anchor and fees are frozen and only
+    ///         redeems are processed. A clipped report never reverts: it processes redeems only.
     function settle(Report calldata r) external nonReentrant onlyKeeper notEmergency {
         if (r.epoch != epoch) revert BadEpoch();
         _checkPoolBand(r.price);
-        _checkHedgeEquity(r.hedgeEquity);
-        hedgeEquity = r.hedgeEquity;
+        (uint256 price, bool clipped) =
+            RiskBudgets.movePrice(budgets, lastPrice, r.price, paused ? 0 : uint256(params.refDriftBps) * (WAD / BPS));
+        bool hClipped;
+        (hedgeEquity, hClipped) = _hedgeFor(r.hedgeEquity);
 
-        uint256 nav = grossAssets(r.price);
+        uint256 nav = grossAssets(price);
         uint256 supply = totalSupply();
-        uint256 feeShares = _accrueFee(nav, supply);
-        supply += feeShares;
-
-        if (!paused) (nav, supply) = _processDeposits(r.maxDeposits, nav, supply);
+        uint256 feeShares;
+        if (!(clipped || hClipped || paused)) {
+            feeShares = _accrueFee(nav, supply);
+            supply += feeShares;
+            (nav, supply) = _processDeposits(r.maxDeposits, nav, supply);
+        }
+        uint256 locked0 = lockedShares;
         (nav, supply) = _processRedeems(r.maxRedeems, nav, supply);
+        if (lockedShares < locked0 || redeemHead == redeemTail) lastProgressTime = block.timestamp;
 
         lastNav = nav;
-        lastPrice = r.price;
+        lastPrice = price;
         lastSettleTime = block.timestamp;
-        emit Settled(epoch, nav, r.price, r.hedgeEquity, feeShares, _pps(nav, supply));
+        emit Settled(epoch, nav, price, hedgeEquity, feeShares, _pps(nav, supply));
         epoch++;
     }
 
@@ -427,10 +474,14 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
             uint256 sh = Math.mulDiv(a, supply + VIRTUAL_SHARES, nav + 1);
             d.assets = 0;
             pendingDepositAssets -= a;
-            nav += a;
             if (sh != 0) {
+                nav += a;
                 supply += sh;
                 _mint(d.owner, sh);
+            } else {
+                // would buy nothing: refund instead of donating it to the holders
+                claimable[d.owner] += a;
+                totalClaimable += a;
             }
             emit Deposited(head, d.owner, a, sh);
         }
@@ -438,6 +489,8 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
         return (nav, supply);
     }
 
+    /// @dev FIFO. The head request is paid partially with all idle asset if it cannot be paid in full; the rest of
+    ///      it stays at the head.
     function _processRedeems(uint256 max, uint256 nav, uint256 supply) internal returns (uint256, uint256) {
         uint256 head = redeemHead;
         uint256 end = redeemTail;
@@ -449,20 +502,20 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
             if (sh == 0) continue;
             uint256 a = Math.mulDiv(sh, nav + 1, supply + VIRTUAL_SHARES);
             if (a > nav) a = nav;
-            if (a > idle) break; // FIFO: wait for the keeper to free liquidity
-            q.shares = 0;
-            lockedShares -= sh;
-            _burn(address(this), sh);
-            supply -= sh;
+            uint256 burnSh = sh;
+            if (a > idle) {
+                burnSh = Math.mulDiv(sh, idle, a);
+                a = Math.mulDiv(burnSh, nav + 1, supply + VIRTUAL_SHARES);
+                if (a == 0) break;
+            }
+            q.shares = sh - burnSh;
+            lockedShares -= burnSh;
+            _burn(address(this), burnSh);
+            supply -= burnSh;
             nav -= a;
             idle -= a;
-            bool pushed = true;
-            if (a != 0 && !asset.trySafeTransfer(q.owner, a)) {
-                pushed = false;
-                claimable[q.owner] += a;
-                totalClaimable += a;
-            }
-            emit Redeemed(head, q.owner, sh, a, pushed);
+            emit Redeemed(head, q.owner, burnSh, a, _pay(q.owner, a));
+            if (burnSh != sh) break; // partially filled head: wait for more liquidity
         }
         redeemHead = head;
         return (nav, supply);
@@ -471,40 +524,41 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
     function _checkPoolBand(uint256 price) internal view {
         if (price == 0) revert BadPrice();
         uint256 p = _poolPrice();
-        uint256 diff = p > price ? p - price : price - p;
-        if (diff * BPS > price * params.poolBandBps) revert PoolPriceOff(p, price);
+        if (_absDiff(p, price) * BPS > price * params.poolBandBps) revert PoolPriceOff(p, price);
     }
 
-    /// @dev The reported off-chain equity may drift (in absolute terms, summed) by at most `hedgeStepBps` of the last
-    ///      NAV per rolling day, so a compromised keeper cannot compound small jumps over many quick settlements.
-    ///      Larger moves need the guardian's exact co-confirmation for this epoch (which does not consume budget).
-    function _checkHedgeEquity(uint256 v) internal {
+    function _absDiff(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a > b ? a - b : b - a;
+    }
+
+    /// @dev Keeper alone may only LOWER the off-chain equity, by at most `hedgeStepBps` of the last NAV (which never
+    ///      includes this settlement's deposits) per decaying day; any increase needs the guardian's co-signature.
+    ///      Margin moved by `sendHedgeMargin`/`returnHedgeMargin` is applied directly and is not a "move".
+    function _hedgeFor(uint256 v) internal returns (uint256, bool) {
         uint256 old = hedgeEquity;
-        uint256 diff = v > old ? v - old : old - v;
-        if (diff == 0) return;
-        if (block.timestamp >= hedgeDriftStart + 1 days) {
-            hedgeDriftStart = block.timestamp;
-            hedgeDriftUsed = 0;
-        }
-        uint256 used = hedgeDriftUsed + diff;
-        if (used * BPS <= lastNav * params.hedgeStepBps) {
-            hedgeDriftUsed = used;
-            return;
-        }
-        if (approvedHedgeEpoch == epoch + 1 && approvedHedgeEquity == v) {
-            approvedHedgeEpoch = 0;
-            return;
-        }
-        revert HedgeEquityJump(old, v);
+        if (v == old) return (v, false);
+        if (hedgeTreasury == address(0)) revert NoHedge();
+        return RiskBudgets.moveHedge(budgets, old, v, epoch, Math.mulDiv(lastNav, params.hedgeStepBps, BPS));
     }
 
-    /// @dev Keeper-supplied price for an LP/swap action: near the pool and near the last settled price.
+    /// @dev Keeper-supplied price for an LP/swap action: within `poolBandBps` of the pool AND of the price anchor.
     function _checkKeeperPrice(uint256 price) internal view {
         _checkPoolBand(price);
         uint256 ref = lastPrice;
-        if (ref == 0) return; // before the first settlement there is no NAV to protect
-        uint256 diff = price > ref ? price - ref : ref - price;
-        if (diff * BPS > ref * params.refDriftBps) revert BadPrice();
+        if (ref != 0 && _absDiff(price, ref) * BPS > ref * params.poolBandBps) revert BadPrice();
+    }
+
+    /// @dev Value of an LP add at the anchor: what the position is worth must be within `maxSlippageBps` of what the
+    ///      vault paid, and the paid value counts against the turnover budget (an add is a swap in effect).
+    function _checkAdd(uint256 got, uint256 paid) internal {
+        if (got * BPS < paid * (BPS - params.maxSlippageBps)) revert AddValue(got, paid);
+        _useTurnover(paid);
+    }
+
+    /// @dev Asset-denominated value at `price` of the asset and base the vault holds (raw balances).
+    function _heldValue(uint256 price) internal view returns (uint256) {
+        uint256 b = baseToken == address(0) ? address(this).balance : IERC20(baseToken).balanceOf(address(this));
+        return asset.balanceOf(address(this)) + Math.mulDiv(b, price, WAD);
     }
 
     /// @dev After any keeper action: queued deposits and unpaid claims stay fully backed.
@@ -512,28 +566,28 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
         if (asset.balanceOf(address(this)) < pendingDepositAssets + totalClaimable) revert ReserveBreached();
     }
 
-    /// @dev Rolling-day window (not per settlement): settling is free for the keeper, so a per-epoch budget could
-    ///      be reset at will by settling with empty queues between swaps.
+    /// @dev Decaying-day budget (not per settlement: settling is free for the keeper).
     function _useTurnover(uint256 notional) internal {
-        uint256 used = notional;
-        if (block.timestamp < swapWindowStart + 1 days) used += swapNotionalUsed;
-        else swapWindowStart = block.timestamp;
-        if (used * BPS > lastNav * params.swapTurnoverBps) revert Turnover();
-        swapNotionalUsed = used;
+        RiskBudgets.useTurnover(budgets, notional, Math.mulDiv(lastNav, params.swapTurnoverBps, BPS));
     }
 
     // ------------------------------------------------------------------ keeper: hedge margin
-    /// @notice Send hedge margin to the fixed `hedgeTreasury`; total outstanding margin <= hedgeCapBps of last NAV.
-    function sendHedgeMargin(uint256 amount) external nonReentrant onlyKeeper whenNotPaused notEmergency {
+    /// @notice Send hedge margin to the fixed `hedgeTreasury`. max(reported equity, net margin outstanding) after the
+    ///         send must stay <= hedgeCapBps of last NAV. Allowed while paused (topping up a short is risk-reducing).
+    function sendHedgeMargin(uint256 amount) external nonReentrant onlyKeeper notEmergency {
         if (hedgeTreasury == address(0)) revert NoHedge();
         if (amount == 0) revert ZeroAmount();
-        uint256 after_ = hedgeEquity + amount;
+        uint256 h = hedgeEquity;
+        uint256 m = netMargin;
+        uint256 after_ = (h > m ? h : m) + amount;
         uint256 cap = hedgeCap();
         if (after_ > cap) revert HedgeCap(after_, cap);
-        hedgeEquity = after_;
+        hedgeEquity = h + amount;
+        netMargin = m + amount;
+        budgets.hedgeApprovedEpoch = 0; // an approval was judged against the old baseline
         asset.safeTransfer(hedgeTreasury, amount);
         _checkReserve();
-        emit HedgeMarginSent(amount, after_);
+        emit HedgeMarginSent(amount, h + amount);
     }
 
     /// @notice Pull hedge margin back from `hedgeTreasury` (which must approve the vault). Keeper or treasury.
@@ -546,6 +600,9 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
         if (asset.balanceOf(address(this)) - before != amount) revert TransferFailed();
         uint256 h = hedgeEquity;
         hedgeEquity = amount >= h ? 0 : h - amount;
+        uint256 m = netMargin;
+        netMargin = amount >= m ? 0 : m - amount;
+        budgets.hedgeApprovedEpoch = 0;
         emit HedgeMarginReturned(amount, hedgeEquity);
     }
 
@@ -560,23 +617,33 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
         emit Paused(p, msg.sender);
     }
 
-    /// @notice Guardian co-confirms an off-chain hedge equity jump larger than `hedgeStepBps` for the current epoch.
-    function approveHedgeEquity(uint256 value) external {
-        if (msg.sender != guardian) revert NotGuardian();
-        approvedHedgeEquity = value;
-        approvedHedgeEpoch = epoch + 1;
-        emit HedgeEquityApproved(epoch, value);
+    /// @notice Guardian co-signs the exact off-chain hedge equity for the current epoch, valid until `until`.
+    ///         Cleared by any margin send/return (it was judged against the old baseline) and when used.
+    function approveHedgeEquity(uint256 value, uint256 until) external onlyGuardian {
+        budgets.hedgeApproved = value;
+        budgets.hedgeApprovedEpoch = epoch + 1;
+        budgets.hedgeApprovedUntil = until;
+        emit HedgeEquityApproved(epoch, value, until);
+    }
+
+    /// @notice Guardian vouches for settlement prices in [lo, hi] until `until`: such a report moves the anchor
+    ///         without using the drift budget (also while paused). `until = 0` revokes.
+    function approvePrice(uint256 lo, uint256 hi, uint256 until) external onlyGuardian {
+        budgets.priceApprovedLo = lo;
+        budgets.priceApprovedHi = hi;
+        budgets.priceApprovedUntil = until;
+        emit PriceApproved(lo, hi, until);
     }
 
     // ------------------------------------------------------------------ owner
     function setKeeper(address k) external onlyOwner {
-        if (k == address(0)) revert BadParam();
+        if (k == address(0) || k == guardian) revert BadParam();
         keeper = k;
         emit RoleSet("keeper", k);
     }
 
     function setGuardian(address g) external onlyOwner {
-        if (g == address(0)) revert BadParam();
+        if (g == address(0) || g == keeper) revert BadParam();
         guardian = g;
         emit RoleSet("guardian", g);
     }
@@ -591,42 +658,60 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
         _setParams(p);
     }
 
+    /// @notice Disabled: without an owner a pause could never be lifted and a hostile keeper never rotated.
+    function renounceOwnership() public pure override {
+        revert BadParam();
+    }
+
     function _setParams(Params memory p) internal {
         if (
             p.feeBps > MAX_FEE_BPS || p.hedgeCapBps > MAX_HEDGE_CAP_BPS || p.poolBandBps > MAX_POOL_BAND_BPS
                 || p.poolBandBps == 0 || p.maxSlippageBps > MAX_SLIPPAGE_BPS || p.hedgeStepBps > MAX_HEDGE_STEP_BPS
-                || p.refDriftBps > MAX_REF_DRIFT_BPS || p.swapTurnoverBps > MAX_TURNOVER_BPS
+                || p.refDriftBps > MAX_REF_DRIFT_BPS || p.swapTurnoverBps > MAX_TURNOVER_BPS || p.minDeposit == 0
                 || p.minDeposit > 100 * 10 ** _assetDecimals
         ) revert BadParam();
-        if (hedgeTreasury == address(0) && p.hedgeCapBps != 0) revert BadParam();
+        if (hedgeTreasury == address(0) && (p.hedgeCapBps != 0 || p.hedgeStepBps != 0)) revert BadParam();
         params = p;
         emit ParamsSet(p);
     }
 
+    /// @dev Shares can enter the vault only through `requestRedeem` (they would otherwise be unrecoverable and
+    ///      dilute every pro-rata payout).
+    function _update(address from, address to, uint256 value) internal override {
+        if (to == address(this)) revert BadParam();
+        super._update(from, to, value);
+    }
+
     // ------------------------------------------------------------------ emergency
-    /// @notice Permissionless after 72 h without settlement. Removes all LP liquidity into tokens and starts the
-    ///         permanent wind-down. Between 72 h and 7 days the pool price must be within 10% of the last settled
-    ///         price (anti-manipulation); after 7 days no price condition. Can be called again to retry positions
-    ///         that failed to unwind. See contract NatSpec for the hedge-treasury part.
+    /// @notice Permissionless wind-down when the redeem queue made no progress for `SETTLE_TIMEOUT` after the first
+    ///         settlement. Two steps: the first call arms it, a call `UNWIND_NOTICE` later executes it unless a
+    ///         settlement made progress in between (protects against a sequencer outage being read as keeper
+    ///         absence). Removes all LP liquidity into tokens; can be called again to retry failed positions.
     function emergencyUnwind() external nonReentrant {
         if (!emergency) {
-            if (block.timestamp <= lastSettleTime + SETTLE_TIMEOUT) revert TooEarly();
-            if (block.timestamp <= lastSettleTime + EMERGENCY_FORCE_DELAY && lastPrice != 0) {
-                uint256 p = _poolPrice();
-                uint256 diff = p > lastPrice ? p - lastPrice : lastPrice - p;
-                if (diff * BPS > lastPrice * EMERGENCY_BAND_BPS) revert PoolPriceOff(p, lastPrice);
+            if (!canEmergencyUnwind()) revert TooEarly();
+            uint256 armed = unwindArmedAt;
+            if (armed <= lastProgressTime) {
+                unwindArmedAt = block.timestamp;
+                emit EmergencyArmed(msg.sender);
+                return;
             }
+            if (block.timestamp < armed + UNWIND_NOTICE) revert TooEarly();
             emergency = true;
+            emergencySince = block.timestamp;
             emit EmergencyUnwind(msg.sender);
         }
         if (_positionCount() != 0) _unwindAll();
     }
 
-    /// @notice Wind-down exit: burn `shares` for a pro-rata part of every token the vault holds on-chain.
+    /// @notice Wind-down exit: burn `shares` for a pro-rata part of every token the vault holds on-chain. Refused
+    ///         while LP positions are still open during the first `EMERGENCY_GRACE` (call `emergencyUnwind` again).
+    ///         A failed asset transfer is credited to `claimable[to]` so the native/wrapped legs still go out.
     function emergencyRedeem(uint256 shares, address to) external nonReentrant {
         if (!emergency) revert NotEmergency();
         if (shares == 0) revert ZeroAmount();
         if (to == address(0) || to == address(this)) revert BadParam();
+        if (_positionCount() != 0 && block.timestamp < emergencySince + EMERGENCY_GRACE) revert PositionsOpen();
         // shares locked in queued redeems still count: their owners cancelRedeem and claim the same pro-rata part
         uint256 supply = totalSupply();
         uint256 aOut = Math.mulDiv(idleAsset(), shares, supply);
@@ -637,7 +722,7 @@ abstract contract LPVaultBase is ERC20, Ownable2Step, ReentrancyGuardTransient {
             ? 0
             : Math.mulDiv(IERC20(wrappedBase).balanceOf(address(this)), shares, supply);
         _burn(msg.sender, shares);
-        if (aOut != 0) asset.safeTransfer(to, aOut);
+        _pay(to, aOut);
         if (wOut != 0) IERC20(wrappedBase).safeTransfer(to, wOut);
         if (bOut != 0) {
             if (baseToken == address(0)) {

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
@@ -36,7 +36,7 @@ abstract contract VaultTestBase is Test {
 
     function config(address hedgeTreasury_) internal view returns (LPVaultBase.BaseConfig memory) {
         LPVaultBase.Params memory p = defaultParams();
-        if (hedgeTreasury_ == address(0)) p.hedgeCapBps = 0;
+        if (hedgeTreasury_ == address(0)) (p.hedgeCapBps, p.hedgeStepBps) = (0, 0);
         return LPVaultBase.BaseConfig({
             asset: IERC20(address(usdc)),
             baseToken: address(0),
@@ -93,6 +93,15 @@ abstract contract VaultTestBase is Test {
     function redeem(address who, uint256 sh) internal returns (uint256 id) {
         vm.prank(who);
         id = vault.requestRedeem(sh);
+    }
+
+    /// Keeper gone: wait out the 72 h no-progress timeout, arm, wait the notice, execute.
+    function forceEmergency() internal {
+        vm.warp(vault.lastProgressTime() + 72 hours + 1);
+        vault.emergencyUnwind(); // arm
+        vm.warp(vm.getBlockTimestamp() + 6 hours);
+        vault.emergencyUnwind();
+        assertTrue(vault.emergency());
     }
 
     function valueOf(address who) internal view returns (uint256) {

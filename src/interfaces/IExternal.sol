@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
 
 /// @notice Minimal Uniswap v4 PositionManager surface used by the vault (matches the deployed periphery ABI).

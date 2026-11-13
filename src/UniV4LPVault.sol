@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -26,33 +26,28 @@ import {IPositionManagerMin, IPermit2Min, IWrappedNative} from "./interfaces/IEx
 ///         vault; swaps go straight through PoolManager.unlock on the same pool. Every keeper action is allowlisted:
 ///         the pool key, the recipient (always this vault) and the PoolManager/PositionManager targets are immutable,
 ///         so the keeper can never move tokens anywhere except into the vault's own positions, the configured pool
-///         (swap, min-out enforced) or `hedgeTreasury` (relative cap).
+///         (swap, min-out enforced) or `hedgeTreasury` (relative cap). Swaps and liquidity adds are bounded the same
+///         way: keeper price within the band of pool and anchor, value received at the anchor within
+///         `maxSlippageBps` of value paid, notional charged to the decaying turnover budget.
 contract UniV4LPVault is LPVaultBase, IUnlockCallback {
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
     using StateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
 
-    // PositionManager action codes (v4-periphery Actions.sol)
-    uint8 internal constant A_INCREASE = 0x00;
-    uint8 internal constant A_DECREASE = 0x01;
-    uint8 internal constant A_MINT = 0x02;
-    uint8 internal constant A_BURN = 0x03;
-    uint8 internal constant A_SETTLE_PAIR = 0x0d;
-    uint8 internal constant A_TAKE_PAIR = 0x11;
-    uint8 internal constant A_CLOSE_CURRENCY = 0x12;
-    uint8 internal constant A_SWEEP = 0x14;
-
     uint256 public constant MAX_POSITIONS = 8;
+    /// Gas that must remain before each burn attempt in `_unwindAll`: a v4 burn costs ~0.2M, so a caught failure
+    /// with this much gas forwarded is a real failure, never one induced by a caller who under-supplied gas (M-8).
+    uint256 internal constant UNWIND_MIN_GAS = 1_000_000;
 
     IPoolManager public immutable poolManager;
     IPositionManagerMin public immutable positionManager;
-    IPermit2Min public immutable permit2;
-    address public immutable currency0;
-    address public immutable currency1;
-    uint24 public immutable fee;
-    int24 public immutable tickSpacing;
-    bool public immutable baseIsCurrency0;
+    IPermit2Min internal immutable permit2;
+    address internal immutable currency0;
+    address internal immutable currency1;
+    uint24 internal immutable fee;
+    int24 internal immutable tickSpacing;
+    bool internal immutable baseIsCurrency0;
     PoolId public immutable poolId;
 
     V4PositionMath.Position[] internal _positions;
@@ -71,6 +66,7 @@ contract UniV4LPVault is LPVaultBase, IUnlockCallback {
     error BelowMinOut(uint256 out, uint256 minOut);
     error NotPoolManager();
     error MintFailed();
+    error UnwindOutOfGas();
 
     struct V4Config {
         IPoolManager poolManager;
@@ -147,15 +143,17 @@ contract UniV4LPVault is LPVaultBase, IUnlockCallback {
     ) external nonReentrant onlyKeeper whenNotPaused notEmergency returns (uint256 tokenId) {
         _checkKeeperPrice(keeperPrice);
         if (_positions.length >= MAX_POSITIONS) revert TooManyPositions();
+        uint256 ref = _ref(keeperPrice);
+        uint256 v0 = _heldValue(ref);
         tokenId = positionManager.nextTokenId();
-        bytes memory actions = abi.encodePacked(A_MINT, A_SETTLE_PAIR, A_SWEEP);
-        bytes[] memory ps = new bytes[](3);
-        ps[0] = abi.encode(poolKey(), tickLower, tickUpper, uint256(liquidity), amount0Max, amount1Max, address(this), bytes(""));
-        ps[1] = abi.encode(currency0, currency1);
-        ps[2] = abi.encode(currency0, address(this));
-        _modify(actions, ps, amount0Max, amount1Max);
+        _modify(
+            V4PositionMath.mintData(poolKey(), tickLower, tickUpper, liquidity, amount0Max, amount1Max, address(this)),
+            amount0Max,
+            amount1Max
+        );
         if (positionManager.ownerOf(tokenId) != address(this)) revert MintFailed();
         _positions.push(V4PositionMath.Position(tokenId, tickLower, tickUpper));
+        _checkAddAt(v0, ref, tickLower, tickUpper, liquidity);
         _checkReserve();
         emit PositionMinted(tokenId, tickLower, tickUpper, liquidity);
     }
@@ -169,14 +167,15 @@ contract UniV4LPVault is LPVaultBase, IUnlockCallback {
         notEmergency
     {
         _checkKeeperPrice(keeperPrice);
-        _indexOf(tokenId);
-        bytes memory actions = abi.encodePacked(A_INCREASE, A_CLOSE_CURRENCY, A_CLOSE_CURRENCY, A_SWEEP);
-        bytes[] memory ps = new bytes[](4);
-        ps[0] = abi.encode(tokenId, uint256(liquidity), amount0Max, amount1Max, bytes(""));
-        ps[1] = abi.encode(currency0);
-        ps[2] = abi.encode(currency1);
-        ps[3] = abi.encode(currency0, address(this));
-        _modify(actions, ps, amount0Max, amount1Max);
+        V4PositionMath.Position memory pos = _positions[_indexOf(tokenId)];
+        uint256 ref = _ref(keeperPrice);
+        uint256 v0 = _heldValue(ref);
+        _modify(
+            V4PositionMath.increaseData(tokenId, liquidity, amount0Max, amount1Max, currency0, currency1, address(this)),
+            amount0Max,
+            amount1Max
+        );
+        _checkAddAt(v0, ref, pos.tickLower, pos.tickUpper, liquidity);
         _checkReserve();
         emit PositionIncreased(tokenId, liquidity);
     }
@@ -189,11 +188,7 @@ contract UniV4LPVault is LPVaultBase, IUnlockCallback {
         notEmergency
     {
         _indexOf(tokenId);
-        bytes memory actions = abi.encodePacked(A_DECREASE, A_TAKE_PAIR);
-        bytes[] memory ps = new bytes[](2);
-        ps[0] = abi.encode(tokenId, uint256(liquidity), amount0Min, amount1Min, bytes(""));
-        ps[1] = abi.encode(currency0, currency1, address(this));
-        _modify(actions, ps, 0, 0);
+        _modify(_removeData(false, tokenId, liquidity, amount0Min, amount1Min), 0, 0);
         emit PositionDecreased(tokenId, liquidity);
     }
 
@@ -205,19 +200,29 @@ contract UniV4LPVault is LPVaultBase, IUnlockCallback {
         notEmergency
     {
         uint256 i = _indexOf(tokenId);
-        _modify(_burnActions(), _burnParams(tokenId, amount0Min, amount1Min), 0, 0);
+        _modify(_removeData(true, tokenId, 0, amount0Min, amount1Min), 0, 0);
         _removeAt(i);
         emit PositionBurned(tokenId);
     }
 
-    function _burnActions() internal pure returns (bytes memory) {
-        return abi.encodePacked(A_BURN, A_TAKE_PAIR);
+    /// @dev Valuation price for an LP add: the anchor (the keeper price only before the first settlement).
+    function _ref(uint256 keeperPrice) internal view returns (uint256) {
+        return lastPrice == 0 ? keeperPrice : lastPrice;
     }
 
-    function _burnParams(uint256 tokenId, uint128 min0, uint128 min1) internal view returns (bytes[] memory ps) {
-        ps = new bytes[](2);
-        ps[0] = abi.encode(tokenId, min0, min1, bytes(""));
-        ps[1] = abi.encode(currency0, currency1, address(this));
+    /// @dev H-3: an add is a swap in effect. Paid = drop in the vault's held value at `ref` (fees collected by an
+    ///      increase net against it); got = the new liquidity valued at `ref`.
+    function _checkAddAt(uint256 v0, uint256 ref, int24 tl, int24 tu, uint128 liquidity) internal {
+        uint256 v1 = _heldValue(ref);
+        _checkAdd(V4PositionMath.liquidityValue(tl, tu, liquidity, ref, baseIsCurrency0), v0 > v1 ? v0 - v1 : 0);
+    }
+
+    function _removeData(bool burn, uint256 tokenId, uint128 liq, uint128 min0, uint128 min1)
+        internal
+        view
+        returns (bytes memory)
+    {
+        return V4PositionMath.removeData(burn, tokenId, liq, min0, min1, currency0, currency1, address(this));
     }
 
     function _removeAt(uint256 i) internal {
@@ -227,12 +232,12 @@ contract UniV4LPVault is LPVaultBase, IUnlockCallback {
     }
 
     /// @dev Calls PositionManager with exact, same-tx Permit2 allowances for ERC-20 legs and msg.value for native.
-    function _modify(bytes memory actions, bytes[] memory ps, uint128 max0, uint128 max1) internal {
+    function _modify(bytes memory data, uint128 max0, uint128 max1) internal {
         uint256 value;
         if (currency0 == address(0)) value = max0;
         else if (max0 != 0) permit2.approve(currency0, address(positionManager), max0, uint48(block.timestamp));
         if (max1 != 0) permit2.approve(currency1, address(positionManager), max1, uint48(block.timestamp));
-        positionManager.modifyLiquidities{value: value}(abi.encode(actions, ps), block.timestamp);
+        positionManager.modifyLiquidities{value: value}(data, block.timestamp);
         if (currency0 != address(0) && max0 != 0) permit2.approve(currency0, address(positionManager), 0, 0);
         if (max1 != 0) permit2.approve(currency1, address(positionManager), 0, 0);
     }
@@ -242,7 +247,8 @@ contract UniV4LPVault is LPVaultBase, IUnlockCallback {
         while (i != 0) {
             --i;
             uint256 id = _positions[i].tokenId;
-            try positionManager.modifyLiquidities(abi.encode(_burnActions(), _burnParams(id, 0, 0)), block.timestamp) {
+            if (gasleft() < UNWIND_MIN_GAS) revert UnwindOutOfGas();
+            try positionManager.modifyLiquidities(_removeData(true, id, 0, 0, 0), block.timestamp) {
                 _removeAt(i);
                 emit PositionBurned(id);
             } catch (bytes memory reason) {
@@ -253,8 +259,9 @@ contract UniV4LPVault is LPVaultBase, IUnlockCallback {
 
     // ------------------------------------------------------------------ keeper: swaps
     /// @notice Exact-input swap through the configured pool only. minOut = fair value at `keeperPrice` minus
-    ///         `maxSlippageBps`; `keeperPrice` must be within `poolBandBps` of the pool and `refDriftBps` of the last
-    ///         settled price; cumulative swap notional per rolling day <= `swapTurnoverBps` of the last NAV.
+    ///         `maxSlippageBps`; `keeperPrice` must be within `poolBandBps` of the pool and of the price anchor, so the
+    ///         loss per unit of notional is <= poolBandBps + maxSlippageBps against the anchor; swap + LP-add
+    ///         notional per decaying day <= `swapTurnoverBps` of the last NAV.
     function swap(bool sellBase, uint256 amountIn, uint256 keeperPrice)
         external
         nonReentrant
@@ -303,6 +310,7 @@ contract UniV4LPVault is LPVaultBase, IUnlockCallback {
         // forge-lint: disable-next-line(unsafe-typecast)
         uint256 got = uint256(uint128(dOut));
         if (cIn == address(0)) {
+            poolManager.sync(Currency.wrap(address(0))); // native settle requires the synced currency to be native
             poolManager.settle{value: pay}();
         } else {
             poolManager.sync(Currency.wrap(cIn));

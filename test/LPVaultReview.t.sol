@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
 import {LPVaultBase} from "../src/LPVaultBase.sol";
 import {MockLPVault} from "./mocks/Mocks.sol";
@@ -43,8 +43,7 @@ contract LPVaultReviewTest is VaultTestBase {
         hype = address(vault).balance;
         vault.addLiquidity(hype / 2, 20_000e6, P0);
         vm.stopPrank();
-        vm.warp(block.timestamp + 72 hours + 1);
-        vault.emergencyUnwind();
+        forceEmergency();
     }
 
     function test_EmergencyRedeemNativeReentrancyBlocked() public {
@@ -68,8 +67,7 @@ contract LPVaultReviewTest is VaultTestBase {
         vm.prank(keeper);
         vault.swap(false, 30_000e6, P0);
         uint256 id = redeem(bob, vault.balanceOf(bob)); // stuck in the queue when the keeper disappears
-        vm.warp(block.timestamp + 72 hours + 1);
-        vault.emergencyUnwind();
+        forceEmergency();
         vm.prank(bob);
         vault.cancelRedeem(id);
         uint256 aSh = vault.balanceOf(alice);
@@ -110,14 +108,14 @@ contract LPVaultReviewTest is VaultTestBase {
         vm.prank(keeper);
         vault.sendHedgeMargin(30_000e6);
         vm.prank(guardian);
-        vault.approveHedgeEquity(10_000e6);
+        vault.approveHedgeEquity(10_000e6, block.timestamp + 1 hours);
         settle(P0, 10_000e6);
         uint256 hwm = vault.highWaterMark();
         deposit(bob, 80_000e6); // enters in the drawdown
         settle(P0, 10_000e6);
         // recover to above the mark: +25% on everything
         vm.prank(guardian);
-        vault.approveHedgeEquity(10_000e6 + 40_000e6);
+        vault.approveHedgeEquity(10_000e6 + 40_000e6, block.timestamp + 1 hours);
         settle(P0, 50_000e6);
         uint256 pps = vault.lastPricePerShare();
         assertGt(pps, hwm);

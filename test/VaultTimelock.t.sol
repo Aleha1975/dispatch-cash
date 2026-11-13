@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {TimelockController} from "@openzeppelin/contracts/governance/TimelockController.sol";
@@ -52,7 +52,7 @@ contract VaultTimelockTest is VaultTestBase {
         cs = new bytes[](7);
         cs[0] = abi.encodeCall(LPVaultBase.setParams, (p));
         cs[1] = abi.encodeCall(LPVaultBase.setKeeper, (bob));
-        cs[2] = abi.encodeCall(LPVaultBase.setGuardian, (bob));
+        cs[2] = abi.encodeCall(LPVaultBase.setGuardian, (carol)); // keeper and guardian must differ
         cs[3] = abi.encodeCall(LPVaultBase.setFeeRecipient, (bob));
         cs[4] = abi.encodeCall(LPVaultBase.setPaused, (false));
         cs[5] = abi.encodeCall(Ownable.transferOwnership, (bob));
@@ -87,7 +87,9 @@ contract VaultTimelockTest is VaultTestBase {
                 vm.prank(callers[j]);
                 (bool ok, bytes memory ret) = address(vault).call(cs[i]);
                 assertFalse(ok);
-                assertEq(bytes4(ret), Ownable.OwnableUnauthorizedAccount.selector);
+                // renounceOwnership is disabled for everybody (L-12)
+                bytes4 want = i == 6 ? LPVaultBase.BadParam.selector : Ownable.OwnableUnauthorizedAccount.selector;
+                assertEq(bytes4(ret), want);
             }
         }
     }
@@ -116,7 +118,7 @@ contract VaultTimelockTest is VaultTestBase {
         assertEq(feeBps, 2000);
         assertEq(band, 500);
         assertEq(vault.keeper(), bob);
-        assertEq(vault.guardian(), bob);
+        assertEq(vault.guardian(), carol);
         assertEq(vault.feeRecipient(), bob);
     }
 
@@ -176,16 +178,15 @@ contract VaultTimelockTest is VaultTestBase {
     }
 
     function test_GuardianCannotVetoTimelockSelfOps() public {
-        // a compromised guardian must not be able to block its own removal (role change on the timelock)
-        address[] memory targets = new address[](3);
-        uint256[] memory values = new uint256[](3);
-        bytes[] memory payloads = new bytes[](3);
-        targets[0] = address(vault);
-        payloads[0] = abi.encodeCall(LPVaultBase.setGuardian, (carol));
+        // a compromised guardian must not be able to block its own removal (role change on the timelock).
+        // Rotation = (1) timelock-only batch moving CANCELLER, (2) vault.setGuardian once (1) is done.
+        address[] memory targets = new address[](2);
+        uint256[] memory values = new uint256[](2);
+        bytes[] memory payloads = new bytes[](2);
+        targets[0] = address(tl);
+        payloads[0] = abi.encodeCall(IAccessControl.revokeRole, (tl.CANCELLER_ROLE(), guardian));
         targets[1] = address(tl);
-        payloads[1] = abi.encodeCall(IAccessControl.revokeRole, (tl.CANCELLER_ROLE(), guardian));
-        targets[2] = address(tl);
-        payloads[2] = abi.encodeCall(IAccessControl.grantRole, (tl.CANCELLER_ROLE(), carol));
+        payloads[1] = abi.encodeCall(IAccessControl.grantRole, (tl.CANCELLER_ROLE(), carol));
         vm.prank(owner);
         tl.scheduleBatch(targets, values, payloads, bytes32(0), SALT, DELAY);
         bytes32 id = tl.hashOperationBatch(targets, values, payloads, bytes32(0), SALT);
@@ -193,9 +194,12 @@ contract VaultTimelockTest is VaultTestBase {
         vm.prank(guardian);
         vm.expectRevert(VaultTimelock.ProposerOnlyCancel.selector);
         tl.cancel(id);
+        bytes memory setG = abi.encodeCall(LPVaultBase.setGuardian, (carol));
+        _schedule(address(vault), setG);
         skip(DELAY);
         vm.prank(owner);
         tl.executeBatch(targets, values, payloads, bytes32(0), SALT);
+        _execute(address(vault), setG);
         assertEq(vault.guardian(), carol);
         assertFalse(tl.hasRole(tl.CANCELLER_ROLE(), guardian));
         assertTrue(tl.hasRole(tl.CANCELLER_ROLE(), carol));

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {ERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
@@ -59,6 +59,7 @@ contract MockLPVault is LPVaultBase {
     uint256 public mockPrice;
     uint256 public lpBase;
     uint256 public lpAsset;
+    bool public stuck; // simulate a position whose burn fails during emergencyUnwind
 
     constructor(BaseConfig memory c, uint256 price0) LPVaultBase(c) {
         pool = new MockPool(c.asset);
@@ -89,7 +90,12 @@ contract MockLPVault is LPVaultBase {
         return lpBase + lpAsset == 0 ? 0 : 1;
     }
 
+    function setStuck(bool s_) external {
+        stuck = s_;
+    }
+
     function _unwindAll() internal override {
+        if (stuck) return;
         (uint256 b, uint256 a) = (lpBase, lpAsset);
         lpBase = 0;
         lpAsset = 0;
@@ -105,6 +111,10 @@ contract MockLPVault is LPVaultBase {
         notEmergency
     {
         _checkKeeperPrice(keeperPrice);
+        // mirror UniV4LPVault: an add is valued at the anchor and charged to turnover (no IL in the mock)
+        uint256 px = lastPrice == 0 ? keeperPrice : lastPrice;
+        uint256 v = assetAmt + Math.mulDiv(baseAmt, px, WAD);
+        _checkAdd(v, v);
         lpBase += baseAmt;
         lpAsset += assetAmt;
         if (assetAmt != 0) asset.transfer(address(pool), assetAmt);

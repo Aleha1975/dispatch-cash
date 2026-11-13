@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
 import {LPVaultBase} from "../src/LPVaultBase.sol";
+import {RiskBudgets} from "../src/RiskBudgets.sol";
 import {MockLPVault} from "./mocks/Mocks.sol";
 import {VaultTestBase} from "./utils/VaultTestBase.sol";
 
@@ -114,16 +115,18 @@ contract LPVaultBaseTest is VaultTestBase {
         settle(P0);
         vm.prank(keeper);
         vault.addLiquidity(0, 90_000e6, P0); // only 10k idle
-        redeem(alice, vault.balanceOf(alice)); // 60k: not payable
-        redeem(bob, vault.balanceOf(bob) / 8); // 5k: payable but behind alice (FIFO)
+        redeem(alice, vault.balanceOf(alice)); // 60k: not payable in full
+        redeem(bob, vault.balanceOf(bob) / 8); // 5k: behind alice (FIFO)
+        uint256 a0 = usdc.balanceOf(alice);
         settle(P0);
+        // M-7: the head gets all idle USDC now, the rest of it stays at the head
+        assertApproxEqAbs(usdc.balanceOf(alice) - a0, 10_000e6, 2);
         assertEq(vault.redeemHead(), 0);
         assertEq(vault.pendingRedeems(), 2);
         // a new deposit nets against redemptions
         deposit(carol, 100_000e6);
-        uint256 a0 = usdc.balanceOf(alice);
         settle(P0);
-        assertApproxEqAbs(usdc.balanceOf(alice) - a0, 60_000e6, 2);
+        assertApproxEqAbs(usdc.balanceOf(alice) - a0, 60_000e6, 3);
         assertEq(vault.pendingRedeems(), 0);
     }
 
@@ -266,7 +269,7 @@ contract LPVaultBaseTest is VaultTestBase {
         vm.prank(keeper);
         vm.expectRevert();
         vault.swap(false, 1_000e6, P0 * 90 / 100);
-        // pool + keeper both drifted >10% from the last settled price
+        // pool + keeper both drifted beyond the band from the price anchor
         vault.setPoolPrice(P0 * 115 / 100);
         vm.prank(keeper);
         vm.expectRevert(LPVaultBase.BadPrice.selector);
@@ -277,7 +280,7 @@ contract LPVaultBaseTest is VaultTestBase {
         vault.swap(false, 100_000e6, P0);
         uint256 hype = address(vault).balance;
         vault.swap(true, hype, P0);
-        vm.expectRevert(LPVaultBase.Turnover.selector);
+        vm.expectRevert(RiskBudgets.Turnover.selector);
         vault.swap(false, 10_000e6, P0);
         vm.stopPrank();
     }
@@ -292,23 +295,25 @@ contract LPVaultBaseTest is VaultTestBase {
         settle(P0); // an empty settle used to reset the budget
         uint256 hype = address(vault).balance;
         vm.prank(keeper);
-        vm.expectRevert(LPVaultBase.Turnover.selector);
+        vm.expectRevert(RiskBudgets.Turnover.selector);
         vault.swap(true, hype, P0); // another ~1x within the same day: > 2x
         skip(1 days);
         settle(P0);
         vm.prank(keeper);
         vault.swap(true, hype, P0); // new window
-        assertEq(vault.swapNotionalUsed(), hype * P0 / 1e18);
+        (,,,, uint256 used,,,,,,,) = vault.budgets();
+        assertEq(used, hype * P0 / 1e18);
     }
 
     function test_SwapMinOutFromKeeperPrice() public {
         deposit(alice, 100_000e6);
         settle(P0);
-        // pool 1.4% worse than the keeper price (inside the band) but > 1% max slippage incl. 0.3% fee
-        vault.setPoolPrice(P0 * 986 / 1000);
+        // keeper price 0.9% below the pool and 1.4% below the anchor (inside both bands), but the pool can't
+        // deliver within 1% max slippage incl. the 0.3% fee
+        vault.setPoolPrice(P0 * 995 / 1000);
         vm.prank(keeper);
         vm.expectRevert(bytes("min out"));
-        vault.swap(false, 1_000e6, P0 * 972 / 1000); // asks for cheap HYPE: pool can't deliver
+        vault.swap(false, 1_000e6, P0 * 986 / 1000); // asks for cheap HYPE
     }
 
     // ------------------------------------------------------------------ reserve
@@ -346,44 +351,49 @@ contract LPVaultBaseTest is VaultTestBase {
         vault.sendHedgeMargin(1);
     }
 
-    function test_HedgeEquityStepBoundAndGuardianOverride() public {
+    function test_HedgeEquityDecreaseBudgetIncreaseNeedsGuardian() public {
         deposit(alice, 100_000e6);
         settle(P0);
         vm.prank(keeper);
         vault.sendHedgeMargin(30_000e6);
-        // +5% of NAV allowed
-        settle(P0, 35_000e6);
-        // next: more than 5% of NAV (105k) jump reverts
-        vault.setPoolPrice(P0);
-        LPVaultBase.Report memory r = report(P0, 35_000e6 - 5_300e6);
-        vm.prank(keeper);
-        vm.expectRevert(abi.encodeWithSelector(LPVaultBase.HedgeEquityJump.selector, 35_000e6, 29_700e6));
-        vault.settle(r);
-        // guardian co-confirms exactly this value for this epoch
+        // keeper alone may lower by up to 5% of NAV (5k) per decaying day
+        settle(P0, 26_000e6);
+        assertEq(vault.hedgeEquity(), 26_000e6);
+        // a further 2k decrease exceeds the remaining 5% x 96k - 4k = 0.8k: clipped, not reverted
+        settle(P0, 24_000e6);
+        assertEq(vault.hedgeEquity(), 25_200e6);
+        // an increase without the guardian is refused (value kept) and the settlement processes no deposits
+        uint256 h = vault.hedgeEquity();
+        deposit(bob, 10_000e6);
+        settle(P0, h + 1);
+        assertEq(vault.hedgeEquity(), h);
+        assertEq(vault.balanceOf(bob), 0);
+        assertEq(vault.pendingDepositAssets(), 10_000e6);
+        // guardian co-confirms exactly this value for this epoch: applied, deposits processed, one-shot
         vm.prank(guardian);
-        vault.approveHedgeEquity(29_700e6);
-        vm.prank(keeper);
-        vault.settle(r);
+        vault.approveHedgeEquity(29_700e6, block.timestamp + 1 hours);
+        settle(P0, 29_700e6);
         assertEq(vault.hedgeEquity(), 29_700e6);
-        // approval is one-shot
-        assertEq(vault.approvedHedgeEpoch(), 0);
+        assertGt(vault.balanceOf(bob), 0);
+        (,,,,,, uint256 h1, uint256 ep,,,,) = vault.budgets();
+        assertEq(h1, 29_700e6);
+        assertEq(ep, 0);
     }
 
-    function test_HedgeEquityDriftBudgetIsPerRollingDay() public {
+    function test_HedgeEquityDecreaseBudgetDecays() public {
         deposit(alice, 100_000e6);
         settle(P0);
         vm.prank(keeper);
         vault.sendHedgeMargin(30_000e6);
-        settle(P0, 33_000e6); // +3% of NAV
+        settle(P0, 27_000e6); // -3% of NAV
         uint256 nav = vault.lastNav();
-        LPVaultBase.Report memory r = report(P0, 33_000e6 + nav * 3 / 100); // another +3%: 6% > 5% in one day
-        vm.prank(keeper);
-        vm.expectRevert();
-        vault.settle(r);
-        vm.warp(block.timestamp + 1 days);
-        vm.prank(keeper);
-        vault.settle(r);
-        assertEq(vault.hedgeEquity(), 33_000e6 + nav * 3 / 100);
+        settle(P0, 27_000e6 - nav * 3 / 100); // another -3%: only ~2% left, clipped
+        assertGt(vault.hedgeEquity(), 27_000e6 - nav * 3 / 100);
+        uint256 h = vault.hedgeEquity();
+        nav = vault.lastNav();
+        vm.warp(vm.getBlockTimestamp() + 1 days); // fully restored
+        settle(P0, h - nav * 5 / 100);
+        assertEq(vault.hedgeEquity(), h - nav * 5 / 100);
     }
 
     function test_UnhedgedVaultCannotSendMargin() public {
@@ -412,16 +422,16 @@ contract LPVaultBaseTest is VaultTestBase {
         vm.expectRevert(LPVaultBase.IsPaused.selector);
         vault.addLiquidity(0, 1e6, P0);
         vm.expectRevert(LPVaultBase.IsPaused.selector);
-        vault.sendHedgeMargin(1e6);
-        vm.expectRevert(LPVaultBase.IsPaused.selector);
         vault.swap(false, 1e6, P0);
+        vault.sendHedgeMargin(1e6); // L-16: topping up the short stays possible while paused
         vm.stopPrank();
 
         // exits keep working: redeem request + settlement pays it; queued deposit stays queued
         redeem(alice, vault.balanceOf(alice));
         uint256 b = usdc.balanceOf(alice);
         settle(P0);
-        assertApproxEqAbs(usdc.balanceOf(alice) - b, 100_000e6, 1);
+        // 1 USDC sits at the hedge treasury: the head is filled partially with all idle USDC (M-7)
+        assertApproxEqAbs(usdc.balanceOf(alice) - b, 99_999e6, 1);
         assertEq(vault.pendingDepositAssets(), 1_000e6);
         vm.prank(bob);
         vault.cancelDeposit(1);
@@ -439,9 +449,23 @@ contract LPVaultBaseTest is VaultTestBase {
     function test_EmergencyUnwind_TooEarly() public {
         vm.expectRevert(LPVaultBase.TooEarly.selector);
         vault.emergencyUnwind();
-        vm.warp(block.timestamp + 72 hours);
+        // L-2: never before the first settlement, however long the deployment sits idle
+        vm.warp(vm.getBlockTimestamp() + 30 days);
         vm.expectRevert(LPVaultBase.TooEarly.selector);
         vault.emergencyUnwind();
+        settle(P0);
+        vm.warp(vm.getBlockTimestamp() + 72 hours);
+        vm.expectRevert(LPVaultBase.TooEarly.selector);
+        vault.emergencyUnwind();
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vault.emergencyUnwind(); // arms only
+        assertFalse(vault.emergency());
+        vm.warp(vm.getBlockTimestamp() + 6 hours - 1);
+        vm.expectRevert(LPVaultBase.TooEarly.selector);
+        vault.emergencyUnwind();
+        vm.warp(vm.getBlockTimestamp() + 1);
+        vault.emergencyUnwind();
+        assertTrue(vault.emergency());
     }
 
     function test_EmergencyUnwind_ProRataInKind() public {
@@ -457,10 +481,8 @@ contract LPVaultBaseTest is VaultTestBase {
         deposit(carol, 5_000e6); // queued deposit
         redeem(bob, vault.balanceOf(bob) / 2); // queued redeem
 
-        vm.warp(block.timestamp + 72 hours + 1);
         vm.prank(makeAddr("anyone"));
-        vault.emergencyUnwind();
-        assertTrue(vault.emergency());
+        forceEmergency();
         assertEq(vault.lpBase() + vault.lpAsset(), 0);
 
         // nothing new can happen
@@ -504,18 +526,16 @@ contract LPVaultBaseTest is VaultTestBase {
         assertApproxEqRel(usdc.balanceOf(bob) - b0 + bob.balance * P0 / 1e18, 25_000e6 * 9 / 10 + 10_000e6, 2e15);
     }
 
-    function test_EmergencyUnwind_PriceBandThenForce() public {
+    /// L-3: the old 10% band against the (3-day-old) anchor turned the 72 h exit into 7 days in any >10% market
+    /// move. Removing liquidity at a pushed price only costs the pusher and the exit is in kind, so it is gone.
+    function test_EmergencyUnwind_NotBlockedByPriceMove() public {
         deposit(alice, 10_000e6);
         settle(P0);
         vm.prank(keeper);
         vault.addLiquidity(0, 10_000e6, P0);
-        vault.setPoolPrice(P0 / 2); // manipulated / crashed
-        vm.warp(block.timestamp + 72 hours + 1);
-        vm.expectRevert();
-        vault.emergencyUnwind();
-        vm.warp(block.timestamp + 7 days);
-        vault.emergencyUnwind();
-        assertTrue(vault.emergency());
+        vault.setPoolPrice(P0 / 2); // crashed
+        forceEmergency();
+        assertEq(vault.lpAsset(), 0);
     }
 
     function test_EmergencyRedeemOnlyInEmergency() public {
@@ -532,7 +552,7 @@ contract LPVaultBaseTest is VaultTestBase {
     // ------------------------------------------------------------------ inflation / donation
     function test_InflationAttackBounded() public {
         LPVaultBase.Params memory p = defaultParams();
-        p.minDeposit = 0;
+        p.minDeposit = 1;
         vm.prank(owner);
         vault.setParams(p);
         deposit(bob, 1); // attacker: 1 raw unit
@@ -569,7 +589,10 @@ contract LPVaultBaseTest is VaultTestBase {
         assertEq(vault.keeper(), bob);
         vm.prank(alice);
         vm.expectRevert(LPVaultBase.NotGuardian.selector);
-        vault.approveHedgeEquity(1);
+        vault.approveHedgeEquity(1, block.timestamp + 1 hours);
+        vm.prank(alice);
+        vm.expectRevert(LPVaultBase.NotGuardian.selector);
+        vault.approvePrice(1, 2, block.timestamp);
         vm.prank(alice);
         vm.expectRevert(LPVaultBase.NotGuardian.selector);
         vault.setPaused(true);
