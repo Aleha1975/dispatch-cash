@@ -150,33 +150,40 @@ class Keeper:
 
     # ------------------------------------------------------------ settle
     def report_hedge_equity(self, snap: Snapshot, now: int) -> int | None:
+        """Hedge equity to report, or None to skip settling this tick.
+
+        Contract rules (audit round 1): the keeper alone may only LOWER the on-chain value, by at most hedgeStepBps
+        of lastNav per decaying day; any increase needs the guardian's exact co-signature for this epoch. A report
+        the vault has to clip is applied conservatively (redeems only, no deposits, no fee). We always report the
+        real value (never a stale lower one: that would mint cheap shares to depositors)."""
         if not self.hedged:
             return 0
         v = self.treasury_capital(snap)
         old = snap.hedge_equity
-        diff = abs(v - old)
-        used = 0 if now >= snap.hedge_drift_start + 86400 else snap.hedge_drift_used
-        budget = snap.last_nav * snap.params["hedgeStepBps"]
-        if diff == 0 or (used + diff) * BPS <= budget:
-            return v
-        if snap.approved_hedge_epoch == snap.epoch + 1 and snap.approved_hedge_equity == v:
-            return v
-        if snap.last_nav == 0 or diff < 10 ** 6:
-            # no NAV yet (budget is 0) or sub-$1 dust: keep the on-chain value rather than block settlement
+        if v != old and (snap.last_nav == 0 or abs(v - old) < 10 ** 6):
+            # no NAV yet (no budget) or sub-$1 dust: keep the on-chain value rather than clip the settlement
             self.log("hedge_equity_kept", reported=old, actual=v, reason="no_nav" if snap.last_nav == 0 else "dust")
             return old
+        applied, clipped = S.hedge_move(v, old, snap.last_nav, snap.params["hedgeStepBps"], snap.hedge_drift_used,
+                                        snap.hedge_drift_time, now, snap.epoch,
+                                        (snap.approved_hedge_equity, snap.approved_hedge_epoch,
+                                         snap.approved_hedge_until))
+        if not clipped:
+            self.state.d.pop("hedge_wait_since", None)
+            return v
+        why = "increase needs guardian" if v > old else "decrease over the daily budget"
+        self.alert("warn", "hedge_eq_cosign", f"hedge equity {v / 1e6:.2f} vs on-chain {old / 1e6:.2f} ({why}); "
+                                              f"guardian: approveHedgeEquity({v}, <deadline>) for epoch {snap.epoch}. "
+                                              f"Until then settlements apply {applied / 1e6:.2f} and skip deposits")
         policy = self.st.hedge_equity_over_budget
-        queues = snap.pending_deposits or snap.pending_redeems
-        if policy == "skip" or (policy == "auto" and queues):
-            self.alert("warn", "hedge_eq_budget", f"hedge equity {v / 1e6:.2f} vs on-chain {old / 1e6:.2f} exceeds the "
-                                                  f"daily drift budget; guardian must approveHedgeEquity({v}) for "
-                                                  f"epoch {snap.epoch}; settlement skipped")
+        if policy == "skip":
             return None
-        room = max(0, budget // BPS - used)
-        clamped = old + room if v > old else old - min(room, old)
-        self.alert("warn", "hedge_eq_budget", f"hedge equity {v / 1e6:.2f} over drift budget; reporting {clamped / 1e6:.2f}"
-                                              f" (guardian approveHedgeEquity({v}) for epoch {snap.epoch} to fix)")
-        return clamped
+        if policy == "auto" and snap.pending_redeems:
+            # redeemers would be priced at the clipped value: give the guardian a bounded time to co-sign
+            since = self.state.d.setdefault("hedge_wait_since", now)
+            if now - since < self.st.guardian_wait_s:
+                return None
+        return v
 
     def settle_due(self, snap: Snapshot, now: int, price: int) -> bool:
         if now - snap.last_settle >= self.st.settle_interval_s:
@@ -201,8 +208,12 @@ class Keeper:
             n += 1
             self.state.d["last_settle_epoch"] = snap.epoch
             s2 = self.reader.snapshot()
+            clipped = s2.last_price != price or s2.hedge_equity != he
             self.log("settled", epoch=snap.epoch, reason=reason, price=price, hedge_equity=he, nav=s2.last_nav,
+                     applied_price=s2.last_price, applied_hedge_equity=s2.hedge_equity, clipped=clipped,
                      deposits_left=s2.pending_deposits, redeems_left=s2.pending_redeems)
+            if clipped:
+                break  # a clipped settlement processes no deposits; repeating it in the same block changes nothing
             more_dep = s2.pending_deposits and not s2.paused and s2.pending_deposits < snap.pending_deposits
             more_red = s2.pending_redeems and s2.redeem_head > snap.redeem_head
             if not (more_dep or more_red):
@@ -304,6 +315,9 @@ class Keeper:
         snap = self.reader.snapshot()
         if snap.paused or snap.last_nav == 0:
             return
+        if self.anchor_lagging(snap, price):
+            self.log("deploy_skipped_anchor", price=price, anchor=snap.last_price)
+            return
         p_usd = M.p_to_usd(price)
         if snap.positions:
             pos = snap.positions[0]
@@ -335,6 +349,18 @@ class Keeper:
         if liq <= 0 or val < self.st.min_deploy_usd:
             self.log("deploy_skipped", value_usd=val, a0=a0, a1=a1)
             return
+        # LP adds are charged to the vault's turnover budget: scale down to what is left instead of reverting
+        pr = snap.params
+        room = S.turnover_room(snap.last_nav, pr["swapTurnoverBps"], snap.swap_notional, snap.swap_notional_time,
+                               self.now())
+        charge = S.add_charge(int(val * 1e6), pr["poolBandBps"], pr["maxSlippageBps"])
+        if charge > room * 0.98:
+            k = room * 0.98 / charge if charge else 0.0
+            if val * k < self.st.min_deploy_usd:
+                self.alert("warn", "turnover", f"turnover budget (rolling day) left {room / 1e6:.0f} USDC: LP add of "
+                                               f"{val:.0f} USD postponed")
+                return
+            liq, val = int(liq * k), val * k
         if pos is None:
             self.act("mintPosition", tl, tu, liq, a0, a1, price)
             self.log("minted", tl=tl, tu=tu, liquidity=liq, value_usd=val, half_width=half_width)
@@ -357,6 +383,11 @@ class Keeper:
             snap = self.reader.snapshot()
         if snap.native * price // E18 > self.st.min_swap_usd * 1e6:
             self.swap_budgeted(True, snap.native, price)
+
+    def anchor_lagging(self, snap: Snapshot, price: int) -> bool:
+        """Swaps and LP adds must quote within poolBandBps of the vault's price anchor (lastPrice)."""
+        band = snap.params["poolBandBps"] * self.st.band_safety
+        return bool(snap.last_price) and abs(price - snap.last_price) * BPS > snap.last_price * band
 
     # ------------------------------------------------------------ hedge
     def hedge(self, price: int, now: int):
@@ -391,10 +422,11 @@ class Keeper:
                                  "treasury_usdc": snap.treasury_usdc / 1e6,
                                  "in_transit": self.state.d.get("in_transit_usdc", 0) / 1e6}
         if mp.action == "send":
-            room = max(0, snap.last_nav * snap.params["hedgeCapBps"] // BPS - snap.hedge_equity)
+            # the vault caps max(reported equity, net margin outstanding) + amount
+            room = max(0, snap.last_nav * snap.params["hedgeCapBps"] // BPS - max(snap.hedge_equity, snap.net_margin))
             avail = max(0, snap.idle_asset - self.buffer(snap, price) - self.reserved_for_redeems(snap, price))
             amt = min(int(mp.amount_usd * 1e6), room, avail)
-            if amt >= self.st.min_margin_move_usd * 1e6 and self.st.auto_send_margin and not snap.paused:
+            if amt >= self.st.min_margin_move_usd * 1e6 and self.st.auto_send_margin:  # allowed while paused
                 self.act("sendHedgeMargin", amt)
                 self.log("margin_sent", usdc=amt / 1e6, target=mp.target_usd)
             elif amt < mp.amount_usd * 1e6 - self.st.min_margin_move_usd * 1e6:
@@ -433,7 +465,16 @@ class Keeper:
             return self._finish(now, snap, None, ["price_skip"], t0)
         if pc.status == "clamped":
             self.log("price_clamped", hl=hl, pool=snap.pool_price, used=pc.price)
-        price = pc.price
+        price = S.sticky_price(pc.price, snap.last_price, snap.pool_price, snap.params["poolBandBps"],
+                               self.st.anchor_hysteresis_bps, self.st.band_safety)
+        applied, clipped = S.anchor_move(price, snap.last_price, snap.params["refDriftBps"], snap.price_drift_used,
+                                         snap.price_drift_time, now, snap.paused, snap.approved_price)
+        self.status["anchor"] = {"anchor": snap.last_price / 1e6, "would_apply": applied / 1e6, "clipped": clipped}
+        if clipped:
+            self.alert("warn", "anchor_budget", f"price {price / 1e6:.4f} is beyond the anchor's daily budget (anchor "
+                                                f"{snap.last_price / 1e6:.4f}, settlements apply {applied / 1e6:.4f} "
+                                                f"and skip deposits); guardian: approvePrice(lo, hi, deadline) around "
+                                                f"the HL price to re-anchor")
         hw, vol = self.half_width(now, hl / 1e6)
         self.status["range_rule"] = {"half_width": hw, "daily_vol_72h": vol}
         crash = None
@@ -450,8 +491,10 @@ class Keeper:
 
         if snap.whype:
             step("unwrap", self.act, "unwrapBase", snap.whype)
-        if snap.last_price and abs(price - snap.last_price) * BPS > snap.last_price * snap.params["refDriftBps"] * 0.9:
-            step("settle_ref", self.settle_all, price, now, "ref_drift")
+        # swaps/adds must quote within the band of the anchor: re-anchor before it lags too far
+        if snap.last_price and abs(price - snap.last_price) * BPS > (
+                snap.last_price * snap.params["poolBandBps"] * self.st.anchor_resettle_frac):
+            step("settle_ref", self.settle_all, price, now, "anchor")
         step("free", self.free_for_redeems, price)
         s = self.reader.snapshot()
         if self.settle_due(s, now, price):

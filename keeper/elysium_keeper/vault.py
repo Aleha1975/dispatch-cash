@@ -50,11 +50,18 @@ class Snapshot:
     queued_redeem_shares: int
     first_redeem_shares: int
     redeem_head: int
-    hedge_drift_start: int
+    hedge_drift_time: int
     hedge_drift_used: int
     approved_hedge_equity: int
     approved_hedge_epoch: int
+    approved_hedge_until: int
+    price_drift_used: int
+    price_drift_time: int
+    approved_price: tuple  # (lo, hi, until)
     swap_notional: int
+    swap_notional_time: int
+    net_margin: int
+    last_progress: int
     treasury: str
     treasury_usdc: int = 0
     treasury_allowance: int = 0
@@ -112,6 +119,9 @@ class VaultReader:
             if sh and not first:
                 first = sh
             queued += sh
+        # RiskBudgets.Budgets: priceUsed, priceTime, hedgeUsed, hedgeTime, turnoverUsed, turnoverTime,
+        # hedgeApproved, hedgeApprovedEpoch, hedgeApprovedUntil, priceApprovedLo, priceApprovedHi, priceApprovedUntil
+        b = list(c("budgets"))
         native = self.rpc.balance(self.v.address)
         whype = self.whype.call("balanceOf", self.v.address) if self.whype else 0
         snap = Snapshot(
@@ -121,9 +131,10 @@ class VaultReader:
             idle_asset=c("idleAsset"), native=native, whype=whype, pool_price=c("poolPrice"), sqrt_price=sp,
             tick=tick, lp_base=lp_base, lp_asset=lp_asset, positions=positions, params=params, paused=c("paused"),
             emergency=c("emergency"), total_supply=c("totalSupply"), queued_redeem_shares=queued,
-            first_redeem_shares=first, redeem_head=head, hedge_drift_start=c("hedgeDriftStart"),
-            hedge_drift_used=c("hedgeDriftUsed"), approved_hedge_equity=c("approvedHedgeEquity"),
-            approved_hedge_epoch=c("approvedHedgeEpoch"), swap_notional=c("swapNotionalUsed"),
+            first_redeem_shares=first, redeem_head=head, hedge_drift_time=b[3], hedge_drift_used=b[2],
+            approved_hedge_equity=b[6], approved_hedge_epoch=b[7], approved_hedge_until=b[8],
+            price_drift_used=b[0], price_drift_time=b[1], approved_price=(b[9], b[10], b[11]),
+            swap_notional=b[4], swap_notional_time=b[5], net_margin=c("netMargin"), last_progress=c("lastProgressTime"),
             treasury=self.treasury,
         )
         if self.treasury != ZERO:

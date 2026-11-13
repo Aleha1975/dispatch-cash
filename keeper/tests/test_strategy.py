@@ -231,3 +231,38 @@ def test_config_rejects_unknown_and_alchemy():
     from elysium_keeper.rpc import RPC
     with pytest.raises(ValueError):
         RPC("https://elysium.g.alchemy.com/v2/x")
+
+
+# ---------------------------------------------------------------- vault rules mirrored from the contracts (audit r1)
+def test_decayed_linear_over_a_day():
+    assert S.decayed(1000, 0, 0) == 1000
+    assert S.decayed(1000, 0, 43200) == 500
+    assert S.decayed(1000, 0, 86400) == 0
+
+
+def test_anchor_move_budget_clip_pause_and_approval():
+    ref = 40_000_000
+    bud = 1000  # 10%/day
+    assert S.anchor_move(41_000_000, ref, bud, 0, 0, 0, False) == (41_000_000, False)
+    p, c = S.anchor_move(28_000_000, ref, bud, 0, 0, 0, False)  # -30%: clipped to -10%
+    assert c and p == 36_000_000
+    assert S.anchor_move(40_100_000, ref, bud, 0, 0, 0, True) == (ref, True)  # paused: frozen
+    assert S.anchor_move(28_000_000, ref, bud, 0, 0, 0, True, (27_000_000, 29_000_000, 10)) == (28_000_000, False)
+    assert S.anchor_move(41_000_000, 0, bud, 0, 0, 0, False) == (41_000_000, False)  # first settlement
+
+
+def test_sticky_price_saves_anchor_budget():
+    ref, pool = 40_000_000, 40_050_000
+    assert S.sticky_price(40_080_000, ref, pool, 150, 25) == ref
+    assert S.sticky_price(40_200_000, ref, pool, 150, 25) == 40_200_000
+    assert S.sticky_price(40_080_000, ref, 41_000_000, 150, 25) == 40_080_000  # anchor left the pool band
+
+
+def test_hedge_move_rules():
+    nav, step = 1_000_000 * 10 ** 6, 500
+    old = 100_000 * 10 ** 6
+    assert S.hedge_move(old + 1, old, nav, step, 0, 0, 0, 7) == (old, True)  # increase needs guardian
+    assert S.hedge_move(old + 1, old, nav, step, 0, 0, 0, 7, (old + 1, 8, 5)) == (old + 1, False)
+    assert S.hedge_move(old + 1, old, nav, step, 0, 0, 9, 7, (old + 1, 8, 5)) == (old, True)  # expired
+    assert S.hedge_move(old - 40_000 * 10 ** 6, old, nav, step, 0, 0, 0, 7) == (old - 40_000 * 10 ** 6, False)
+    assert S.hedge_move(old - 60_000 * 10 ** 6, old, nav, step, 0, 0, 0, 7) == (old - 50_000 * 10 ** 6, True)

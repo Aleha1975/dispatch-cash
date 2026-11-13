@@ -81,6 +81,10 @@ def run_until(k, fork, trader, hl, cond, max_ticks=10, step_s=120):
         assert not st["errors"], st["errors"]
         if cond():
             return st
+        if os.environ.get("E2E_DEBUG"):
+            s = k.reader.snapshot()
+            print("DBG", st.get("anchor"), st.get("price"), "pos", [(q.token_id, q.tl, q.tu) for q in s.positions],
+                  "tick", s.tick, "native", s.native, "idle", s.idle_asset, "nav", s.last_nav, "turn", s.swap_notional)
         fork.advance(step_s)
     raise AssertionError("condition not reached")
 
@@ -152,6 +156,11 @@ def test_end_to_end(env):
     report["fees"] = dict(lp_fee_usd=(lp_val1 - lp_val0) / 1e6, nav=hv.call("lastNav") / 1e6, fee_shares=fee_shares)
 
     # ------------------------------------------------------------- +5% move: out of range -> re-range + re-hedge
+    # a day later: the initial deployment used most of the vault's rolling-day turnover budget (swaps + LP adds)
+    fork.advance(23 * 3600)
+    hl.set(fork.now(), hl.mid())
+    trader.move_to(int(hl.mid() * 1e6))
+    assert not kh.tick()["errors"]
     old_id = s2.positions[0].token_id
     trader.move_to(int(px * 1.05))
     hl.set(fork.now(), trader.price() / 1e6)

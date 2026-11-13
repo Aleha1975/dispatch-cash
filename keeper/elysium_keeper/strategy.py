@@ -72,6 +72,69 @@ def choose_price(hl: int, pool: int, band_bps: int, safety: float = 0.8, max_dev
     return PriceChoice(min(hi, max(lo, hl)), "clamped", dev)
 
 
+# ---------------------------------------------------------------- vault rules (mirror of LPVaultBase / RiskBudgets)
+WAD = 10 ** 18
+DAY = 86400
+
+
+def decayed(used: int, t: int, now: int) -> int:
+    """RiskBudgets._decay: `used` spent at `t` is restored linearly over the next 24 h."""
+    dt = now - t
+    return 0 if dt >= DAY else used * (DAY - dt) // DAY
+
+
+def turnover_room(nav: int, turnover_bps: int, used: int, t: int, now: int) -> int:
+    """Remaining swap/LP-add turnover budget (asset units): swapTurnoverBps x lastNav minus the decayed use."""
+    return max(0, nav * turnover_bps // 10_000 - decayed(used, t, now))
+
+
+def add_charge(value: int, band_bps: int, slippage_bps: int) -> int:
+    """Turnover charged by an LP add of `value` (LPVaultBase._checkAdd: weighted slippage / (band + slippage))."""
+    return -(-value * slippage_bps // (slippage_bps + band_bps))
+
+
+def anchor_move(p: int, ref: int, ref_drift_bps: int, used: int, t: int, now: int, paused: bool,
+                approved: tuple = (0, 0, 0)) -> tuple[int, bool]:
+    """Price the vault will APPLY for a settle report `p` (RiskBudgets.movePrice): free in a guardian-approved
+    [lo, hi] until `until`; otherwise limited by the decaying refDriftBps budget (0 while paused). (price, clipped)"""
+    lo, hi, until = approved
+    if ref == 0 or (now <= until and lo <= p <= hi):
+        return p, False
+    cap = 0 if paused else ref_drift_bps * (WAD // BPS)
+    u = decayed(used, t, now)
+    room = max(0, cap - u)
+    move = -(-abs(p - ref) * WAD // ref)  # ceil
+    if move <= room:
+        return p, False
+    d = ref * room // WAD
+    return (ref + d if p > ref else ref - d), True
+
+
+def sticky_price(p: int, ref: int, pool: int, band_bps: int, hyst_bps: int, safety: float = 0.8) -> int:
+    """Report the anchor itself while the fresh price is within `hyst_bps` of it and the anchor is still inside the
+    pool band: chop then costs no anchor budget (the NAV error stays below hyst_bps of the base leg)."""
+    if ref and abs(p - ref) * BPS <= ref * hyst_bps and abs(pool - ref) * BPS <= ref * band_bps * safety:
+        return ref
+    return p
+
+
+def hedge_move(v: int, old: int, last_nav: int, step_bps: int, used: int, t: int, now: int, epoch: int,
+               approved: tuple = (0, 0, 0)) -> tuple[int, bool]:
+    """Hedge equity the vault will APPLY for a report `v` (LPVaultBase._hedgeFor / RiskBudgets.moveHedge):
+    guardian's exact value for this epoch before its deadline -> as is; any other increase -> refused (old kept);
+    a decrease -> limited by the decaying hedgeStepBps-of-lastNav budget. (value, clipped)"""
+    if v == old:
+        return v, False
+    value, ep, until = approved
+    if ep == epoch + 1 and value == v and now <= until:
+        return v, False
+    if v > old:
+        return old, True
+    room = max(0, last_nav * step_bps // BPS - decayed(used, t, now))
+    d = old - v
+    return (old - min(d, room)), d > room
+
+
 # ---------------------------------------------------------------- hedge
 @dataclass
 class HedgeDecision:

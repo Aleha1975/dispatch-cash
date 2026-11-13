@@ -169,20 +169,7 @@
  },
  {
   "type": "function",
-  "name": "EMERGENCY_BAND_BPS",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "EMERGENCY_FORCE_DELAY",
+  "name": "EMERGENCY_GRACE",
   "inputs": [],
   "outputs": [
    {
@@ -208,45 +195,6 @@
  },
  {
   "type": "function",
-  "name": "MAX_HEDGE_CAP_BPS",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "MAX_HEDGE_STEP_BPS",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "MAX_POOL_BAND_BPS",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
   "name": "MAX_POSITIONS",
   "inputs": [],
   "outputs": [
@@ -260,46 +208,20 @@
  },
  {
   "type": "function",
-  "name": "MAX_REF_DRIFT_BPS",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "MAX_SLIPPAGE_BPS",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "MAX_TURNOVER_BPS",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
   "name": "SETTLE_TIMEOUT",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "UNWIND_NOTICE",
   "inputs": [],
   "outputs": [
    {
@@ -373,6 +295,11 @@
     "name": "value",
     "type": "uint256",
     "internalType": "uint256"
+   },
+   {
+    "name": "until",
+    "type": "uint256",
+    "internalType": "uint256"
    }
   ],
   "outputs": [],
@@ -380,29 +307,26 @@
  },
  {
   "type": "function",
-  "name": "approvedHedgeEpoch",
-  "inputs": [],
-  "outputs": [
+  "name": "approvePrice",
+  "inputs": [
    {
-    "name": "",
+    "name": "lo",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hi",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "until",
     "type": "uint256",
     "internalType": "uint256"
    }
   ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "approvedHedgeEquity",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
+  "outputs": [],
+  "stateMutability": "nonpayable"
  },
  {
   "type": "function",
@@ -438,19 +362,6 @@
  },
  {
   "type": "function",
-  "name": "baseIsCurrency0",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "bool",
-    "internalType": "bool"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
   "name": "baseToken",
   "inputs": [],
   "outputs": [
@@ -458,6 +369,74 @@
     "name": "",
     "type": "address",
     "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "budgets",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "priceUsed",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "priceTime",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeUsed",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeTime",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "turnoverUsed",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "turnoverTime",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeApproved",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeApprovedEpoch",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeApprovedUntil",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "priceApprovedLo",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "priceApprovedHi",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "priceApprovedUntil",
+    "type": "uint256",
+    "internalType": "uint256"
    }
   ],
   "stateMutability": "view"
@@ -533,6 +512,19 @@
  },
  {
   "type": "function",
+  "name": "claimTo",
+  "inputs": [
+   {
+    "name": "to",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
   "name": "claimable",
   "inputs": [
    {
@@ -546,32 +538,6 @@
     "name": "",
     "type": "uint256",
     "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "currency0",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "address",
-    "internalType": "address"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "currency1",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "address",
-    "internalType": "address"
    }
   ],
   "stateMutability": "view"
@@ -700,6 +666,19 @@
  },
  {
   "type": "function",
+  "name": "emergencySince",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
   "name": "emergencyUnwind",
   "inputs": [],
   "outputs": [],
@@ -714,19 +693,6 @@
     "name": "",
     "type": "uint256",
     "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "fee",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "uint24",
-    "internalType": "uint24"
    }
   ],
   "stateMutability": "view"
@@ -779,32 +745,6 @@
  {
   "type": "function",
   "name": "hedgeCap",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "hedgeDriftStart",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "hedgeDriftUsed",
   "inputs": [],
   "outputs": [
    {
@@ -967,6 +907,19 @@
  },
  {
   "type": "function",
+  "name": "lastProgressTime",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
   "name": "lastSettleTime",
   "inputs": [],
   "outputs": [
@@ -1044,6 +997,19 @@
     "name": "",
     "type": "string",
     "internalType": "string"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "netMargin",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
    }
   ],
   "stateMutability": "view"
@@ -1170,19 +1136,6 @@
     "name": "",
     "type": "uint256",
     "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "permit2",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "address",
-    "internalType": "contract IPermit2Min"
    }
   ],
   "stateMutability": "view"
@@ -1420,7 +1373,7 @@
   "name": "renounceOwnership",
   "inputs": [],
   "outputs": [],
-  "stateMutability": "nonpayable"
+  "stateMutability": "pure"
  },
  {
   "type": "function",
@@ -1703,32 +1656,6 @@
  },
  {
   "type": "function",
-  "name": "swapNotionalUsed",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "swapWindowStart",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
   "name": "symbol",
   "inputs": [],
   "outputs": [
@@ -1736,19 +1663,6 @@
     "name": "",
     "type": "string",
     "internalType": "string"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "tickSpacing",
-  "inputs": [],
-  "outputs": [
-   {
-    "name": "",
-    "type": "int24",
-    "internalType": "int24"
    }
   ],
   "stateMutability": "view"
@@ -1863,6 +1777,19 @@
    }
   ],
   "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "unwindArmedAt",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
  },
  {
   "type": "function",
@@ -2017,6 +1944,19 @@
  },
  {
   "type": "event",
+  "name": "EmergencyArmed",
+  "inputs": [
+   {
+    "name": "by",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
   "name": "EmergencyRedeemed",
   "inputs": [
    {
@@ -2083,6 +2023,12 @@
    },
    {
     "name": "value",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "until",
     "type": "uint256",
     "indexed": false,
     "internalType": "uint256"
@@ -2343,6 +2289,31 @@
  },
  {
   "type": "event",
+  "name": "PriceApproved",
+  "inputs": [
+   {
+    "name": "lo",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "hi",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   },
+   {
+    "name": "until",
+    "type": "uint256",
+    "indexed": false,
+    "internalType": "uint256"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
   "name": "RedeemCancelled",
   "inputs": [
    {
@@ -2548,6 +2519,22 @@
  },
  {
   "type": "error",
+  "name": "AddValue",
+  "inputs": [
+   {
+    "name": "got",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "paid",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
   "name": "BadEpoch",
   "inputs": []
  },
@@ -2691,22 +2678,6 @@
  },
  {
   "type": "error",
-  "name": "HedgeEquityJump",
-  "inputs": [
-   {
-    "name": "oldValue",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "newValue",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ]
- },
- {
-  "type": "error",
   "name": "InEmergency",
   "inputs": []
  },
@@ -2790,6 +2761,11 @@
  },
  {
   "type": "error",
+  "name": "PositionsOpen",
+  "inputs": []
+ },
+ {
+  "type": "error",
   "name": "ReentrancyGuardReentrantCall",
   "inputs": []
  },
@@ -2837,12 +2813,12 @@
  },
  {
   "type": "error",
-  "name": "Turnover",
+  "name": "UnknownPosition",
   "inputs": []
  },
  {
   "type": "error",
-  "name": "UnknownPosition",
+  "name": "UnwindOutOfGas",
   "inputs": []
  },
  {

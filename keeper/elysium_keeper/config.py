@@ -54,7 +54,10 @@ class StrategyCfg:
     band_safety: float = 0.8
     max_clamp_dev_bps: int = 300
     burn_slippage_bps: int = 100
-    hedge_equity_over_budget: str = "auto"  # auto (skip if queues else clamp) | skip | clamp
+    hedge_equity_over_budget: str = "auto"  # auto (wait for guardian while redeems queue, then settle) | skip | clamp
+    guardian_wait_s: int = 2 * 3600  # auto: longest wait for a guardian co-signature before settling clipped
+    anchor_hysteresis_bps: int = 25  # report the anchor itself while the price is this close (saves anchor budget)
+    anchor_resettle_frac: float = 0.5  # re-anchor when |price - anchor| > this x poolBand (swaps/adds need < band)
 
 
 @dataclass
