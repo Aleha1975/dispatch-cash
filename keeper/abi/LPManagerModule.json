@@ -33,6 +33,16 @@
       "internalType": "address"
      },
      {
+      "name": "factory",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "accountSalt",
+      "type": "bytes32",
+      "internalType": "bytes32"
+     },
+     {
       "name": "poolManager",
       "type": "address",
       "internalType": "contract IPoolManager"
@@ -173,6 +183,19 @@
  },
  {
   "type": "function",
+  "name": "MAX_APPROVAL_TTL",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
   "name": "MAX_FEE_BPS",
   "inputs": [],
   "outputs": [
@@ -245,6 +268,120 @@
  },
  {
   "type": "function",
+  "name": "account",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "",
+    "type": "tuple",
+    "internalType": "struct SALib.Account",
+    "components": [
+     {
+      "name": "delegationHash",
+      "type": "bytes32",
+      "internalType": "bytes32"
+     },
+     {
+      "name": "owner",
+      "type": "address",
+      "internalType": "address"
+     },
+     {
+      "name": "kind",
+      "type": "uint8",
+      "internalType": "uint8"
+     },
+     {
+      "name": "until",
+      "type": "uint64",
+      "internalType": "uint64"
+     },
+     {
+      "name": "revoked",
+      "type": "bool",
+      "internalType": "bool"
+     },
+     {
+      "name": "hedgeClipped",
+      "type": "bool",
+      "internalType": "bool"
+     },
+     {
+      "name": "contributed",
+      "type": "int256",
+      "internalType": "int256"
+     },
+     {
+      "name": "hwm",
+      "type": "int256",
+      "internalType": "int256"
+     },
+     {
+      "name": "hedgeEquity",
+      "type": "uint256",
+      "internalType": "uint256"
+     },
+     {
+      "name": "netMargin",
+      "type": "uint256",
+      "internalType": "uint256"
+     },
+     {
+      "name": "hedgeEpoch",
+      "type": "uint256",
+      "internalType": "uint256"
+     },
+     {
+      "name": "snapAsset",
+      "type": "uint256",
+      "internalType": "uint256"
+     },
+     {
+      "name": "snapBase",
+      "type": "uint256",
+      "internalType": "uint256"
+     },
+     {
+      "name": "lastFeeTime",
+      "type": "uint256",
+      "internalType": "uint256"
+     },
+     {
+      "name": "feesPaid",
+      "type": "uint256",
+      "internalType": "uint256"
+     },
+     {
+      "name": "hedgeTime",
+      "type": "uint256",
+      "internalType": "uint256"
+     }
+    ]
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "accountSalt",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "bytes32",
+    "internalType": "bytes32"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
   "name": "accountValue",
   "inputs": [
    {
@@ -269,86 +406,22 @@
  },
  {
   "type": "function",
-  "name": "accounts",
-  "inputs": [
-   {
-    "name": "",
-    "type": "address",
-    "internalType": "address"
-   }
-  ],
-  "outputs": [
-   {
-    "name": "delegationHash",
-    "type": "bytes32",
-    "internalType": "bytes32"
-   },
-   {
-    "name": "kind",
-    "type": "uint8",
-    "internalType": "uint8"
-   },
-   {
-    "name": "until",
-    "type": "uint64",
-    "internalType": "uint64"
-   },
-   {
-    "name": "contributed",
-    "type": "int256",
-    "internalType": "int256"
-   },
-   {
-    "name": "hwm",
-    "type": "int256",
-    "internalType": "int256"
-   },
-   {
-    "name": "hedgeEquity",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "netMargin",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "hedgeEpoch",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "snapAsset",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "snapBase",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "lastFeeTime",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "feesPaid",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
   "name": "approveHedgeEquity",
   "inputs": [
    {
     "name": "a",
     "type": "address",
     "internalType": "address"
+   },
+   {
+    "name": "expectedEpoch",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "expectedStored",
+    "type": "uint256",
+    "internalType": "uint256"
    },
    {
     "name": "value",
@@ -425,34 +498,28 @@
   ],
   "outputs": [
    {
-    "name": "priceUsed",
-    "type": "uint256",
-    "internalType": "uint256"
+    "name": "turnover",
+    "type": "tuple",
+    "internalType": "struct SAWindow.W",
+    "components": [
+     {
+      "name": "b",
+      "type": "uint128[9]",
+      "internalType": "uint128[9]"
+     }
+    ]
    },
    {
-    "name": "priceTime",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "hedgeUsed",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "hedgeTime",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "turnoverUsed",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "turnoverTime",
-    "type": "uint256",
-    "internalType": "uint256"
+    "name": "hedge",
+    "type": "tuple",
+    "internalType": "struct SAWindow.W",
+    "components": [
+     {
+      "name": "b",
+      "type": "uint128[9]",
+      "internalType": "uint128[9]"
+     }
+    ]
    },
    {
     "name": "hedgeApproved",
@@ -461,28 +528,18 @@
    },
    {
     "name": "hedgeApprovedEpoch",
-    "type": "uint256",
-    "internalType": "uint256"
+    "type": "uint64",
+    "internalType": "uint64"
    },
    {
     "name": "hedgeApprovedUntil",
-    "type": "uint256",
-    "internalType": "uint256"
+    "type": "uint64",
+    "internalType": "uint64"
    },
    {
-    "name": "priceApprovedLo",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "priceApprovedHi",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "priceApprovedUntil",
-    "type": "uint256",
-    "internalType": "uint256"
+    "name": "hedgeApprovedEra",
+    "type": "uint64",
+    "internalType": "uint64"
    }
   ],
   "stateMutability": "view"
@@ -639,6 +696,19 @@
  },
  {
   "type": "function",
+  "name": "factory",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
   "name": "feeRecipient",
   "inputs": [],
   "outputs": [
@@ -659,6 +729,19 @@
     "name": "",
     "type": "address",
     "internalType": "address"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "guardianEra",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint64",
+    "internalType": "uint64"
    }
   ],
   "stateMutability": "view"
@@ -950,7 +1033,7 @@
     "internalType": "bytes32"
    },
    {
-    "name": "s",
+    "name": "s_",
     "type": "bytes32",
     "internalType": "bytes32"
    }
@@ -1033,25 +1116,6 @@
     "name": "",
     "type": "bool",
     "internalType": "bool"
-   }
-  ],
-  "stateMutability": "view"
- },
- {
-  "type": "function",
-  "name": "payoutAddress",
-  "inputs": [
-   {
-    "name": "a",
-    "type": "address",
-    "internalType": "address"
-   }
-  ],
-  "outputs": [
-   {
-    "name": "",
-    "type": "address",
-    "internalType": "address"
    }
   ],
   "stateMutability": "view"
@@ -1235,62 +1299,29 @@
   "inputs": [],
   "outputs": [
    {
-    "name": "priceUsed",
+    "name": "window",
+    "type": "tuple",
+    "internalType": "struct SAWindow.W",
+    "components": [
+     {
+      "name": "b",
+      "type": "uint128[9]",
+      "internalType": "uint128[9]"
+     }
+    ]
+   },
+   {
+    "name": "lo",
     "type": "uint256",
     "internalType": "uint256"
    },
    {
-    "name": "priceTime",
+    "name": "hi",
     "type": "uint256",
     "internalType": "uint256"
    },
    {
-    "name": "hedgeUsed",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "hedgeTime",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "turnoverUsed",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "turnoverTime",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "hedgeApproved",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "hedgeApprovedEpoch",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "hedgeApprovedUntil",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "priceApprovedLo",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "priceApprovedHi",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "priceApprovedUntil",
+    "name": "until",
     "type": "uint256",
     "internalType": "uint256"
    }
@@ -1410,6 +1441,19 @@
     "name": "amount",
     "type": "uint256",
     "internalType": "uint256"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
+ },
+ {
+  "type": "function",
+  "name": "revoke",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
    }
   ],
   "outputs": [],
@@ -1625,6 +1669,35 @@
   "stateMutability": "nonpayable"
  },
  {
+  "type": "function",
+  "name": "windows",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "turnoverUsed",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "hedgeUsed",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "priceUsed",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
   "type": "event",
   "name": "CallFailed",
   "inputs": [
@@ -1763,12 +1836,6 @@
     "name": "account",
     "type": "address",
     "indexed": true,
-    "internalType": "address"
-   },
-   {
-    "name": "to",
-    "type": "address",
-    "indexed": false,
     "internalType": "address"
    },
    {
@@ -2135,6 +2202,25 @@
  },
  {
   "type": "event",
+  "name": "Revoked",
+  "inputs": [
+   {
+    "name": "account",
+    "type": "address",
+    "indexed": true,
+    "internalType": "address"
+   },
+   {
+    "name": "by",
+    "type": "address",
+    "indexed": false,
+    "internalType": "address"
+   }
+  ],
+  "anonymous": false
+ },
+ {
+  "type": "event",
   "name": "RoleSet",
   "inputs": [
    {
@@ -2222,22 +2308,6 @@
  },
  {
   "type": "error",
-  "name": "FeeNeedsIdle",
-  "inputs": [
-   {
-    "name": "fee",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "idle",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ]
- },
- {
-  "type": "error",
   "name": "FeeTooEarly",
   "inputs": [
    {
@@ -2270,11 +2340,6 @@
  },
  {
   "type": "error",
-  "name": "MintFailed",
-  "inputs": []
- },
- {
-  "type": "error",
   "name": "NoAnchor",
   "inputs": []
  },
@@ -2286,6 +2351,11 @@
  {
   "type": "error",
   "name": "NotKeeper",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "NotLive",
   "inputs": []
  },
  {
@@ -2354,6 +2424,11 @@
  },
  {
   "type": "error",
+  "name": "StaleHedge",
+  "inputs": []
+ },
+ {
+  "type": "error",
   "name": "StalePrice",
   "inputs": []
  },
@@ -2366,6 +2441,22 @@
   "type": "error",
   "name": "TransferMismatch",
   "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "Unexpected",
+  "inputs": [
+   {
+    "name": "asset",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "base",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
  },
  {
   "type": "error",
@@ -2411,7 +2502,23 @@
  },
  {
   "type": "error",
-  "name": "Turnover",
+  "name": "BadMint",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "Subscribed",
+  "inputs": [
+   {
+    "name": "tokenId",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "WindowOverflow",
   "inputs": []
  },
  {

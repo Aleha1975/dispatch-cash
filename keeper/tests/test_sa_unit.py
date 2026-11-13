@@ -38,6 +38,15 @@ def test_hwm_fee(profit, hwm, bps, fee, mark):
     assert hwm_fee(profit, hwm, bps) == (fee, mark)
 
 
+def test_hwm_fee_partial_matches_salib():
+    # SA-1 L-11: capped at max_fee, the mark advances only by the gain that was charged for
+    fee, mark = hwm_fee(10_000, 0, 1500, max_fee=600)
+    assert fee == 600 and mark == 600 * 10_000 // 1500 - 600
+    assert hwm_fee(10_000, 0, 1500, max_fee=10 ** 9) == hwm_fee(10_000, 0, 1500)
+    f2, _ = hwm_fee(10_000 - fee, mark, 1500, max_fee=10 ** 9)  # the rest is charged later, never twice
+    assert fee + f2 <= 1500
+
+
 def test_hwm_fee_never_charges_twice():
     f1, m1 = hwm_fee(10_000, 0, 1500)
     f2, m2 = hwm_fee(10_000 - f1, m1, 1500)  # profit after paying the fee == the mark

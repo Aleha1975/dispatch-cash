@@ -191,8 +191,12 @@ class AccountSnap:
     native: int
     positions: list
     value: int  # accountValue at the anchor
-    budgets: dict
-    payout: str = ""
+    budgets: dict  # guardian hedge approval (hedgeApproved / Epoch / Until / Era)
+    windows: dict  # used amounts in the sliding 24 h windows (turnoverUsed, hedgeUsed, priceUsed)
+    owner: str = ""  # pinned owner (hybrid: the EOA the address derives from; 7702: the account)
+    revoked: bool = False
+    hedge_clipped: bool = False
+    hedge_time: int = 0
 
     @property
     def profit(self) -> int:
@@ -226,8 +230,16 @@ class GlobalSnap:
     extra: dict = field(default_factory=dict)
 
 
-BUDGET_KEYS = ["priceUsed", "priceTime", "hedgeUsed", "hedgeTime", "turnoverUsed", "turnoverTime", "hedgeApproved",
-               "hedgeApprovedEpoch", "hedgeApprovedUntil", "priceApprovedLo", "priceApprovedHi", "priceApprovedUntil"]
+# LPManagerModule.budgets(a): (turnover window, hedge window, hedgeApproved, hedgeApprovedEpoch, hedgeApprovedUntil,
+# hedgeApprovedEra); the windows are read through windows(a)
+ZERO_ADDRESS = "0x" + "00" * 20
+BUDGET_KEYS = ["hedgeApproved", "hedgeApprovedEpoch", "hedgeApprovedUntil", "hedgeApprovedEra"]
+WINDOW_KEYS = ["turnoverUsed", "hedgeUsed", "priceUsed"]
+PRICE_BUDGET_KEYS = ["priceApprovedLo", "priceApprovedHi", "priceApprovedUntil"]
+# SALib.Account field order (LPManagerModule.account(a))
+ACCOUNT_KEYS = ["delegationHash", "owner", "kind", "until", "revoked", "hedgeClipped", "contributed", "hwm",
+                "hedgeEquity", "netMargin", "hedgeEpoch", "snapAsset", "snapBase", "lastFeeTime", "feesPaid",
+                "hedgeTime"]
 PARAM_KEYS = ["feeBps", "hedgeCapBps", "poolBandBps", "maxSlippageBps", "hedgeStepBps", "refDriftBps",
               "swapTurnoverBps", "feeInterval", "maxPriceAge"]
 
@@ -263,8 +275,10 @@ class ModuleReader:
         sp, tick = self.slot0()
         g = GlobalSnap(last_price=c("lastPrice"), last_price_time=c("lastPriceTime"), clipped=c("lastPriceClipped"),
                        paused=c("paused"), pool_price=c("poolPrice"), sqrt_price=sp, tick=tick,
-                       params=dict(zip(PARAM_KEYS, c("params"))), price_budget=dict(zip(BUDGET_KEYS, c("priceBudget"))),
+                       params=dict(zip(PARAM_KEYS, c("params"))),
+                       price_budget=dict(zip(PRICE_BUDGET_KEYS, c("priceBudget")[1:])),
                        treasury=self.treasury, fee_recipient=self.fee_recipient)
+        g.price_budget["priceUsed"] = c("windows", ZERO_ADDRESS)[2]
         g.treasury_usdc = self.usdc.call("balanceOf", self.treasury)
         g.treasury_allowance = self.usdc.call("allowance", self.treasury, self.m.address)
         return g
@@ -272,19 +286,21 @@ class ModuleReader:
     def account(self, a: str, price: int | None = None) -> AccountSnap:
         c = self.m.call
         a = to_checksum_address(a)
-        s = c("accounts", a)
-        if s[0] == b"\0" * 32:
+        s = dict(zip(ACCOUNT_KEYS, c("account", a)))
+        if s["delegationHash"] == b"\0" * 32:
             raise ValueError(f"{a} is not registered")
         price = price or c("lastPrice")
         ps = [APos(int(t[0]), int(t[1]), int(t[2]), int(self.posm.call("getPositionLiquidity", int(t[0]))))
               for t in c("positionsOf", a)]
         active = c("isActive", a)
         return AccountSnap(
-            address=a, kind=KIND.get(s[1], str(s[1])), active=active, until=s[2], contributed=s[3], hwm=s[4],
-            hedge_equity=s[5], net_margin=s[6], hedge_epoch=s[7], last_fee_time=s[10], fees_paid=s[11],
+            address=a, kind=KIND.get(s["kind"], str(s["kind"])), active=active, until=s["until"],
+            contributed=s["contributed"], hwm=s["hwm"], hedge_equity=s["hedgeEquity"], net_margin=s["netMargin"],
+            hedge_epoch=s["hedgeEpoch"], last_fee_time=s["lastFeeTime"], fees_paid=s["feesPaid"],
             usdc=self.usdc.call("balanceOf", a), native=self.rpc.balance(a), positions=ps,
-            value=c("accountValue", a, price), budgets=dict(zip(BUDGET_KEYS, c("budgets", a))),
-            payout=to_checksum_address(c("payoutAddress", a)))
+            value=c("accountValue", a, price), budgets=dict(zip(BUDGET_KEYS, c("budgets", a)[2:])),
+            windows=dict(zip(WINDOW_KEYS, c("windows", a))), owner=to_checksum_address(s["owner"]),
+            revoked=s["revoked"], hedge_clipped=s["hedgeClipped"], hedge_time=s["hedgeTime"])
 
     def discover(self, from_block: int, to_block: int | None = None, step: int = 50_000) -> list[str]:
         """Accounts from Registered events (chunked eth_getLogs)."""

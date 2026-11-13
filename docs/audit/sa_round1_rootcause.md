@@ -88,6 +88,14 @@ registration is a revocation.
    (including `reportHedgeEquity`).
 7. HybridDeleGator's raw-hash ERC-1271 (L-17): the residual ERC-20 allowance was the only thing a replayed owner
    signature could pull through; it is now always reset to 0.
+8. Found while writing the regressions: on `decreasePosition` / `burnPosition` the directional post-check alone is
+   not enough. The proceeds raise idle USDC above the pre-action snapshot, so account code that sends part of the
+   proceeds away inside the bracket still passes `_post`, and the closing snapshot then hides the missing value as a
+   loss (fee evasion of the M-5 kind, without a subscriber). Fixed with a value-conservation check: the account value
+   at the pool price (unchanged inside the call) may not fall by more than rounding (0.001% + 2 wei) across a removal.
+   Test: `test_M5_Sibling_AccountCodeDrainsInsideBracket` (real UUPS upgrade of the HybridDeleGator).
+   On adds the same drain is bounded by the H-3 add check (`paid` ≤ value received / (1 − slippage)) and charged to
+   turnover; on swaps by min-out and `_post` on the input.
 
 **Residual (stated, not fixed).** A hybrid owner can still upgrade its proxy to arbitrary code; the module cannot read
 the ERC-1967 slot. After the changes above that only harms the client's own account: identity, payer, treasury and fee

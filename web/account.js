@@ -27,13 +27,18 @@ const UD = CONFIG.usdcDecimals;
 const ZERO = '0x0000000000000000000000000000000000000000';
 const ROOT = '0x' + 'f'.repeat(64);
 const BATCH_MODE = pad('0x01', { dir: 'right', size: 32 });
+// ERC-7579 batch with the TRY exec type: a failing leg (a position the keeper just burned, ...) does not undo the
+// others, so the revoke and the disable always stand (audit SA-1 M-8). The outcome is checked by state afterwards.
+const BATCH_TRY = pad('0x0101', { dir: 'right', size: 32 });
 
 // ------------------------------------------------------------------ ABIs
 const MODULE_ABI = parseAbi([
   'struct Caveat { address enforcer; bytes terms; bytes args; }',
   'struct Delegation { address delegate; address delegator; bytes32 authority; Caveat[] caveats; uint256 salt; bytes signature; }',
   'struct Position { uint256 tokenId; int24 tickLower; int24 tickUpper; }',
-  'function accounts(address) view returns (bytes32 delegationHash, uint8 kind, uint64 until, int256 contributed, int256 hwm, uint256 hedgeEquity, uint256 netMargin, uint256 hedgeEpoch, uint256 snapAsset, uint256 snapBase, uint256 lastFeeTime, uint256 feesPaid)',
+  'struct Account { bytes32 delegationHash; address owner; uint8 kind; uint64 until; bool revoked; bool hedgeClipped; int256 contributed; int256 hwm; uint256 hedgeEquity; uint256 netMargin; uint256 hedgeEpoch; uint256 snapAsset; uint256 snapBase; uint256 lastFeeTime; uint256 feesPaid; uint256 hedgeTime; }',
+  'function account(address) view returns (Account)',
+  'function revoke(address)',
   'function accountValue(address, uint256) view returns (uint256)',
   'function lastPrice() view returns (uint256)',
   'function isActive(address) view returns (bool)',
@@ -183,8 +188,8 @@ async function load() {
   // an EOA upgraded to the MetaMask delegator may be its own account; otherwise the HybridDeleGator
   let a = hybrid;
   if (S.is7702) {
-    const own = await pub.readContract({ address: SA.module, abi: MODULE_ABI, functionName: 'accounts', args: [S.account] });
-    if (own[0] !== pad('0x00', { size: 32 })) a = S.account;
+    const own = await pub.readContract({ address: SA.module, abi: MODULE_ABI, functionName: 'account', args: [S.account] });
+    if (own.delegationHash !== pad('0x00', { size: 32 })) a = S.account;
   }
   S.sa = a;
   S.info = await readAccount(a);
@@ -194,15 +199,15 @@ async function load() {
 async function readAccount(a) {
   const r = (fn, args = []) => pub.readContract({ address: SA.module, abi: MODULE_ABI, functionName: fn, args });
   const [acc, price, active, positions, usdcBal, hype, walletUsdc] = await Promise.all([
-    r('accounts', [a]), r('lastPrice'), r('isActive', [a]), r('positionsOf', [a]),
+    r('account', [a]), r('lastPrice'), r('isActive', [a]), r('positionsOf', [a]),
     pub.readContract({ address: USDC, abi: ERC20_ABI, functionName: 'balanceOf', args: [a] }), pub.getBalance({ address: a }),
     pub.readContract({ address: USDC, abi: ERC20_ABI, functionName: 'balanceOf', args: [S.account] }),
   ]);
-  const registered = acc[0] !== pad('0x00', { size: 32 });
+  const registered = acc.delegationHash !== pad('0x00', { size: 32 });
   const value = registered ? await r('accountValue', [a, price]) : usdcBal;
   const liq = await Promise.all(positions.map((p) => pub.readContract({ address: SA.positionManager, abi: POSM_ABI, functionName: 'getPositionLiquidity', args: [p.tokenId] })));
-  return { address: a, registered, kind: acc[1], until: Number(acc[2]), contributed: acc[3], hwm: acc[4], hedgeEquity: acc[5], netMargin: acc[6],
-    feesPaid: acc[11], price, active, value, usdc: usdcBal, hype, walletUsdc, deployed: (await pub.getCode({ address: a }))?.length > 2,
+  return { address: a, registered, kind: acc.kind, until: Number(acc.until), revoked: acc.revoked, contributed: acc.contributed, hwm: acc.hwm,
+    hedgeEquity: acc.hedgeEquity, netMargin: acc.netMargin, feesPaid: acc.feesPaid, price, active, value, usdc: usdcBal, hype, walletUsdc, deployed: (await pub.getCode({ address: a }))?.length > 2,
     positions: positions.map((p, i) => ({ ...p, liquidity: liq[i] })) };
 }
 
@@ -238,8 +243,8 @@ async function start() {
     const res = await fetch(SA.relayerUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
     if (!res.ok) throw new Error(`Relayer: ${res.status} ${await res.text()}`);
     for (let i = 0; i < 60; i++) {
-      const acc = await pub.readContract({ address: SA.module, abi: MODULE_ABI, functionName: 'accounts', args: [account] });
-      if (acc[0] !== pad('0x00', { size: 32 })) break;
+      const acc = await pub.readContract({ address: SA.module, abi: MODULE_ABI, functionName: 'account', args: [account] });
+      if (acc.delegationHash !== pad('0x00', { size: 32 })) break;
       await new Promise((r) => setTimeout(r, 2000));
     }
     S.busy = null; S.steps = null; S.msg = 'Your account is live. The manager starts within a few minutes.';
@@ -272,7 +277,8 @@ async function exitExecutions(to) {
   const ctx = await pub.readContract({ address: SA.module, abi: MODULE_ABI, functionName: 'permissionContext', args: [S.sa] });
   const [ds] = decodeAbiParameters([{ type: 'tuple[]', components: DELEGATION_COMPONENTS }], ctx);
   const d = ds[0];
-  const xs = [];
+  // 1. revoke at the module (no external calls, not pausable); 2. disable at the DelegationManager; 3. burns
+  const xs = [{ target: SA.module, value: 0n, callData: encodeFunctionData({ abi: MODULE_ABI, functionName: 'revoke', args: [S.sa] }) }];
   const h = await pub.readContract({ address: SA.delegationManager, abi: DM_ABI, functionName: 'getDelegationHash', args: [d] });
   if (!(await pub.readContract({ address: SA.delegationManager, abi: DM_ABI, functionName: 'disabledDelegations', args: [h] }))) {
     xs.push({ target: SA.delegationManager, value: 0n, callData: encodeFunctionData({ abi: DM_ABI, functionName: 'disableDelegation', args: [d] }) });
@@ -281,15 +287,15 @@ async function exitExecutions(to) {
   for (const p of S.info.positions) xs.push({ target: SA.positionManager, value: 0n, callData: burnCall(p.tokenId, to, deadline) });
   return xs;
 }
-async function runOnAccount(xs) {
+async function runOnAccount(xs, mode = BATCH_MODE) {
   if (S.kind === 'eip7702') {
     // the wallet itself is the account: one transaction to itself (execute is onlyEntryPointOrSelf)
-    const data = encodeFunctionData({ abi: ACCOUNT_ABI, functionName: 'execute', args: [BATCH_MODE, batch(xs)] });
+    const data = encodeFunctionData({ abi: ACCOUNT_ABI, functionName: 'execute', args: [mode, batch(xs)] });
     return req('eth_sendTransaction', [{ from: S.account, to: S.account, data }]);
   }
   // HybridDeleGator: a zero-fee user operation signed by the owner, submitted by the owner (one transaction)
   const nonce = await pub.readContract({ address: SA.entryPoint, abi: EP_ABI, functionName: 'getNonce', args: [S.sa, 0n] });
-  const op = { sender: S.sa, nonce, initCode: '0x', callData: encodeFunctionData({ abi: ACCOUNT_ABI, functionName: 'execute', args: [BATCH_MODE, batch(xs)] }),
+  const op = { sender: S.sa, nonce, initCode: '0x', callData: encodeFunctionData({ abi: ACCOUNT_ABI, functionName: 'execute', args: [mode, batch(xs)] }),
     accountGasLimits: concat([pad(toHex(300000), { size: 16 }), pad(toHex(2500000), { size: 16 })]), preVerificationGas: 0n,
     gasFees: pad('0x00', { size: 32 }), paymasterAndData: '0x', signature: '0x' };
   const typed = { types: USEROP_TYPES, primaryType: 'PackedUserOperation', domain: { name: 'HybridDeleGator', version: '1', chainId: CHAIN.id, verifyingContract: S.sa },
@@ -305,11 +311,17 @@ async function runOnAccount(xs) {
 }
 async function exit() {
   S.err = ''; S.msg = '';
-  if (!confirm('Stop the manager and close your positions into your account? Hedge margin is returned to your wallet by the keeper.')) return;
+  if (!confirm('Stop the manager and close your positions into your account? The keeper then returns your hedge margin into the account.')) return;
   S.busy = 'exit'; render();
   try {
     if (MOCK) { await new Promise((r) => setTimeout(r, 900)); S.mock = 'exited'; }
-    else { await ensureChain(); await waitTx(await runOnAccount(await exitExecutions(S.sa))); }
+    else {
+      await ensureChain();
+      await waitTx(await runOnAccount(await exitExecutions(S.sa), BATCH_TRY));
+      // the EntryPoint reports success even when the inner call failed: check the result on chain
+      const acc = await pub.readContract({ address: SA.module, abi: MODULE_ABI, functionName: 'account', args: [S.sa] });
+      if (!acc.revoked) throw new Error('The stop did not take effect on chain; please try again.');
+    }
     S.msg = 'Done. The manager can no longer act on your account; positions are closed into it.';
   } catch (e) { S.err = plain(e); }
   S.busy = null; await load();
@@ -412,11 +424,11 @@ function render() {
     if (I.active) {
       h += `<button class="btn secondary" id="add" ${S.busy ? 'disabled' : ''}>${S.busy === 'add' ? '<span class="spinner"></span>' : ''}Add USDC</button>
         <button class="btn danger-btn" id="exit" ${S.busy ? 'disabled' : ''}>${S.busy === 'exit' ? '<span class="spinner"></span>' : ''}Stop and close positions</button>
-        <p class="note">One transaction from your wallet: revokes the permission and closes every position into your account. The keeper then returns your hedge margin to your wallet.</p>`;
+        <p class="note">One transaction from your wallet: revokes the permission and closes every position into your account. The keeper then returns your hedge margin into the account; withdraw it from here.</p>`;
     } else if (I.kind !== 2 && (I.usdc > 0n || I.hype > 0n)) {
       h += `<button class="btn" id="withdraw" ${S.busy ? 'disabled' : ''}>${S.busy === 'withdraw' ? '<span class="spinner"></span>' : ''}Withdraw ${usd(I.usdc)} + ${Number(formatUnits(I.hype, 18)).toFixed(4)} HYPE to my wallet</button>`;
     }
-    if (!I.active && I.hedgeEquity > 0n) h += '<p class="note">Hedge margin is on its way back to your wallet (the keeper closes your hedge share first).</p>';
+    if (!I.active && I.hedgeEquity > 0n) h += '<p class="note">Hedge margin is on its way back into your account (the keeper closes your hedge share first); withdraw it once it arrives.</p>';
   }
   h += '<footer>Contracts: <a href="' + esc(CHAIN.explorer) + '/address/' + esc(SA.module || '') + '">manager module</a> · <a href="index.html">vaults</a></footer>';
   $('app').innerHTML = h;

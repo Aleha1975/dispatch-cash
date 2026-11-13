@@ -261,19 +261,20 @@ own checks, so they are a fair proxy for the module.
 8. **Missing contracts.** Canonical HybridDeleGatorImpl, SimpleFactory, AllowedTargets and AllowedMethods must be deployed by us at their
    canonical addresses. Verify the code hash against Base after deploying.
 
-## 6. As built (branch `smart-account`)
+## 6. As built (branch `smart-account`, audit SA-1 fixes on `sa-r1-fixes`)
 
 ### Contracts (`src/sa/`, solc 0.8.26 via-IR, runs 1; runtime sizes)
 
 | Contract | Bytes | Role |
 |---|---|---|
-| `LPManagerModule` | 23,947 (629 under EIP-170) | The keeper's only delegate. Ownable2Step (owner = `VaultTimelock`), transient reentrancy guard. |
-| `SALib` (external, linked) | 8,065 | Delegation shape check at registration, account-kind detection, HWM fee, sqrtPrice from price, execution builders, contribution flows, H-3 add check. |
-| `ElysiumCustodyEnforcer` | 7,529 | Client-signed caveat (MetaMask Delegation Framework v1.3.0 `ICaveatEnforcer`). |
+| `LPManagerModule` | 23,980 (596 under EIP-170) | The keeper's only delegate. Ownable2Step (owner = `VaultTimelock`), transient reentrancy guard. |
+| `SALib` (external, linked) | 19,440 | Delegation shape check, account identity (CREATE2 derivation / 7702 designator), registration, flow booking (`sync` writes the snapshot), valuation at a price, HWM fee, budgets (`movePrice`, `moveHedge`, turnover), execution builders with approval resets, verified transfers out. |
+| `SAWindow` (internal) | — | Sliding 24 h budget: nine 3 h buckets; any 24 h window admits at most 1x the cap. |
+| `ElysiumCustodyEnforcer` | 7,802 | Client-signed caveat (MetaMask Delegation Framework v1.3.0 `ICaveatEnforcer`). |
 | `SwapExecutor` | 3,402 | v4 unlock-callback router: exact input, pays only `msg.sender`, min-out, sqrtPrice limit, refunds unused native. |
 | `vendor/DelegationFramework.sol` | interfaces | `ModeCode`, `Caveat`, `Delegation`, `Execution`, DM / DeleGator / HybridDeleGator / SimpleFactory interfaces, EIP-712 hash. |
 
-Reused unchanged: `V4PositionMath`, `RiskBudgets`, `VaultTimelock`. The pooled vault (`LPVaultBase`, `UniV4LPVault`) is untouched.
+Reused unchanged: `V4PositionMath`, `VaultTimelock`. The SA path no longer uses `RiskBudgets` (it stays as is for the shelved vault). The pooled vault (`LPVaultBase`, `UniV4LPVault`) is untouched.
 Deployment: `script/DeploySA.s.sol` (not run on a live chain) creates HybridDeleGatorImpl (+ its linked SCL library at CREATE2 salt 0)
 and SimpleFactory from `test/fixtures/delegation-framework-v1.3.0` through the Arachnid CREATE2 deployer; the tests assert they land
 on the canonical addresses `0x48dB…FEC4` and `0x69Aa…c77c`. DM, 7702 delegator and TimestampEnforcer are the ones already on 99901.
@@ -286,9 +287,13 @@ on the canonical addresses `0x48dB…FEC4` and `0x69Aa…c77c`. DM, 7702 delegat
    its own terms hash.
 2. `TimestampEnforcer`, `terms = uint128(0) ‖ uint128(until)`, `until ≥ now + 1 day` (the web page uses 180 days).
 
-`register` checks the shape, the account kind (HybridDeleGator proxy on the canonical implementation, or an EOA whose code is the 7702
-designator for `0x63c0…`), the signature through the account's ERC-1271 `isValidSignature`, and that the delegation is not disabled.
-Re-registering (a new delegation, e.g. a longer expiry) keeps the account's books.
+`register` checks the shape (no caveat `args`, a 65-byte signature, expiry ≤ uint64), the account identity, the signature through the
+account's ERC-1271 `isValidSignature`, and that the delegation is not disabled. Identity (SA-1 C-1 / H-2): a 7702 account is an EOA whose
+code is the designator for `0x63c0…` (owner = the EOA); a hybrid account must sit at the SimpleFactory CREATE2 address of the canonical
+ERC1967Proxy initialised with (owner, no P256 keys) under the fixed salt: `owner()` is only a candidate that must re-derive the address,
+and the treasury / fee recipient can never be owners. The owner is pinned at registration. The first registration is permissionless
+(relayer); replacing the stored delegation or resuming after a revoke needs the account or its pinned owner (SA-1 M-1). Re-registering
+keeps the account's books.
 
 ### `ElysiumCustodyEnforcer.beforeHook` (default deny)
 
@@ -299,28 +304,38 @@ Called by the DelegationManager only; single-call default mode only; `redeemer =
 | PositionManager | `modifyLiquidities(unlockData, deadline)` only. The calldata, `unlockData` and every action's params must be the canonical ABI encoding (re-encoded and compared byte for byte). ≤ 16 actions from {MINT_POSITION, INCREASE_LIQUIDITY, DECREASE_LIQUIDITY, BURN_POSITION, SETTLE_PAIR, TAKE_PAIR, CLOSE_CURRENCY, SWEEP}; every other action code (0..255) reverts. MINT: the fixed PoolKey, `owner == delegator`, empty hookData. INCREASE/DECREASE/BURN: `ownerOf(tokenId) == delegator` and the position is in the fixed pool, empty hookData. SETTLE_PAIR / TAKE_PAIR: exactly (HYPE, USDC). TAKE_PAIR / SWEEP: `to == delegator` (no `MSG_SENDER` / `ADDRESS_THIS` sentinels). Native value > 0 only if the last action is SWEEP(native → delegator). |
 | SwapExecutor | `swap(zeroForOne, amountIn, minOut, limit)` only, amounts > 0, value == amountIn iff native input. |
 | Permit2 | `approve(token, spender, amount, expiration)`: token = the pool's ERC-20, spender ∈ {PositionManager, SwapExecutor}; amount 0 always allowed, otherwise `expiration ∈ {0, now}` (same-block) and amount ≤ the delegator's balance. |
-| USDC | `approve(Permit2, ≤ balance)`; `transfer(hedgeTreasury, x)` within 35% of the idle USDC balance per decaying day (state per delegator); `transfer(feeRecipient, x)` ≤ 20% of the idle USDC balance, at most once per 7 days. |
+| USDC | `approve(Permit2, ≤ balance)`; `transfer(hedgeTreasury, x)` within 35% of the idle USDC balance per sliding 24 h window (state per delegator AND terms hash, SA-1 M-6); `transfer(feeRecipient, x)` ≤ 20% of the idle USDC balance, at most once per 7 days. |
 | anything else | reverts: other targets and selectors, native transfers, other spenders/recipients, batch or try modes, short calldata. |
 
 Consequence for the keeper: hedge margin is limited by the account's **idle** USDC, so the keeper sends margin before the LP add
-(and keeps a small idle buffer); a fee needs idle USDC ≥ 5× the fee, so the keeper frees USDC from the position first.
+(and keeps a small idle buffer); a fee above 20% of idle USDC is charged partially, so the keeper frees USDC from the position first.
 
 ### Module
 
-- **Contributions are measured on-chain.** Every module action is bracketed by `_sync` / `_snap`: a change of the account's idle USDC,
-  idle HYPE (at the anchor) or tracked positions' liquidity since the last module action can only come from the client (or a donor), so it
-  is booked as contribution or withdrawal. Positions the account no longer owns are dropped. No `allocate` / `release` calls; a client may
-  add or take funds directly at any time.
-- **Account value** = idle USDC + idle HYPE × anchor + position amounts (incl. uncollected fees) + reported hedge equity.
-- **Budgets per account**: turnover (swaps + LP adds), hedge equity drift, guardian hedge approvals. One global price anchor.
-- **HWM fee**: `fee = feeBps × (profit − hwm)` if positive, `hwm = profit − fee`; `profit = value − contributed`. Needs a fresh
-  (`maxPriceAge`, 1 h) unclipped anchor, `feeInterval` (≥ 7 d) since the last fee, not paused, fee ≤ 20% of idle USDC.
-- **Hedge margin**: `sendHedgeMargin` (keeper, also while paused); `returnHedgeMargin` (keeper or treasury, never paused) pays the
-  account while the delegation is live, the HybridDeleGator's owner EOA after a revoke or expiry.
+- **Contributions are measured on-chain.** Every module path that touches an account starts with `SALib.sync`, which books what
+  changed since the last snapshot (idle USDC, idle HYPE, tracked positions' liquidity) as a client flow AND writes the new snapshot in
+  the same step, so no path can book a flow twice (SA-1 H-3 / M-2). Inflows are valued at min(anchor, pool), outflows at max (L-2).
+  After the action a directional post-check (idle may fall only by what the action spends) and, for decreases/burns, a value-conservation
+  check at the pool price stop account code from moving value out inside the bracket (M-5); positions with a subscriber are refused.
+  Positions the account no longer owns are dropped. A client may add or take funds directly at any time.
+- **Liveness** (`isActive`): registered, not revoked, not expired, delegation not disabled, and the account's identity unchanged (7702
+  designator, hybrid `owner()` == pinned owner): an owner change or a re-delegation is a revocation (L-14).
+- **Account value** at a price: idle USDC + idle HYPE × price + each position's principal at sqrt(price) + its uncollected fees +
+  reported hedge equity. No pool-spot term (M-4); fee and margin sends need an anchor that is fresh, unclipped and within the pool band.
+- **Budgets** (`SAWindow`, sliding 24 h, 1x): per account turnover (swaps + LP adds) and keeper-only hedge decreases; one global anchor
+  drift window, charged |Δ| / min both ways (M-7). Guardian price ranges and hedge approvals are one-shot, TTL ≤ 1 day, cleared by a pause
+  / guardian change; a hedge approval binds (account, epoch, stored value, value, guardian era) and every margin move bumps the epoch (M-3).
+- **HWM fee**: `fee = feeBps × (profit − hwm)` capped at 20% of idle USDC; a capped fee advances the mark only by the gain it charged
+  (L-11). Needs a fresh unclipped anchor in band, a recent unclipped hedge report (L-12), `feeInterval` since the last fee, not paused.
+- **Hedge margin**: `sendHedgeMargin` (keeper, not while paused, fresh anchor) is verified at the treasury (recipient delta, H-2).
+  `returnHedgeMargin` (keeper or treasury, never paused) always pays INTO the account, live or not, inside a sync/snapshot bracket; the
+  keeper may return at most the account's own hedge equity (H-1), the treasury itself any amount.
 - **Onboarding**: `onboard(delegation, amount, permit)` registers and pulls USDC from the HybridDeleGator's **owner** into that account
   only (a permit cannot be redirected to another account; a front-run permit is tolerated). 7702 accounts already hold their funds.
 - **Batching**: `multicall(bytes[], allowFailure)` (self-delegatecall) for many accounts per transaction.
-- Max 4 positions per account. `renounceOwnership` disabled. keeper ≠ guardian in the constructor and setters.
+- **Client stop**: `revoke(account)` by the account or its pinned owner: one plain call, no external calls, not pausable (M-8).
+- Max 4 positions per account. `renounceOwnership` disabled. Owner, keeper, guardian, treasury, fee recipient and the module pairwise
+  distinct (constructor and setters, L-8). Approvals the module builds are reset to 0 in the same redemption (L-17).
 
 Audit-1 constraints carried over: H-1 / M-9 (equity only down without the guardian), H-2 / M-4 / M-10 (one bounded-rate anchor, frozen
 while paused, every swap/add within band of pool and anchor), H-3 (adds valued at the anchor, charged to turnover), M-2 (approvals bind
@@ -332,13 +347,16 @@ enforcer/treasury/fee recipient), L-15 (min-out and a sqrtPrice limit at the anc
 ### Client exit
 
 - **HybridDeleGator**: one transaction from the owner EOA: `EntryPoint.handleOps([op], owner)` with a zero-fee user operation
-  (EIP-712 signed by the owner; domain `HybridDeleGator` / `1` / 99901 / account) whose `execute(batch)` runs
-  `DelegationManager.disableDelegation(d)` and `modifyLiquidities(BURN_POSITION, TAKE_PAIR → account)` for every position.
+  (EIP-712 signed by the owner; domain `HybridDeleGator` / `1` / 99901 / account) whose `execute(batch, TRY)` runs
+  `module.revoke(account)`, `DelegationManager.disableDelegation(d)` and `modifyLiquidities(BURN_POSITION, TAKE_PAIR → account)` for
+  every position. TRY exec type: a failing burn (e.g. the keeper burned it first) cannot undo the revoke; the EntryPoint reports success
+  even when the inner call failed, so the web page and the keeper check the result by state (`account(a).revoked`), not by status (M-8).
   Fork gas: 185k (one position, forge) / 272k (anvil, incl. calldata). A second identical transaction withdraws USDC + HYPE to the EOA.
 - **7702**: one transaction from the EOA to itself (`execute` is `onlyEntryPointOrSelf`), 114k gas.
 - Works while the module is paused and while the DelegationManager is paused (the exit never redeems a delegation).
-- Afterwards every keeper call reverts at the DM (`CannotUseADisabledDelegation`). The keeper closes the client's share of the HL
-  short and pays its hedge equity back with `returnHedgeMargin` (to the owner EOA). `netMargin` keeps the realised hedge cost
+- Afterwards every keeper call reverts (`NotLive`). The keeper closes the client's share of the HL short and pays its hedge equity
+  back INTO the account with `returnHedgeMargin` (at most the on-chain hedge equity; any rest needs the treasury itself); the client
+  withdraws it from the account. `netMargin` keeps the realised hedge cost
   (a flow counter, not a debt).
 
 ### Keeper (`keeper/elysium_keeper/sa_keeper.py`, `sa_chain.py`, `ledger.py`)
@@ -369,7 +387,10 @@ e2e checks against the chain.
 
 ### Tests
 
-- `test/sa/CustodyEnforcer.t.sol` (26): every allowed shape, every action code 0..255, recipients/owners/sentinels, foreign pool and
+- `test/sa/SARegressions.t.sol` (33): audit SA-1 regressions: for C-1, every High and every Medium the auditor's PoC and at least
+  one sibling path from `docs/audit/sa_round1_rootcause.md` (hostile account code via a real UUPS upgrade, 7702 re-delegation, owner
+  rotation, subscribers, racing burns against the exit), plus L-3 / L-4 / L-10 / L-17.
+- `test/sa/CustodyEnforcer.t.sol` (27): every allowed shape, every action code 0..255, recipients/owners/sentinels, foreign pool and
   foreign tokenIds, non-canonical encodings, native value rules, targets/selectors, Permit2/ERC-20 spenders and amounts, hedge and fee
   %-limits, 4 fuzz tests, a rogue delegate through the real DelegationManager, redeemer mismatch.
 - `test/sa/LPManagerModule.t.sol` (31): onboarding (hybrid, 7702, permit front-run, permit redirection), every `BadDelegation` code
@@ -377,8 +398,8 @@ e2e checks against the chain.
   lifecycle, deposits/withdrawals/direct burns as flows, fee freshness/idle, exits (hybrid, 7702, DM paused), re-registration,
   multicall, SwapExecutor, gas.
 - `test/fork/SmartAccount.fork.t.sol` (3, `ELYSIUM_FORK=true`): canonical framework on 99901, hybrid end to end with the real USDC
-  permit (onboard → margin → swap → mint → volume → fee → exit → margin to owner), 7702 end to end.
-- Keeper: `tests/test_sa_unit.py` (15: fee mirror, ledger, EIP-712 vs `eth_account`'s independent encoder, addresses) and
+  permit (onboard → margin → swap → mint → volume → fee → exit → margin back into the account), 7702 end to end.
+- Keeper: `tests/test_sa_unit.py` (16: fee mirror, ledger, EIP-712 vs `eth_account`'s independent encoder, addresses) and
   `tests/test_sa_e2e_fork.py` (anvil fork: deploy script, two clients via relayer and request queue, ticks, convergence, fee, one-tx exit,
   wind-down, restart no-op).
 - The test environment runs offline on a **replica**: the exact runtime code of Elysium's PoolManager, PositionManager, Permit2,

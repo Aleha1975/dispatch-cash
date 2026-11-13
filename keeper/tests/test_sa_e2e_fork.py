@@ -30,6 +30,7 @@ from elysium_keeper import config as C  # noqa: E402
 from elysium_keeper.hl import DryRunAdapter  # noqa: E402
 from elysium_keeper.infra import Log  # noqa: E402
 from elysium_keeper.rpc import ERC20_ABI, Contract  # noqa: E402
+from elysium_keeper.sa_chain import _b  # noqa: E402
 from elysium_keeper.sa_chain import (  # noqa: E402
     DM, ENTRYPOINT, HYBRID_IMPL, SIMPLE_FACTORY, Relayer, delegation_hash, dm_domain, hybrid_address,
     module_delegation, permit_digest, typed_digest, userop_digest)
@@ -165,10 +166,12 @@ def onboard(fork, k, module_addr, pk: bytes, usd: int, via_dir: str | None = Non
 
 def exit_hybrid(fork, k, pk: bytes, a: str, d):
     """ONE transaction from the owner EOA: EntryPoint.handleOps with a zero-fee userOp signed (EIP-712) by the owner;
-    the account disables the delegation and burns its positions into itself."""
+    the account revokes at the module, disables the delegation and burns its positions into itself, in ERC-7579 TRY
+    mode (SA-1 M-8: a failing burn cannot undo the revocation; the outcome is checked by state, not tx status)."""
     owner = Account.from_key(pk).address
     fork.set_balance(owner, 10 ** 18)
-    xs = [(DM, 0, keccak(text="disableDelegation((address,address,bytes32,(address,bytes,bytes)[],uint256,bytes))")[:4]
+    xs = [(k.r.m.address, 0, _b(k.r.m.encode("revoke", a)))]
+    xs += [(DM, 0, keccak(text="disableDelegation((address,address,bytes32,(address,bytes,bytes)[],uint256,bytes))")[:4]
            + abi_encode(["(address,address,bytes32,(address,bytes,bytes)[],uint256,bytes)"], [d.as_tuple()]))]
     for p in k.r.m.call("positionsOf", a):
         # V4PositionMath.removeData(burn) equivalent: actions BURN_POSITION, TAKE_PAIR(c0, c1, account)
@@ -180,7 +183,7 @@ def exit_hybrid(fork, k, pk: bytes, a: str, d):
                                                                               [unlock, fork.now() + 3600])
         xs.append((k.r.posm.address, 0, call))
     batch = abi_encode(["(address,uint256,bytes)[]"], [xs])
-    mode = (1 << 248).to_bytes(32, "big")
+    mode = ((1 << 248) | (1 << 240)).to_bytes(32, "big")  # batch, TRY exec type
     call_data = keccak(text="execute(bytes32,bytes)")[:4] + abi_encode(["bytes32", "bytes"], [mode, batch])
     ep = Contract(fork.rpc, ENTRYPOINT, EP_ABI)
     op = dict(sender=a, nonce=ep.call("getNonce", a, 0), initCode=b"", callData=call_data,
@@ -258,28 +261,33 @@ def test_sa_end_to_end(env):
     assert not st["errors"], st["errors"]
     fees = k.state.d.get("fees_by_account", {})
     for a in (a1, a2):
-        acc = m.call("accounts", a)
-        if acc[11]:
-            assert fees.get(a) == acc[11]
+        fees_paid = k.r.account(a).fees_paid
+        if fees_paid:
+            assert fees.get(a) == fees_paid
     print("fees", {a: v / 1e6 for a, v in fees.items()}, "profit", {a: st["accounts"][a]["profit"] for a in (a1, a2)})
 
-    # client 1 exits with one transaction; the keeper winds its hedge down and pays the margin to the owner EOA
+    # client 1 exits with one transaction; the keeper winds its hedge down and pays the margin back INTO the account
     gas = exit_hybrid(fork, k, pk1, a1, d1)
     print("exit gas", gas)
-    owner1 = Account.from_key(pk1).address
     assert Contract(fork.rpc, DM, DM_ABI).call("disabledDelegations", delegation_hash(d1))
+    assert k.r.account(a1).revoked
     assert not m.call("isActive", a1)
-    before = usdc.call("balanceOf", owner1)
+    contributed0 = k.r.account(a1).contributed
+    before = usdc.call("balanceOf", a1)
     for _ in range(3):
         st = k.tick()
         assert not st["errors"], st["errors"]
     led = k.ledger.clients()[a1]
     assert led["closed"] and led["short"] == pytest.approx(0, abs=1e-9)
-    paid = usdc.call("balanceOf", owner1) - before
+    paid = usdc.call("balanceOf", a1) - before
     assert paid == pytest.approx(led["margin_out"] * E6, rel=1e-6)
     assert paid > 3000 * 0.25 * 0.95 * E6
     # net margin is a flow counter: what is left is the client's realised hedge cost (fees), not owed money
-    assert m.call("accounts", a1)[6] == pytest.approx((led["margin_in"] - led["margin_out"]) * E6, abs=2)
+    assert k.r.account(a1).net_margin == pytest.approx((led["margin_in"] - led["margin_out"]) * E6, abs=2)
+    assert k.r.account(a1).hedge_equity == 0
+    # the margin coming back is not a client deposit (SA-1 M-2); what moves `contributed` here is the client's own
+    # burn collecting a week of LP fees into idle (booked as a client flow: acknowledged, in the client's favour)
+    assert abs(k.r.account(a1).contributed - contributed0) < 0.05 * paid
     assert led["equity"] == pytest.approx(0, abs=1e-6)
     # client 2 untouched and still managed
     assert m.call("isActive", a2) and k.ledger.clients()[a2]["short"] > 0

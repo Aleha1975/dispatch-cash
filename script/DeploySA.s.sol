@@ -62,6 +62,12 @@ contract DeploySA is Script {
                 && keeper != address(0) && treasury != address(0) && feeTo != address(0) && treasury != feeTo,
             "roles must be distinct and non-zero"
         );
+        // SA-1 L-8: the hot keys never hold the treasury / fee roles (the module constructor enforces the same)
+        require(
+            keeper != treasury && keeper != feeTo && guardian != treasury && guardian != feeTo && owner != treasury
+                && owner != feeTo,
+            "keeper / guardian / owner must not be the treasury or the fee recipient"
+        );
         require(IERC20Metadata(USDC).decimals() == 6, "USDC decimals");
         require(
             PM.code.length != 0 && POSM.code.length != 0 && PERMIT2.code.length != 0 && DM.code.length != 0
@@ -78,6 +84,8 @@ contract DeploySA is Script {
         _create2(bytes32(0), _fixture("SCL_RIP7212"), SCL_LIB);
         _create2(bytes32("GATOR"), abi.encodePacked(_fixture("HybridDeleGator.linked"), gatorArgs), HYBRID_IMPL);
         _create2(bytes32("GATOR"), _fixture("SimpleFactory"), SIMPLE_FACTORY);
+
+        require(HYBRID_IMPL.code.length != 0 && SIMPLE_FACTORY.code.length != 0, "canonical gator contracts missing");
 
         VaultTimelock timelock = new VaultTimelock(delay, owner, guardian);
         executor = new SwapExecutor(IPoolManager(PM), PERMIT2, key);

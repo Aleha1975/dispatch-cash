@@ -5,7 +5,8 @@ Tick:
      mark the hedge ledger to market.
   2. accounts: discover (static list + Registered events), then for EACH account, re-read its state from the chain
      (never from memory) and run, staggered by `sa.stagger_s` after any account that sent a transaction:
-       exited (delegation revoked / expired): close its hedge share, pay its hedge equity back (to the owner EOA);
+       exited (revoked / disabled / expired / code or owner changed): close its hedge share, pay its hedge equity
+         back INTO THE ACCOUNT (the keeper may return at most the on-chain hedge equity; the rest is the treasury's);
        live: hedge margin first (the enforcer caps margin at 35%/day of IDLE USDC, so it goes out before the LP add)
              -> LP: burn out-of-range positions, deploy idle funds (swap to the range's split, mint / increase)
              -> fee when due (HWM, frees idle USDC first: the enforcer caps a fee at 20% of idle)
@@ -39,12 +40,15 @@ BPS = 10_000
 E18 = 10 ** 18
 
 
-def hwm_fee(profit: int, hwm: int, fee_bps: int) -> tuple[int, int]:
-    """Mirror of SALib.hwmFee: (fee, new mark)."""
-    if profit <= hwm:
+def hwm_fee(profit: int, hwm: int, fee_bps: int, max_fee: int | None = None) -> tuple[int, int]:
+    """Mirror of SALib.hwmFee: (fee, new mark). A fee above `max_fee` (20% of idle USDC) is charged partially and
+    the mark advances only by the gain it charged for."""
+    if profit <= hwm or fee_bps == 0:
         return 0, hwm
     fee = (profit - hwm) * fee_bps // BPS
-    return fee, profit - fee
+    if max_fee is None or fee <= max_fee:
+        return fee, profit - fee
+    return max_fee, hwm + max_fee * BPS // fee_bps - max_fee
 
 
 def hedge_room(value: int, cap_bps: int, hedge_equity: int, net_margin: int) -> int:
@@ -53,7 +57,8 @@ def hedge_room(value: int, cap_bps: int, hedge_equity: int, net_margin: int) -> 
 
 
 def enforcer_hedge_room(idle_usdc: int, used_wad: int = 0) -> int:
-    """ElysiumCustodyEnforcer: transfers to the treasury <= 35% of the account's idle USDC per decaying day."""
+    """ElysiumCustodyEnforcer: transfers to the treasury <= 35% of the account's idle USDC per sliding 24 h window
+    (SAWindow: capacity returns 24-27 h after a send)."""
     return max(0, idle_usdc * (35 * 10 ** 16 - used_wad) // E18)
 
 
@@ -286,8 +291,8 @@ class SAKeeper:
         val = u0 * price // E18 + u1
         if liq <= 0 or val < self.sa.min_deploy_usd * 1e6:
             return
-        b = s.budgets
-        room = S.turnover_room(s.value, g.params["swapTurnoverBps"], b["turnoverUsed"], b["turnoverTime"], self.now())
+        # sliding 24 h window (SAWindow): capacity returns 24-27 h after use, no decay
+        room = max(0, s.value * g.params["swapTurnoverBps"] // BPS - s.windows["turnoverUsed"])
         charge = S.add_charge(val, g.params["poolBandBps"], g.params["maxSlippageBps"])
         if charge > room * 0.98:
             k = room * 0.98 / charge if charge else 0.0
@@ -309,6 +314,12 @@ class SAKeeper:
         if g.clipped or now - g.last_price_time > g.params["maxPriceAge"]:
             self.log("fee_waits_price", account=a)
             return
+        if s.hedge_equity and (s.hedge_clipped or now - s.hedge_time > g.params["maxPriceAge"]):
+            self.report_equity(s, refresh=True)  # chargeFee needs a recent, unclipped hedge report (SA-1 L-12)
+            s = self.r.account(a)
+            if s.hedge_clipped:
+                self.log("fee_waits_hedge", account=a)
+                return
         fee, new_hwm = hwm_fee(s.profit, s.hwm, g.params["feeBps"])
         if fee <= 0:
             return
@@ -321,9 +332,8 @@ class SAKeeper:
                 q = min(1.0, (need - s.usdc) * 1.05 / y)
                 self.act("decreasePosition", a, p.token_id, int(p.liquidity * q), 0, 0)
                 s = self.r.account(a)
-        if s.usdc * 2000 < fee * BPS:
-            self.alert("warn", f"fee_idle_{a}", f"fee {fee / 1e6:.2f} for {a} needs more idle USDC; postponed")
-            return
+        if s.usdc * 2000 < fee * BPS:  # charged partially (20% of idle); the mark advances only by that part
+            self.log("fee_partial", account=a, fee=fee / 1e6, idle=s.usdc / 1e6)
         self.act("chargeFee", a)
         s2 = self.r.account(a)
         charged = s2.fees_paid - s.fees_paid
@@ -333,12 +343,15 @@ class SAKeeper:
         tot[a] = tot.get(a, 0) + charged
         self.log("fee_charged", **rec)
 
-    def report_equity(self, s: AccountSnap):
-        """On-chain hedgeEquity follows the ledger: lowered by the keeper (daily budget), raised only with the
-        guardian's exact per-account approval."""
+    def report_equity(self, s: AccountSnap, refresh: bool = False):
+        """On-chain hedgeEquity follows the ledger: lowered by the keeper (sliding 24 h budget, nothing while paused or
+        on a stale anchor), raised only with the guardian's one-shot approval for this account's exact epoch and
+        stored value. `refresh`: report even when unchanged (refreshes the report time the fee needs)."""
         v = max(0, int(self.ledger.equity(s.address) * 1e6))
         old = s.hedge_equity
         if abs(v - old) < max(10 ** 6, old // 200):
+            if refresh:
+                self.act("reportHedgeEquity", s.address, old)
             return
         b = s.budgets
         if v > old:
@@ -348,7 +361,9 @@ class SAKeeper:
                 return
             self.alert("warn", f"hedge_eq_{s.address}",
                        f"hedge equity of {s.address}: ledger {v / 1e6:.2f} > on-chain {old / 1e6:.2f}; guardian: "
-                       f"approveHedgeEquity({s.address}, {v}, <deadline>) (epoch {s.hedge_epoch})")
+                       f"approveHedgeEquity({s.address}, {s.hedge_epoch}, {old}, {v}, <until <= 1 day>)")
+            if refresh:
+                self.act("reportHedgeEquity", s.address, old)
             return
         self.act("reportHedgeEquity", s.address, v)
 
@@ -363,18 +378,23 @@ class SAKeeper:
             return  # the netted order this tick closes it; margin goes back on a later tick
         eq = int(max(0.0, led["equity"]) * 1e6)
         if eq < 10 ** 6:
+            if s.hedge_equity:  # nothing left off-chain: write the on-chain residue down (a keeper-only decrease)
+                self.act("reportHedgeEquity", a, 0)
             self.ledger.close(a)
             self.log("client_closed", account=a)
             return
         avail = min(g.treasury_usdc, g.treasury_allowance)
-        amt = min(eq, avail)
+        # SA-1 H-1: the keeper may return at most the account's on-chain hedge equity; always into the account
+        amt = min(eq, avail, s.hedge_equity)
         if amt >= 10 ** 6:
             self.act("returnHedgeMargin", a, amt)
             self.ledger.margin_returned(a, amt / 1e6)
-            self.log("margin_returned", account=a, to=s.payout, usdc=amt / 1e6)
+            self.log("margin_returned", account=a, to=a, usdc=amt / 1e6)
         if eq - amt >= 10 ** 6:
-            self.alert("warn", f"exit_margin_{a}", f"MANUAL: withdraw {(eq - amt) / 1e6:.2f} USDC from HL to the "
-                                                   f"treasury for exited client {a} (paid to {s.payout})")
+            why = "on-chain hedge equity is lower: the treasury itself calls returnHedgeMargin" \
+                if s.hedge_equity < eq else "withdraw from HL to the treasury first"
+            self.alert("warn", f"exit_margin_{a}", f"MANUAL: {(eq - amt) / 1e6:.2f} USDC of exited client {a} still "
+                                                   f"to return into the account ({why})")
 
     # ------------------------------------------------------------ hedge (netted)
     def hedge(self, now: int):
