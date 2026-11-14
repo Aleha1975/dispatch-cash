@@ -26,6 +26,9 @@ interface IPermit2Transfer {
 ///         client account may let a delegate call it without any recipient checks.
 ///         The caller bounds the trade with `minOut` (reverts below it) and `sqrtPriceLimitX96` (the pool price the
 ///         swap may not cross; the LPManagerModule sets it to the edge of its price anchor band).
+///         SA-2 (flow booking): every swap is recorded per payer in transient storage (count, paid, received), so the
+///         LPManagerModule books the swap's effect on the account from this contract's record, never from balances
+///         the account's own code could move inside the bracket.
 contract SwapExecutor is IUnlockCallback, ReentrancyGuardTransient {
     using SafeCast for uint256;
 
@@ -37,6 +40,9 @@ contract SwapExecutor is IUnlockCallback, ReentrancyGuardTransient {
     int24 public immutable tickSpacing;
 
     event Swapped(address indexed payer, bool zeroForOne, uint256 paid, uint256 received);
+
+    /// transient record base slot: keccak256("elysium.SwapExecutor.record")
+    bytes32 private constant RECORD = 0x614994e2b962b21300eceffa0cdefbe19f54d6273729eae36cd38effd6e63c31;
 
     error BadPool();
     error BadAmount();
@@ -83,7 +89,23 @@ contract SwapExecutor is IUnlockCallback, ReentrancyGuardTransient {
             (bool ok,) = msg.sender.call{value: amountIn - paid}("");
             if (!ok) revert RefundFailed();
         }
+        bytes32 k = keccak256(abi.encode(msg.sender, RECORD));
+        assembly {
+            tstore(k, add(tload(k), 1))
+            tstore(add(k, 1), paid)
+            tstore(add(k, 2), out)
+        }
         emit Swapped(msg.sender, zeroForOne, paid, out);
+    }
+
+    /// @notice (number of swaps paid by `payer` in this transaction, input paid and output received by the last one).
+    function lastSwap(address payer) external view returns (uint256 n, uint256 paid, uint256 received) {
+        bytes32 k = keccak256(abi.encode(payer, RECORD));
+        assembly {
+            n := tload(k)
+            paid := tload(add(k, 1))
+            received := tload(add(k, 2))
+        }
     }
 
     function unlockCallback(bytes calldata data) external returns (bytes memory) {

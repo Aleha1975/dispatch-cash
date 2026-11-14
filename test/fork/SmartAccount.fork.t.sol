@@ -61,11 +61,12 @@ contract SmartAccountForkTest is SATestBase {
 
         g = gasleft();
         vm.prank(keeper);
-        module.swap(a, false, 650e6, p);
+        module.swap(a, false, 650e6, p, 0);
         emit log_named_uint("gas swap", g - gasleft());
         g = gasleft();
         uint256 id = _mintAll(a);
         emit log_named_uint("gas mint", g - gasleft());
+        assertEq(_pending(a), 0, "send, swap and mint booked from unfakeable sources, exactly");
         assertEq(POSM.ownerOf(id), a);
         uint256 v = module.accountValue(a, module.lastPrice());
         assertApproxEqRel(v, 2_000e6, 0.02e18);
@@ -84,11 +85,15 @@ contract SmartAccountForkTest is SATestBase {
         _moveTo(module.lastPrice());
         vm.warp(vm.getBlockTimestamp() + 7 days);
         _report();
+        _stable(); // SA-2: booking and fees need the anchor unchanged for minPriceStable
         uint128 half = POSM.getPositionLiquidity(id) / 2;
         vm.prank(keeper);
         module.decreasePosition(a, id, half, 0, 0);
+        assertEq(_pending(a), 0, "the module's computed effect matches the real PositionManager to the wei");
         _reportEquity(a, 600e6); // a recent, unclipped hedge report is required for the fee (SA-1 L-12)
-        int256 profit = int256(module.accountValue(a, module.lastPrice())) - module.account(a).contributed;
+        // SA-2: profit at the lower of the value at the anchor and at the pool
+        uint256 vv = Math.min(module.accountValue(a, module.lastPrice()), module.accountValue(a, poolPrice()));
+        int256 profit = int256(vv) - module.account(a).contributed;
         uint256 maxFee = usdc.balanceOf(a) * 2000 / 10_000;
         vm.prank(keeper);
         uint256 f = module.chargeFee(a);
@@ -131,6 +136,6 @@ contract SmartAccountForkTest is SATestBase {
         uint256 p = poolPrice();
         vm.prank(keeper);
         vm.expectRevert();
-        module.swap(a, false, 10e6, p);
+        module.swap(a, false, 10e6, p, 0);
     }
 }

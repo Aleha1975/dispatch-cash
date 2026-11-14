@@ -232,7 +232,8 @@ abstract contract SATestBase is Test {
             refDriftBps: 1000,
             swapTurnoverBps: 20000,
             feeInterval: 7 days,
-            maxPriceAge: 3600
+            maxPriceAge: 3600,
+            minPriceStable: 300
         });
     }
 
@@ -520,7 +521,7 @@ abstract contract SATestBase is Test {
     function _buyBase(address a, uint256 usd) internal {
         uint256 p = poolPrice();
         vm.prank(keeper);
-        module.swap(a, false, usd, p);
+        module.swap(a, false, usd, p, 0);
     }
 
     // ------------------------------------------------------------------ test helpers
@@ -543,13 +544,41 @@ abstract contract SATestBase is Test {
         id = _mintAll(a);
     }
 
+    /// Wait until the anchor has been unchanged for minPriceStable (booking and fees need it; SA-2 H-1 / L-16).
+    function _stable() internal {
+        (,,,,,,,, , uint32 st) = module.params();
+        uint256 t = module.lastPriceMoved() + st;
+        if (block.timestamp < t) vm.warp(t);
+    }
+
+    /// Unbooked client flow (live state - snapshot) valued at the anchor, as SABook.sync would book it.
+    function _pending(address a) internal view returns (int256 f) {
+        uint256 ref = module.lastPrice();
+        SALib.Account memory s = module.account(a);
+        f = int256(usdc.balanceOf(a)) - s.snapAsset;
+        int256 db = int256(a.balance) - s.snapBase;
+        f += db >= 0 ? int256(uint256(db) * ref / 1e18) : -int256((uint256(-db) * ref + 1e18 - 1) / 1e18);
+        V4PositionMath.Position[] memory ps = module.positionsOf(a);
+        for (uint256 i; i < ps.length; ++i) {
+            uint128 liq;
+            try POSM.ownerOf(ps[i].tokenId) returns (address o) {
+                if (o == a) liq = POSM.getPositionLiquidity(ps[i].tokenId);
+            } catch {}
+            uint128 old = module.snapLiquidity(ps[i].tokenId);
+            f += int256(V4PositionMath.liquidityValue(ps[i].tickLower, ps[i].tickUpper, liq, ref, true))
+                - int256(V4PositionMath.liquidityValue(ps[i].tickLower, ps[i].tickUpper, old, ref, true));
+        }
+    }
+
     function _syncTouch(address a) internal {
-        // decrease(0) = fee collect: a module action that syncs flows; allowed in every state
+        // decrease(0) = fee collect: a module action that syncs flows; allowed in every state. Waits for a stable
+        // anchor first so the sync books (SA-2).
+        _stable();
         V4PositionMath.Position[] memory ps = module.positionsOf(a);
         uint256 p = poolPrice();
         vm.prank(keeper);
         if (ps.length > 0) module.decreasePosition(a, ps[0].tokenId, 0, 0, 0);
-        else module.swap(a, false, 1e6, p);
+        else module.swap(a, false, 1e6, p, 0);
     }
 
     function _schedule(address target, bytes memory data) internal {

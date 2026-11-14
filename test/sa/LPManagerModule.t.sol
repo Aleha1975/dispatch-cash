@@ -29,9 +29,11 @@ contract LPManagerModuleTest is SATestBase {
         assertEq(s.delegationHash, DM.getDelegationHash(d));
         assertEq(s.kind, 1);
         assertEq(s.owner, owner_, "owner pinned (derived from the address)");
-        assertEq(s.contributed, 0); // registered before the funds arrived
+        assertEq(s.contributed, 10_000e6); // SA-2: a USDC pull is booked at face value at once
+        assertEq(s.snapAsset, 10_000e6);
         assertTrue(module.isActive(a));
-        _buyBase(a, 1_000e6); // first keeper touch books the deposit
+        _stable();
+        _buyBase(a, 1_000e6); // nothing pending: the first keeper touch books nothing more
         assertEq(_acct(a).contributed, 10_000e6);
     }
 
@@ -40,8 +42,11 @@ contract LPManagerModuleTest is SATestBase {
         assertEq(a, vm.addr(BOB_PK));
         assertEq(_acct(a).kind, 2);
         assertEq(_acct(a).owner, a);
-        assertEq(_acct(a).contributed, 5_000e6); // already in the EOA at registration
+        assertEq(_acct(a).contributed, 0); // SA-2: registration books nothing; pending until a trusted keeper sync
+        assertEq(_pending(a), 5_000e6);
+        _stable();
         _buyBase(a, 2_000e6);
+        assertEq(_acct(a).contributed, 5_000e6);
         uint256 id = _mintAll(a);
         assertEq(POSM.ownerOf(id), a);
     }
@@ -225,7 +230,7 @@ contract LPManagerModuleTest is SATestBase {
             vm.expectRevert(LPManagerModule.NotKeeper.selector);
             module.burnPosition(a, id, 0, 0);
             vm.expectRevert(LPManagerModule.NotKeeper.selector);
-            module.swap(a, true, 1, p);
+            module.swap(a, true, 1, p, 0);
             vm.expectRevert(LPManagerModule.NotKeeper.selector);
             module.sendHedgeMargin(a, 1);
             vm.expectRevert(LPManagerModule.NotKeeper.selector);
@@ -319,14 +324,14 @@ contract LPManagerModuleTest is SATestBase {
         uint256 p = poolPrice();
         vm.startPrank(keeper);
         vm.expectRevert(LPManagerModule.BadPrice.selector); // in band of the pool, not of the anchor
-        module.swap(a, false, 100e6, p);
+        module.swap(a, false, 100e6, p, 0);
         vm.expectPartialRevert(LPManagerModule.PoolPriceOff.selector); // the anchor itself is off the pool
-        module.swap(a, false, 100e6, anchor);
+        module.swap(a, false, 100e6, anchor, 0);
         // a price in band of both passes the price check; buying base would push the pool further past the
         // anchor band (L-15 limit), selling base moves it back
         vm.expectRevert();
-        module.swap(a, false, 100e6, anchor * 10_140 / 10_000);
-        module.swap(a, true, 1 ether, anchor * 10_140 / 10_000);
+        module.swap(a, false, 100e6, anchor * 10_140 / 10_000, 0);
+        module.swap(a, true, 1 ether, anchor * 10_140 / 10_000, 0);
         vm.stopPrank();
     }
 
@@ -373,9 +378,9 @@ contract LPManagerModuleTest is SATestBase {
         uint256 hype = a.balance / 2;
         vm.prank(keeper);
         vm.expectRevert(); // selling base would push the pool further below the anchor band edge
-        module.swap(a, true, hype, kp);
+        module.swap(a, true, hype, kp, 0);
         vm.prank(keeper);
-        module.swap(a, false, 100e6, kp); // buying base moves it back toward the anchor: fine
+        module.swap(a, false, 100e6, kp, 0); // buying base moves it back toward the anchor: fine
     }
 
     function test_SwapTurnoverIsPerAccount() public {
@@ -385,22 +390,22 @@ contract LPManagerModuleTest is SATestBase {
         // 2x account value per 24 h window: 10k account -> ~20k notional
         for (uint256 i; i < 2; ++i) {
             vm.prank(keeper);
-            module.swap(a, false, 4_000e6, p);
+            module.swap(a, false, 4_000e6, p, 0);
             _moveTo(p);
             vm.prank(keeper);
-            module.swap(a, true, a.balance, p);
+            module.swap(a, true, a.balance, p, 0);
             _moveTo(p);
         }
         vm.prank(keeper);
         vm.expectRevert(SAWindow.WindowOverflow.selector);
-        module.swap(a, false, 5_000e6, p);
+        module.swap(a, false, 5_000e6, p, 0);
         vm.prank(keeper);
-        module.swap(b, false, 5_000e6, p); // bob's budget is his own
+        module.swap(b, false, 5_000e6, p, 0); // bob's budget is his own
         vm.warp(vm.getBlockTimestamp() + 27 hours);
         _report();
         p = poolPrice();
         vm.prank(keeper);
-        module.swap(a, false, 4_000e6, p);
+        module.swap(a, false, 4_000e6, p, 0);
     }
 
     // ------------------------------------------------------------------ LP adds (H-3)
@@ -523,7 +528,7 @@ contract LPManagerModuleTest is SATestBase {
         uint256 p = poolPrice();
         vm.startPrank(keeper);
         vm.expectRevert(LPManagerModule.IsPaused.selector);
-        module.swap(a, false, 100e6, p);
+        module.swap(a, false, 100e6, p, 0);
         vm.expectRevert(LPManagerModule.IsPaused.selector);
         module.mintPosition(a, -60, 60, 1, 1, 1, p);
         vm.expectRevert(LPManagerModule.IsPaused.selector);
@@ -602,14 +607,15 @@ contract LPManagerModuleTest is SATestBase {
         xs[0] = Execution(address(usdc), 0, abi.encodeCall(IERC20.transfer, (owner_, 3_000e6)));
         xs[1] = Execution(owner_, 1 ether, "");
         _clientExec(ALICE_PK, a, xs);
-        uint256 hi = Math.max(module.lastPrice(), poolPrice()); // an outflow is booked at the higher price (L-2)
+        uint256 ref = module.lastPrice(); // SA-2: every flow at the anchor, the price `value` uses
         _syncTouch(a);
         assertEq(c1, c0 + 5_000e6);
-        assertApproxEqAbs(_acct(a).contributed, c1 - 3_000e6 - int256(hi), 2);
-        assertApproxEqAbs(_profit(a), p0, 1e6);
+        assertApproxEqAbs(_acct(a).contributed, c1 - 3_000e6 - int256(ref), 2);
+        assertApproxEqAbs(_profit(a), p0, 2, "a flow never moves profit");
         // no fee on any of it
         vm.warp(vm.getBlockTimestamp() + 7 days);
         _report();
+        _stable();
         vm.prank(keeper);
         assertLe(module.chargeFee(a), 1e6 * 1500 / 10_000);
     }
@@ -630,7 +636,7 @@ contract LPManagerModuleTest is SATestBase {
         _clientExec(ALICE_PK, a, xs);
         uint256 p = poolPrice();
         vm.prank(keeper);
-        module.swap(a, false, 10e6, p);
+        module.swap(a, false, 10e6, p, 0);
         assertEq(module.positionsOf(a).length, 0, "untracked after the client burned it");
         assertApproxEqRel(uint256(_acct(a).contributed), 10_000e6, 3e15);
         assertApproxEqAbs(_profit(a), p0, 30e6); // only the 10 USDC swap's fee and the anchor/pool spread
@@ -695,7 +701,7 @@ contract LPManagerModuleTest is SATestBase {
         uint256 p = poolPrice();
         vm.prank(keeper);
         vm.expectRevert(LPManagerModule.NotLive.selector);
-        module.swap(a, false, 10e6, p);
+        module.swap(a, false, 10e6, p, 0);
         // hedge margin comes back into the account (B: always bracketed, never to an address the account reports)
         int256 c0 = _acct(a).contributed;
         uint256 bal = usdc.balanceOf(a);
@@ -728,7 +734,7 @@ contract LPManagerModuleTest is SATestBase {
         uint256 p = poolPrice();
         vm.prank(keeper);
         vm.expectRevert(); // management halts
-        module.swap(a, false, 10e6, p);
+        module.swap(a, false, 10e6, p, 0);
         // the client's own exit never goes through redeemDelegations
         _exitHybrid(ALICE_PK, a, d, vm.addr(ALICE_PK));
         assertGt(usdc.balanceOf(vm.addr(ALICE_PK)), 0);
@@ -757,8 +763,8 @@ contract LPManagerModuleTest is SATestBase {
         (address b,) = _onboardHybrid(BOB_PK, 10_000e6);
         uint256 p = poolPrice();
         bytes[] memory calls = new bytes[](3);
-        calls[0] = abi.encodeCall(LPManagerModule.swap, (a, false, 3_000e6, p));
-        calls[1] = abi.encodeCall(LPManagerModule.swap, (b, false, 3_000e6, p));
+        calls[0] = abi.encodeCall(LPManagerModule.swap, (a, false, 3_000e6, p, 0));
+        calls[1] = abi.encodeCall(LPManagerModule.swap, (b, false, 3_000e6, p, 0));
         calls[2] = abi.encodeCall(LPManagerModule.sendHedgeMargin, (b, 1_000_000e6)); // fails: over the cap
         vm.prank(keeper);
         vm.expectPartialRevert(LPManagerModule.HedgeCap.selector);

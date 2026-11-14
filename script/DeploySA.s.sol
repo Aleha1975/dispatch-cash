@@ -8,6 +8,10 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
+import {PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
+import {IHybridDeleGator, ISimpleFactory} from "../src/sa/vendor/DelegationFramework.sol";
+import {SALib} from "../src/sa/SALib.sol";
 import {VaultTimelock} from "../src/VaultTimelock.sol";
 import {IPositionManagerMin} from "../src/interfaces/IExternal.sol";
 import {IDelegationManager} from "../src/sa/vendor/DelegationFramework.sol";
@@ -24,7 +28,14 @@ import {LPManagerModule} from "../src/sa/LPManagerModule.sol";
 ///    and GUARDIAN cancel). Forge links SALib / V4PositionMath / RiskBudgets automatically.
 /// Env: OWNER, KEEPER, GUARDIAN, HEDGE_TREASURY, FEE_RECIPIENT, optional TIMELOCK_DELAY (default 48 h, >= 24 h).
 /// After deploying: the keeper calls reportPrice once (anchor), the treasury approves the module for USDC.
+interface IPausable {
+    function paused() external view returns (bool);
+}
+
 contract DeploySA is Script {
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
+
     uint256 constant CHAIN_ID = 99901;
     address constant USDC = 0xb47c4C8F73F009CC0C0d3f92B388d13E293F0B65;
     address constant PM = 0xE2e105d3F7209A9DA11f83cCf3E7398a753823F1;
@@ -48,6 +59,15 @@ contract DeploySA is Script {
         if (expected.code.length != 0) return;
         (bool ok, bytes memory ret) = CREATE2_DEPLOYER.call(abi.encodePacked(salt, initcode));
         require(ok && address(bytes20(ret)) == expected, "CREATE2 did not land on the canonical address");
+    }
+
+    /// SA-2 L-8: a contract already at a canonical CREATE2 address is accepted only if that address is the
+    /// deterministic deployer's derivation of the fixture initcode (the address commits to the initcode).
+    function _canonical(bytes32 salt, bytes memory initcode, address expected) internal pure {
+        address got = address(
+            uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), CREATE2_DEPLOYER, salt, keccak256(initcode)))))
+        );
+        require(got == expected, "fixture does not derive the canonical address");
     }
 
     function run() external returns (LPManagerModule module, ElysiumCustodyEnforcer enforcer, SwapExecutor executor) {
@@ -76,8 +96,24 @@ contract DeploySA is Script {
             "missing v4 / Delegation Framework / EntryPoint contracts"
         );
         uint256 delay = vm.envOr("TIMELOCK_DELAY", uint256(48 hours));
-        require(delay >= 24 hours, "TIMELOCK_DELAY < 24h");
+        require(delay >= 24 hours && delay <= 30 days, "TIMELOCK_DELAY outside [24h, 30d]");
         PoolKey memory key = PoolKey(Currency.wrap(address(0)), Currency.wrap(USDC), 3000, 60, IHooks(address(0)));
+        // SA-2 L-8: the first reportPrice is free and bounded only by the pool, so the pool must be live and deep
+        (uint160 sp,,,) = IPoolManager(PM).getSlot0(key.toId());
+        require(sp != 0 && IPoolManager(PM).getLiquidity(key.toId()) != 0, "pool not initialised / no liquidity");
+        require(!IPausable(DM).paused(), "DelegationManager paused");
+        require(
+            keccak256(CREATE2_DEPLOYER.code)
+                == keccak256(vm.parseBytes(vm.readFile("test/fixtures/elysium/Create2Deployer.runtime.hex"))),
+            "not the deterministic CREATE2 deployer"
+        );
+        bytes memory gatorArgs0 = abi.encode(DM, ENTRYPOINT);
+        _canonical(bytes32("GATOR"), abi.encodePacked(_fixture("DelegationManager"), abi.encode(0xB0403B32f54d0Bd752113f4009e8B534C6669f44)), DM);
+        _canonical(bytes32("GATOR"), abi.encodePacked(_fixture("EIP7702StatelessDeleGator"), gatorArgs0), EIP7702_IMPL);
+        _canonical(bytes32("GATOR"), _fixture("TimestampEnforcer"), TIMESTAMP_ENFORCER);
+        _canonical(bytes32(0), _fixture("SCL_RIP7212"), SCL_LIB);
+        _canonical(bytes32("GATOR"), abi.encodePacked(_fixture("HybridDeleGator.linked"), gatorArgs0), HYBRID_IMPL);
+        _canonical(bytes32("GATOR"), _fixture("SimpleFactory"), SIMPLE_FACTORY);
 
         vm.startBroadcast();
         bytes memory gatorArgs = abi.encode(DM, ENTRYPOINT);
@@ -119,10 +155,27 @@ contract DeploySA is Script {
                     refDriftBps: 1000,
                     swapTurnoverBps: 20000,
                     feeInterval: 7 days,
-                    maxPriceAge: 3600
+                    maxPriceAge: 3600,
+                    minPriceStable: 300
                 })
             })
         );
         vm.stopBroadcast();
+        // SA-2 L-8: the module's CREATE2 derivation must equal the factory's, or every hybrid registration reverts
+        address probe = address(0xBEEF);
+        bytes memory init = abi.encodeCall(
+            IHybridDeleGator.initialize, (probe, new string[](0), new uint256[](0), new uint256[](0))
+        );
+        bytes memory proxyInit = abi.encodePacked(_fixture("ERC1967Proxy"), abi.encode(HYBRID_IMPL, init));
+        SALib.Expect memory e;
+        e.hybridImpl = HYBRID_IMPL;
+        e.factory = SIMPLE_FACTORY;
+        e.accountSalt = bytes32("ELYSIUM-LP-V1");
+        require(
+            SALib.hybridAddress(e, probe)
+                == ISimpleFactory(SIMPLE_FACTORY).computeAddress(keccak256(proxyInit), bytes32("ELYSIUM-LP-V1")),
+            "module and factory derive different account addresses"
+        );
+        // operator step left: the treasury approves the module for USDC (returnHedgeMargin), sized per return
     }
 }

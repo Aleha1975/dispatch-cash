@@ -26,7 +26,9 @@ contract SARegressionsTest is SATestBase {
     }
 
     function _hostile(address claimedOwner, uint8 mode) internal returns (HostileAccount) {
-        return new HostileAccount(claimedOwner, sink, address(usdc), treasury, feeTo, POSM_ADDR, mode, HYBRID_IMPL);
+        return new HostileAccount(
+            claimedOwner, sink, address(usdc), treasury, feeTo, POSM_ADDR, mode, HYBRID_IMPL, address(executor), PERMIT2, 0, 0
+        );
     }
 
     /// The owner upgrades its canonical HybridDeleGator (UUPS, owner-signed userOp) to client code that keeps
@@ -92,7 +94,7 @@ contract SARegressionsTest is SATestBase {
         uint256 p = poolPrice();
         vm.prank(keeper);
         vm.expectRevert(LPManagerModule.NotLive.selector);
-        module.swap(a, false, 10e6, p);
+        module.swap(a, false, 10e6, p, 0);
     }
 
     // ================================================================== H-1 (class G: treasury bound per account)
@@ -279,7 +281,12 @@ contract SARegressionsTest is SATestBase {
         int256 c0 = module.account(a).contributed;
         _clientExec1(ALICE_PK, a, address(usdc), 0, abi.encodeCall(IERC20.transfer, (vm.addr(ALICE_PK), 2_000e6)));
         vm.prank(keeper);
-        module.returnHedgeMargin(a, 1_000e6);
+        module.returnHedgeMargin(a, 1_000e6); // stale anchor: nothing is booked, the withdrawal stays pending
+        assertEq(module.account(a).contributed, c0);
+        assertEq(_pending(a), -2_000e6, "the margin is not a flow");
+        _report();
+        _stable();
+        _reportEquity(a, 0);
         assertEq(module.account(a).contributed, c0 - 2_000e6, "the withdrawal is booked, the margin is not");
     }
 
@@ -364,9 +371,9 @@ contract SARegressionsTest is SATestBase {
         module.reportPrice(ref); // fresh again
         _moveTo(ref * 103 / 100);
         vm.startPrank(keeper);
-        vm.expectPartialRevert(LPManagerModule.PoolPriceOff.selector);
+        vm.expectRevert(LPManagerModule.StalePrice.selector); // pool off the anchor band: not fresh
         module.sendHedgeMargin(a, 100e6);
-        vm.expectPartialRevert(LPManagerModule.PoolPriceOff.selector);
+        vm.expectRevert(LPManagerModule.StalePrice.selector); // SA-2: fees need a trusted anchor
         module.chargeFee(a);
         vm.stopPrank();
     }
@@ -393,19 +400,29 @@ contract SARegressionsTest is SATestBase {
         vm.stopPrank();
     }
 
-    /// Sibling: client code in the account itself moves value out inside the bracket of a keeper action.
+    /// Sibling: client code in the account itself moves value out inside the bracket of a keeper action. SA-2: no
+    /// revert any more; the module's computed snapshot leaves the drain visible as a client outflow, booked once at the
+    /// next trusted sync, so profit (the fee base) is unchanged by it.
     function test_M5_Sibling_AccountCodeDrainsInsideBracket() public {
         (address a,, uint256 id) = _invested(ALICE_PK, 10_000e6);
+        _syncTouch(a);
+        int256 c0 = _acct(a).contributed;
         _upgradeTo(ALICE_PK, a, 2);
         uint128 half = POSM.getPositionLiquidity(id) / 2;
         vm.prank(keeper);
-        vm.expectPartialRevert(SALib.Unexpected.selector);
         module.decreasePosition(a, id, half, 0, 0);
-        // the burn too
+        uint256 d1 = usdc.balanceOf(sink);
+        assertGt(d1, 0);
+        assertApproxEqAbs(_pending(a), -int256(d1), 2, "computed snapshot: the drain is pending, nothing else");
         vm.prank(keeper);
-        vm.expectPartialRevert(SALib.Unexpected.selector);
-        module.burnPosition(a, id, 0, 0);
-        assertEq(usdc.balanceOf(sink), 0);
+        module.burnPosition(a, id, 0, 0); // its sync books the first drain
+        uint256 drained = usdc.balanceOf(sink);
+        assertApproxEqAbs(_acct(a).contributed, c0 - int256(d1), 2);
+        assertApproxEqAbs(_pending(a), -int256(drained - d1), 2);
+        _report();
+        _syncTouch(a);
+        assertApproxEqAbs(_acct(a).contributed, c0 - int256(drained), 2, "booked once, as an outflow");
+        assertEq(_pending(a), 0);
     }
 
     /// Sibling (L-13): the account subscribes the freshly minted position inside the mint bracket.
@@ -482,14 +499,14 @@ contract SARegressionsTest is SATestBase {
         uint256 cap = module.accountValue(a, module.lastPrice()) * 2;
         for (uint256 i; i < 2; ++i) {
             vm.prank(keeper);
-            module.swap(a, false, 4_000e6, p);
+            module.swap(a, false, 4_000e6, p, 0);
             _moveTo(p);
             vm.prank(keeper);
-            module.swap(a, true, a.balance, p);
+            module.swap(a, true, a.balance, p, 0);
             _moveTo(p);
         }
         vm.prank(keeper);
-        module.swap(a, false, 3_000e6, p);
+        module.swap(a, false, 3_000e6, p, 0);
         _moveTo(p);
         (uint256 used,,) = module.windows(a);
         assertGt(used, cap * 9 / 10);
@@ -498,12 +515,12 @@ contract SARegressionsTest is SATestBase {
         p = poolPrice();
         vm.prank(keeper);
         vm.expectRevert(SAWindow.WindowOverflow.selector);
-        module.swap(a, true, a.balance, p);
+        module.swap(a, true, a.balance, p, 0);
         vm.warp(vm.getBlockTimestamp() + 4 hours);
         _report();
         p = poolPrice();
         vm.prank(keeper);
-        module.swap(a, true, a.balance, p);
+        module.swap(a, true, a.balance, p, 0);
     }
 
     /// Siblings: the anchor drift window (up then down is charged both ways, no reset at 24 h), and the hedge step.
@@ -538,6 +555,8 @@ contract SARegressionsTest is SATestBase {
     }
 
     /// Sibling: a guardian price range is one-shot and charged; validated; cleared by pause and guardian change.
+    /// SA-2 I-7 / M-4: a move that fits the keeper's own room does not use (or burn) the range; a move beyond it is
+    /// applied unclipped, consumes the range and charges only the room that was left.
     function test_M7_Sibling_GuardianRangeOneShot() public {
         uint256 p0 = module.lastPrice();
         vm.startPrank(guardian);
@@ -550,13 +569,27 @@ contract SARegressionsTest is SATestBase {
         module.approvePrice(p0 / 2, p0 * 2, block.timestamp + 1 hours);
         vm.stopPrank();
         _moveTo(p0 * 108 / 100);
-        _report();
+        _report(); // fits the 10% room: the range is not used
         assertFalse(module.lastPriceClipped());
+        (,,, uint256 until) = module.priceBudget();
+        assertGt(until, 0, "a routine report does not burn the approval");
         (,, uint256 pu) = module.windows(address(0));
         assertGt(pu, 0.07e18, "charged to the window");
-        _moveTo(p0 * 116 / 100);
-        _report(); // range used: the next move is clipped by the remaining room
-        assertTrue(module.lastPriceClipped());
+        _moveTo(p0 * 125 / 100);
+        _report(); // beyond the room: the range applies it unclipped and is consumed
+        assertApproxEqRel(module.lastPrice(), p0 * 125 / 100, 0.001e18);
+        assertFalse(module.lastPriceClipped());
+        (,,, until) = module.priceBudget();
+        assertEq(until, 0, "one-shot");
+        (,, pu) = module.windows(address(0));
+        assertEq(pu, 0.1e18, "charged min(move, room): the window is full, not beyond");
+        _moveTo(p0 * 126 / 100);
+        _report(); // no room: not applied, but within the band of the report, so not "clipped" (M-4)
+        assertApproxEqRel(module.lastPrice(), p0 * 125 / 100, 0.001e18);
+        assertFalse(module.lastPriceClipped());
+        _moveTo(p0 * 130 / 100);
+        _report();
+        assertTrue(module.lastPriceClipped(), "anchor out of band of the report");
         // cleared by a pause
         vm.prank(guardian);
         module.approvePrice(p0 / 2, p0 * 2, block.timestamp + 1 hours);
@@ -654,6 +687,7 @@ contract SARegressionsTest is SATestBase {
         );
         vm.warp(vm.getBlockTimestamp() + 27 hours);
         _report();
+        _stable(); // SA-2: dropping a position the client burned is part of booking (trusted anchor)
         (int24 tl2, int24 tu2) = _range(300);
         (uint128 l2, uint128 n0, uint128 n1) = _liqFor(a, tl2, tu2, a.balance / 2, usdc.balanceOf(a) / 2);
         uint256 p2 = poolPrice();

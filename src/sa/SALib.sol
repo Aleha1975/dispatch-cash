@@ -2,6 +2,9 @@
 pragma solidity 0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Permit} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
@@ -36,14 +39,17 @@ interface IPositionInfo {
 /// @title SALib
 /// @notice Linked (external) library for the LPManagerModule, holding the logic that would not fit under EIP-170:
 ///         delegation and account checks at registration (identity by CREATE2 derivation, audit SA-1 C-1), the
-///         per-account flow bookkeeping (`sync`: books AND re-snapshots, SA-1 H-3 / M-2), valuation at a given price
-///         (SA-1 M-4), the HWM fee rule, the budgets (sliding window, SA-1 M-7) and the execution builders. Functions
-///         taking `storage` arguments write only the module storage passed in; nothing here moves tokens.
+///         permit-only onboarding pull (SA-2 M-3), the HWM fee rule, the budgets (sliding window, SA-1 M-7) and the
+///         execution builders. The books (flows, valuation, the module's computed effect) are in SABook. Functions
+///         taking `storage` arguments write only the module storage passed in.
 library SALib {
     using StateLibrary for IPoolManager;
 
     uint256 internal constant BPS = 10_000;
     uint256 internal constant WAD = 1e18;
+
+    bytes32 internal constant PERMIT_TYPEHASH =
+        keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
 
     uint8 internal constant KIND_HYBRID = 1;
     uint8 internal constant KIND_EIP7702 = 2;
@@ -56,12 +62,11 @@ library SALib {
     error AddValue(uint256 got, uint256 paid);
     error BadMint();
     error Subscribed(uint256 tokenId);
-    error Unexpected(uint256 asset, uint256 base);
     error TransferMismatch();
     error NotOwnAccount();
+    error BadPermit();
 
     event Registered(address indexed account, bytes32 delegationHash, uint8 kind, uint256 until, bool first);
-    event Flow(address indexed account, int256 value);
 
     // ------------------------------------------------------------------ module storage types
     struct Account {
@@ -76,8 +81,8 @@ library SALib {
         uint256 hedgeEquity; // off-chain hedge equity attributed to this account
         uint256 netMargin; // margin sent - margin returned (floored at 0; written down by a guardian approval)
         uint256 hedgeEpoch; // increments on every change of hedgeEquity or netMargin
-        uint256 snapAsset; // idle asset at the last snapshot
-        uint256 snapBase; // idle base at the last snapshot
+        int256 snapAsset; // idle asset the books account for (SABook: moved by booking and by the module's own effect)
+        int256 snapBase; // idle base the books account for
         uint256 lastFeeTime;
         uint256 feesPaid;
         uint256 hedgeTime; // last hedge report
@@ -195,10 +200,15 @@ library SALib {
         return address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), e.factory, e.accountSalt, ch)))));
     }
 
-    /// @notice `owner()` of a hybrid account (gas-capped; 0 on failure). A candidate, never trusted on its own.
+    /// @notice `owner()` of a hybrid account (gas-capped; 0 on failure or a non-canonical word, SA-2 I-4). A
+    ///         candidate, never trusted on its own.
     function ownerOf(address a) public view returns (address o) {
         (bool ok, bytes memory r) = a.staticcall{gas: 30_000}(abi.encodeCall(IHybridDeleGator.owner, ()));
-        if (ok && r.length == 32) o = abi.decode(r, (address));
+        if (ok && r.length == 32) {
+            uint256 w = abi.decode(r, (uint256));
+            // forge-lint: disable-next-line(unsafe-typecast)
+            if (w >> 160 == 0) o = address(uint160(w));
+        }
     }
 
     /// @notice The module may act for `a`: registered, not revoked by the client, not expired, and the account's
@@ -210,27 +220,23 @@ library SALib {
         return ownerOf(a) == s.owner;
     }
 
-    /// @notice Register `d` for its delegator (module storage passed in). The first registration is permissionless
-    ///         and books what the account already holds (zero snapshots). The stored delegation again: no-op (L-2).
-    ///         Replacing it, or registering after a revoke: only the account or its pinned owner (M-1).
+    /// @notice Register `d` for its delegator (module storage passed in). Returns false (no-op) for the stored,
+    ///         non-revoked delegation, before any other check (SA-2 L-11: top-ups keep working in the delegation's
+    ///         last day). Replacing it, or registering after a revoke: only the account or its pinned owner (M-1).
+    ///         Registration books nothing (SA-2 L-9 / H-1): what the account holds is a pending flow until the next
+    ///         keeper sync at a trusted anchor (SABook).
     function register(
         mapping(address => Account) storage accts,
         mapping(address => bytes) storage ctxs,
-        mapping(address => V4PositionMath.Position[]) storage pos,
-        mapping(uint256 => uint128) storage snapLiq,
-        Venue storage v,
         Delegation calldata d,
-        Expect memory e,
-        uint256 ref,
-        uint256 poolP
-    ) external {
-        (bytes32 h, uint8 kind, uint256 until, address o) = checkDelegation(d, e);
+        Expect memory e
+    ) external returns (bool) {
         address a = d.delegator;
         Account storage s = accts[a];
         bytes32 old = s.delegationHash;
-        if (old == h && !s.revoked) return;
+        if (old != 0 && old == e.dm.getDelegationHash(d) && !s.revoked) return false;
+        (bytes32 h, uint8 kind, uint256 until, address o) = checkDelegation(d, e);
         if (old != 0 && msg.sender != a && msg.sender != s.owner) revert NotOwnAccount();
-        _sync(s, pos[a], snapLiq, a, v, ref, poolP);
         s.delegationHash = h;
         s.owner = o;
         s.kind = kind;
@@ -242,128 +248,7 @@ library SALib {
         ctxs[a] = abi.encode(ds);
         if (old == 0) s.lastFeeTime = block.timestamp;
         emit Registered(a, h, kind, until, old == 0);
-    }
-
-    // ------------------------------------------------------------------ flows and valuation
-    /// @notice Book everything that changed since the last snapshot as a client flow AND write the new snapshot in
-    ///         the same step (H-3, M-2: no caller can forget the snapshot). Inflows (value up) are booked at the lower
-    ///         of `ref` and `poolP`, outflows at the higher (L-2: no anchor-lag arbitrage against the fee). Positions
-    ///         the account no longer owns are dropped (their remaining liquidity is an outflow).
-    function sync(
-        Account storage s,
-        V4PositionMath.Position[] storage ps,
-        mapping(uint256 => uint128) storage snapLiq,
-        address a,
-        Venue storage v,
-        uint256 ref,
-        uint256 poolP
-    ) external {
-        _sync(s, ps, snapLiq, a, v, ref, poolP);
-    }
-
-    function _sync(
-        Account storage s,
-        V4PositionMath.Position[] storage ps,
-        mapping(uint256 => uint128) storage snapLiq,
-        address a,
-        Venue storage v,
-        uint256 ref,
-        uint256 poolP
-    ) private {
-        (uint256 lo, uint256 hi) = ref < poolP ? (ref, poolP) : (poolP, ref);
-        uint256 x = IERC20(v.asset).balanceOf(a);
-        uint256 b = _bal(v.base, a);
-        // forge-lint: disable-next-line(unsafe-typecast)
-        int256 f = int256(x) - int256(s.snapAsset) + signedDelta(b, s.snapBase, b >= s.snapBase ? lo : hi);
-        uint256 i = ps.length;
-        while (i != 0) {
-            --i;
-            V4PositionMath.Position memory p = ps[i];
-            (uint128 liq, bool owned) = _liquidityOf(v.posm, a, p.tokenId);
-            uint128 old = snapLiq[p.tokenId];
-            if (liq != old) {
-                uint256 px = liq > old ? lo : hi;
-                f += signedDelta(
-                    V4PositionMath.liquidityValue(p.tickLower, p.tickUpper, liq, px, v.baseIsCurrency0),
-                    V4PositionMath.liquidityValue(p.tickLower, p.tickUpper, old, px, v.baseIsCurrency0),
-                    WAD
-                );
-            }
-            if (owned) {
-                snapLiq[p.tokenId] = liq;
-            } else {
-                delete snapLiq[p.tokenId];
-                uint256 last = ps.length - 1;
-                if (i != last) ps[i] = ps[last];
-                ps.pop();
-            }
-        }
-        s.snapAsset = x;
-        s.snapBase = b;
-        if (f != 0) {
-            s.contributed += f;
-            emit Flow(a, f);
-        }
-    }
-
-    /// @notice Directional post-check of a module action against the pre-action snapshot written by `sync`: idle asset
-    ///         and base may have fallen at most by what the action itself spends (A: client code running inside the
-    ///         bracket can never take value out unbooked).
-    function post(Account storage s, address a, Venue storage v, uint256 maxAssetOut, uint256 maxBaseOut) external view {
-        _post(s, a, v, maxAssetOut, maxBaseOut);
-    }
-
-    function _post(Account storage s, address a, Venue storage v, uint256 maxAssetOut, uint256 maxBaseOut) private view {
-        uint256 x = IERC20(v.asset).balanceOf(a);
-        uint256 b = _bal(v.base, a);
-        if (x + maxAssetOut < s.snapAsset || b + maxBaseOut < s.snapBase) revert Unexpected(x, b);
-    }
-
-    /// @notice Idle asset + idle base at `price`.
-    function held(Venue storage v, address a, uint256 price) public view returns (uint256) {
-        return IERC20(v.asset).balanceOf(a) + Math.mulDiv(_bal(v.base, a), price, WAD);
-    }
-
-    /// @notice Account value at `price`: idle + positions the account still owns (principal at sqrt(price) plus
-    ///         uncollected fees, base valued at `price`; M-4: no pool-spot term) + attributed hedge equity.
-    function value(
-        Venue storage v,
-        Account storage s,
-        V4PositionMath.Position[] storage ps,
-        address a,
-        uint256 price
-    ) external view returns (uint256 val) {
-        val = held(v, a, price) + s.hedgeEquity;
-        for (uint256 i; i < ps.length; ++i) {
-            V4PositionMath.Position memory p = ps[i];
-            (, bool owned) = _liquidityOf(v.posm, a, p.tokenId);
-            if (owned) val += _positionValue(v, p, price, true);
-        }
-    }
-
-    /// @notice Uncollected fees of one position valued at `price`.
-    function feesValue(Venue storage v, V4PositionMath.Position memory p, uint256 price) external view returns (uint256) {
-        return _positionValue(v, p, price, false);
-    }
-
-    function _positionValue(Venue storage v, V4PositionMath.Position memory p, uint256 price, bool principal)
-        private
-        view
-        returns (uint256 val)
-    {
-        (uint128 liq, uint256 last0, uint256 last1) =
-            v.pm.getPositionInfo(v.id, address(v.posm), p.tickLower, p.tickUpper, bytes32(p.tokenId));
-        if (liq == 0) return 0;
-        if (principal) val = V4PositionMath.liquidityValue(p.tickLower, p.tickUpper, liq, price, v.baseIsCurrency0);
-        (uint256 in0, uint256 in1) = v.pm.getFeeGrowthInside(v.id, p.tickLower, p.tickUpper);
-        uint256 f0;
-        uint256 f1;
-        unchecked {
-            f0 = FullMath.mulDiv(in0 - last0, liq, 1 << 128);
-            f1 = FullMath.mulDiv(in1 - last1, liq, 1 << 128);
-        }
-        (uint256 fb, uint256 fa) = v.baseIsCurrency0 ? (f0, f1) : (f1, f0);
-        val += fa + Math.mulDiv(fb, price, WAD);
+        return true;
     }
 
     /// @notice After a mint: the token is owned by the account, in the fixed pool, with exactly the requested ticks
@@ -382,25 +267,33 @@ library SALib {
         if (IPositionInfo(address(posm)).positionInfo(tokenId) & 0xff != 0) revert Subscribed(tokenId);
     }
 
-    function _bal(address token, address a) private view returns (uint256) {
-        return token == address(0) ? a.balance : IERC20(token).balanceOf(a);
-    }
-
-    function _liquidityOf(IPositionManagerMin posm, address a, uint256 tokenId) private view returns (uint128, bool) {
-        try posm.ownerOf(tokenId) returns (address o) {
-            if (o != a) return (0, false);
-        } catch {
-            return (0, false);
+    /// @notice SA-2 M-3: move `amount` USDC from the pinned owner `o` into its account `a` only on a fresh EIP-2612
+    ///         permit for exactly this spender and amount. A permit that was front-run is accepted only if this very
+    ///         signature was the owner's last permit (nonce - 1), it has not expired and the allowance it set is
+    ///         untouched; a standing allowance from `approve` is never used.
+    function pull(address asset, address o, address a, uint256 amount, uint256 deadline, uint8 v, bytes32 r, bytes32 s_)
+        external
+    {
+        try IERC20Permit(asset).permit(o, address(this), amount, deadline, v, r, s_) {}
+        catch {
+            uint256 n = IERC20Permit(asset).nonces(o);
+            if (n == 0 || block.timestamp > deadline) revert BadPermit();
+            bytes32 digest = keccak256(
+                abi.encodePacked(
+                    "\x19\x01",
+                    IERC20Permit(asset).DOMAIN_SEPARATOR(),
+                    keccak256(abi.encode(PERMIT_TYPEHASH, o, address(this), amount, n - 1, deadline))
+                )
+            );
+            (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, v, r, s_);
+            if (err != ECDSA.RecoverError.NoError || signer != o || IERC20(asset).allowance(o, address(this)) != amount) {
+                revert BadPermit();
+            }
         }
-        return (posm.getPositionLiquidity(tokenId), true);
-    }
-
-    /// @notice (now - then) x price / 1e18 as a signed amount (losses rounded up).
-    function signedDelta(uint256 now_, uint256 then_, uint256 price) public pure returns (int256) {
-        // forge-lint: disable-next-line(unsafe-typecast)
-        if (now_ >= then_) return int256(Math.mulDiv(now_ - then_, price, 1e18));
-        // forge-lint: disable-next-line(unsafe-typecast)
-        return -int256(Math.mulDiv(then_ - now_, price, 1e18, Math.Rounding.Ceil));
+        IERC20 t = IERC20(asset);
+        uint256 b0 = t.balanceOf(a);
+        SafeERC20.safeTransferFrom(t, o, a, amount);
+        if (t.balanceOf(a) - b0 != amount) revert TransferMismatch();
     }
 
     // ------------------------------------------------------------------ fee
@@ -424,20 +317,22 @@ library SALib {
     }
 
     // ------------------------------------------------------------------ budgets
-    /// @notice Move the anchor `ref` toward `p`. The first report (ref == 0) is free. A guardian range covering `p`
-    ///         is consumed by this report (one-shot) and its move is charged to the window without clipping (F);
-    ///         otherwise the move is limited by the room left in the sliding 24 h window of `capWad`. A step costs
-    ///         |p - ref| / min(p, ref), the same up and down (E).
+    /// @notice Move the anchor `ref` toward `p`. The first report (ref == 0) is free. The move is limited by the
+    ///         room left in the sliding 24 h window of `capWad`; a step costs |p - ref| / min(p, ref), the same up and
+    ///         down (E). Only a move that does NOT fit the room uses a guardian range covering `p` (SA-2 I-7: a
+    ///         routine report does not burn the approval): it is applied unclipped, the range is consumed (one-shot)
+    ///         and the window is charged min(move, room) (SA-2 M-4: an approval never costs the keeper more room than
+    ///         it had).
     function movePrice(PriceBudget storage b, uint256 ref, uint256 p, uint256 capWad) external returns (uint256, bool) {
         if (ref == 0) return (p, false);
         uint256 move = Math.mulDiv(p > ref ? p - ref : ref - p, WAD, p > ref ? ref : p, Math.Rounding.Ceil);
-        if (block.timestamp <= b.until && p >= b.lo && p <= b.hi) {
-            b.until = 0;
-            SAWindow.add(b.window, move);
-            return (p, false);
-        }
         uint256 room = SAWindow.room(b.window, capWad);
         bool clipped = move > room;
+        if (clipped && block.timestamp <= b.until && p >= b.lo && p <= b.hi) {
+            b.until = 0;
+            SAWindow.add(b.window, room);
+            return (p, false);
+        }
         if (clipped) {
             move = room;
             // up: p = ref (1 + room); down: p = ref / (1 + room)
@@ -451,8 +346,11 @@ library SALib {
     ///         era and value (unexpired) is applied as is and consumed; it also writes `netMargin` down to `v` (L-4),
     ///         and an approved increase is credited back to the decrease window (net movement). Otherwise an increase
     ///         is refused (equity kept: understated, never a fee risk) and a decrease uses at most the room left in
-    ///         the window of `cap` (0 while paused). Every report records its time; `hedgeClipped` = stored equity
-    ///         may be above the real one (L-12). Returns (applied, applied != v).
+    ///         the window of `cap` (0 while paused or on an anchor that is not fresh). Every report records its
+    ///         time. `hedgeClipped` = a keeper decrease did not fit (stored equity may be above the real one, L-12);
+    ///         it is cleared only by a decrease applied in full (the keeper re-reports the real value once the window
+    ///         has room again: auto-clearing) or by a guardian approval, never by an equal or higher report (SA-2
+    ///         L-1). Returns (applied, applied != v).
     function moveHedge(Account storage s, Budgets storage b, uint256 v, uint256 cap, uint64 era)
         external
         returns (uint256, bool)
@@ -475,10 +373,7 @@ library SALib {
             s.hedgeClipped = false;
             return (v, false);
         }
-        if (v >= old) {
-            s.hedgeClipped = false;
-            return (old, v != old);
-        }
+        if (v >= old) return (old, v != old); // SA-2 L-1: an equal / higher report never clears hedgeClipped
         uint256 d = old - v;
         uint256 room = SAWindow.room(b.hedge, cap);
         bool clipped = d > room;
@@ -517,19 +412,9 @@ library SALib {
         return uint160(s);
     }
 
-    /// @notice H-3 check for an LP add: the new liquidity valued at the anchor (`got`) must be worth >= `paid` x
-    ///         (1 - slippage). Returns the turnover charge paid x slippage / (band + slippage), rounded up.
-    function addCharge(int24 tl, int24 tu, uint128 liquidity, uint256 ref, bool baseIsCurrency0, uint256 paid, uint256 slip, uint256 band)
-        external
-        pure
-        returns (uint256)
-    {
-        uint256 got = V4PositionMath.liquidityValue(tl, tu, liquidity, ref, baseIsCurrency0);
-        if (got * BPS < paid * (BPS - slip)) revert AddValue(got, paid);
-        return Math.mulDiv(paid, slip, slip + band, Math.Rounding.Ceil);
-    }
-
     // ------------------------------------------------------------------ execution builders (ERC-7579 single calls)
+    /// @dev Permit2 allowance valid while block.timestamp <= expiration, i.e. for every block with this timestamp
+    ///      (several on Nitro), which is why every use is followed by an amount-0 approval (SA-2 L-13).
     function _permit2Approve(address permit2, address token, address spender, uint256 amount)
         private
         view
@@ -539,7 +424,11 @@ library SALib {
             permit2,
             0,
             abi.encodeWithSignature(
-                "approve(address,address,uint160,uint48)", token, spender, uint160(amount), uint48(block.timestamp)
+                "approve(address,address,uint160,uint48)",
+                token,
+                spender,
+                uint160(amount),
+                amount == 0 ? 0 : uint48(block.timestamp)
             )
         );
     }
@@ -577,7 +466,7 @@ library SALib {
         uint256 max0,
         uint256 max1
     ) external {
-        bytes[] memory xs = new bytes[](7);
+        bytes[] memory xs = new bytes[](9);
         uint256 n;
         uint256 value;
         bool leg0 = currency0 != address(0) && max0 != 0;
@@ -594,8 +483,14 @@ library SALib {
         xs[n++] = DelegationFramework.single(
             posm, value, abi.encodeCall(IModifyLiquidities.modifyLiquidities, (unlockData, block.timestamp))
         );
-        if (leg0) xs[n++] = _approve(currency0, permit2, 0);
-        if (max1 != 0) xs[n++] = _approve(currency1, permit2, 0);
+        if (leg0) {
+            xs[n++] = _approve(currency0, permit2, 0);
+            xs[n++] = _permit2Approve(permit2, currency0, posm, 0);
+        }
+        if (max1 != 0) {
+            xs[n++] = _approve(currency1, permit2, 0);
+            xs[n++] = _permit2Approve(permit2, currency1, posm, 0);
+        }
         assembly {
             mstore(xs, n)
         }
@@ -617,32 +512,30 @@ library SALib {
             xs = new bytes[](1);
             xs[0] = DelegationFramework.single(executor, amountIn, call);
         } else {
-            xs = new bytes[](4);
+            xs = new bytes[](5);
             xs[0] = _approve(cIn, permit2, amountIn);
             xs[1] = _permit2Approve(permit2, cIn, executor, amountIn);
             xs[2] = DelegationFramework.single(executor, 0, call);
             xs[3] = _approve(cIn, permit2, 0);
+            xs[4] = _permit2Approve(permit2, cIn, executor, 0);
         }
         _redeem(dm, ctx, xs);
     }
 
     /// @notice USDC from the account to one of the module's two fixed recipients, verified at the recipient (H-2:
-    ///         the account's code cannot fake a balance it does not control) and by the directional post-check.
-    function transferOut(
-        IDelegationManager dm,
-        bytes storage ctx,
-        Account storage s,
-        Venue storage v,
-        address a,
-        address to,
-        uint256 amount
-    ) external {
-        IERC20 t = IERC20(v.asset);
+    ///         the account's code cannot fake a balance it does not control). The account's side is booked by the
+    ///         computed snapshot (SA-2: snapAsset -= amount); anything else the account's code does inside the
+    ///         bracket stays a pending client flow.
+    function transferOut(IDelegationManager dm, bytes storage ctx, Account storage s, address asset, address to, uint256 amount)
+        external
+    {
+        IERC20 t = IERC20(asset);
         uint256 r0 = t.balanceOf(to);
         bytes[] memory xs = new bytes[](1);
-        xs[0] = DelegationFramework.single(address(t), 0, abi.encodeCall(IERC20.transfer, (to, amount)));
+        xs[0] = DelegationFramework.single(asset, 0, abi.encodeCall(IERC20.transfer, (to, amount)));
         _redeem(dm, ctx, xs);
         if (t.balanceOf(to) - r0 != amount) revert TransferMismatch();
-        _post(s, a, v, amount, 0);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        s.snapAsset -= int256(amount);
     }
 }

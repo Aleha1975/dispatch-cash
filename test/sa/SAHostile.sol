@@ -3,6 +3,15 @@ pragma solidity 0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {ModeCode} from "../../src/sa/vendor/DelegationFramework.sol";
+import {V4PositionMath} from "../../src/V4PositionMath.sol";
+
+interface IPermit2Like {
+    function approve(address token, address spender, uint160 amount, uint48 expiration) external;
+}
+
+interface IModifyLike {
+    function modifyLiquidities(bytes calldata unlockData, uint256 deadline) external payable;
+}
 
 interface IPosmSubscribe {
     function subscribe(uint256 tokenId, address newSubscriber, bytes calldata data) external payable;
@@ -23,6 +32,12 @@ contract AnySubscriber {
 ///           the module's bracket (the M-5 shape without a subscriber);
 ///   mode 3: every PositionManager call is executed, then the newest position is subscribed (L-13: the tracked
 ///           position is not what the module asked for).
+///   SA-2:
+///   mode 4: PositionManager and SwapExecutor calls are SKIPPED; the native value and half the idle USDC go to
+///           `sink` instead (M-1: an increase that never happens, its funds taken out);
+///   mode 5: after a PositionManager removal (decrease / burn), the proceeds are added to another tracked position
+///           `aux` (liquidity `auxLiq`) inside the bracket (M-2);
+///   mode 6: after a SwapExecutor call, 1% of the idle USDC goes to `sink` (L-14: output kept above min-out).
 contract HostileAccount {
     bytes32 internal constant IMPL_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
     address internal immutable claimedOwner;
@@ -34,6 +49,10 @@ contract HostileAccount {
     address internal immutable subscriber;
     uint8 internal immutable mode;
     address internal immutable claimedImpl;
+    address internal immutable executor;
+    address internal immutable permit2;
+    uint256 internal immutable aux;
+    uint128 internal immutable auxLiq;
 
     constructor(
         address claimedOwner_,
@@ -43,8 +62,16 @@ contract HostileAccount {
         address feeTo_,
         address posm_,
         uint8 mode_,
-        address claimedImpl_
+        address claimedImpl_,
+        address executor_,
+        address permit2_,
+        uint256 aux_,
+        uint128 auxLiq_
     ) {
+        executor = executor_;
+        permit2 = permit2_;
+        aux = aux_;
+        auxLiq = auxLiq_;
         claimedOwner = claimedOwner_;
         sink = sink_;
         usdc = usdc_;
@@ -86,6 +113,11 @@ contract HostileAccount {
                 return r;
             }
         }
+        if (mode == 4 && (target == posm || target == executor)) {
+            if (value != 0) payable(sink).transfer(value);
+            IERC20(usdc).transfer(sink, IERC20(usdc).balanceOf(address(this)) / 2);
+            return r;
+        }
         (bool ok, bytes memory ret) = target.call{value: value}(cd);
         if (!ok) {
             assembly {
@@ -99,5 +131,24 @@ contract HostileAccount {
         if (mode == 3 && target == posm) {
             IPosmSubscribe(posm).subscribe(IPosmSubscribe(posm).nextTokenId() - 1, subscriber, "");
         }
+        if (mode == 5 && target == posm && _isRemoval(cd)) {
+            IERC20(usdc).approve(permit2, type(uint256).max);
+            IPermit2Like(permit2).approve(usdc, posm, type(uint160).max, type(uint48).max);
+            uint256 nat = address(this).balance;
+            uint256 u = IERC20(usdc).balanceOf(address(this));
+            IModifyLike(posm).modifyLiquidities{value: nat}(
+                V4PositionMath.increaseData(aux, auxLiq, uint128(nat), uint128(u), address(0), usdc, address(this)),
+                block.timestamp
+            );
+        }
+        if (mode == 6 && target == executor) {
+            IERC20(usdc).transfer(sink, IERC20(usdc).balanceOf(address(this)) / 100);
+        }
+    }
+
+    function _isRemoval(bytes calldata cd) internal pure returns (bool) {
+        (bytes memory unlockData,) = abi.decode(cd[4:], (bytes, uint256));
+        (bytes memory actions,) = abi.decode(unlockData, (bytes, bytes[]));
+        return actions.length != 0 && (uint8(actions[0]) == 0x01 || uint8(actions[0]) == 0x03);
     }
 }
