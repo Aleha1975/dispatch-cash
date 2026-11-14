@@ -261,6 +261,9 @@ class SAKeeper:
             if (sell_base and pool * BPS < price * (BPS - dev)) or (not sell_base and pool * BPS > price * (BPS + dev)):
                 self.log("swap_paused_adverse_dev", account=a, pool=pool, price=price)
                 break
+            if not self.r.global_snap().trusted(self.now()):
+                self.log("swap_waits_trusted", account=a)  # SA-3: a previous chunk moved the pool off the book band
+                break
             chunk = min(amount - done, chunk_max)
             while True:
                 try:  # the module's floor applies to the probe; the sent swap pins what the probe got (SA-3 L-22)
@@ -328,6 +331,9 @@ class SAKeeper:
                 self.log("deploy_postponed_turnover", account=a, room=room / 1e6)
                 return
             liq = int(liq * k)
+        if not self.r.global_snap().trusted(self.now()):
+            self.log("deploy_waits_trusted", account=a)  # the swaps above moved the pool off the book band
+            return
         if pos is None:
             self.act("mintPosition", a, tl, tu, liq, a0, a1, price)
             self.log("minted", account=a, tl=tl, tu=tu, liquidity=liq, value_usd=val / 1e6)

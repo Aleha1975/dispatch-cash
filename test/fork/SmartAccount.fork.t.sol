@@ -52,6 +52,7 @@ contract SmartAccountForkTest is SATestBase {
         emit log_named_uint("gas deploy account + onboard (relayer)", g - gasleft());
         assertEq(vm.getNonce(owner_), 0, "client sent no transaction");
 
+        _stable(); // SA-3: swaps and LP adds need a trusted anchor
         uint256 p = poolPrice();
         g = gasleft();
         vm.prank(keeper);
@@ -91,9 +92,8 @@ contract SmartAccountForkTest is SATestBase {
         module.decreasePosition(a, id, half, 0, 0);
         assertEq(_pending(a), 0, "the module's computed effect matches the real PositionManager to the wei");
         _reportEquity(a, 600e6); // a recent, unclipped hedge report is required for the fee (SA-1 L-12)
-        // SA-2: profit at the lower of the value at the anchor and at the pool
-        uint256 vv = Math.min(module.accountValue(a, module.lastPrice()), module.accountValue(a, poolPrice()));
-        int256 profit = int256(vv) - module.account(a).contributed;
+        // SA-3 M-3: profit at the anchor (the fee gate needs the anchor not above the pool)
+        int256 profit = int256(module.accountValue(a, module.lastPrice())) - module.account(a).contributed;
         uint256 maxFee = usdc.balanceOf(a) * 2000 / 10_000;
         vm.prank(keeper);
         uint256 f = module.chargeFee(a);
@@ -124,7 +124,7 @@ contract SmartAccountForkTest is SATestBase {
     function test_Fork_7702_EndToEnd() public {
         (address a, Delegation memory d) = _onboard7702(BOB_PK, 2_000e6);
         assertEq(a, vm.addr(BOB_PK));
-        _buyBase(a, 800e6);
+        _buyBase(a, 500e6); // the live pool is thin: ~700 USDC moves it past the 1.5% band (a partial fill reverts)
         uint256 id = _mintAll(a);
         assertEq(POSM.ownerOf(id), a);
         uint256 g = gasleft();

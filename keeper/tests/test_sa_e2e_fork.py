@@ -100,7 +100,7 @@ def deploy_sa(fork) -> str:
     import subprocess
 
     env = dict(os.environ, OWNER=OWNER, KEEPER=KEEPER, GUARDIAN=GUARDIAN, HEDGE_TREASURY=TREASURY,
-               FEE_RECIPIENT=FEE_TO)
+               FEE_RECIPIENT=FEE_TO, ALLOW_EOA_OWNER="true")  # anvil test keys (production: a multisig)
     cmd = ["forge", "script", "script/DeploySA.s.sol:DeploySA", "--rpc-url", fork.url, "--broadcast", "--unlocked",
            "--sender", DEPLOYER, "--slow"]
     r = subprocess.run(cmd, cwd=REPO, env=env, capture_output=True, text=True, timeout=900)
@@ -200,6 +200,17 @@ def exit_hybrid(fork, k, pk: bytes, a: str, d):
     return int(rc["gasUsed"], 16)
 
 
+def settle(fork, k, hl, n: int = 2, dt: int = 200):
+    """n keeper ticks dt seconds apart (dt < minPriceStable: each re-report confirms the anchor, SA-3)."""
+    st = None
+    for _ in range(n):
+        fork.advance(dt)
+        hl.set(fork.now(), hl.mid())
+        st = k.tick()
+        assert not st["errors"], st["errors"]
+    return st
+
+
 def test_sa_end_to_end(env):
     fork, tmp = env
     alerts: list = []
@@ -221,9 +232,12 @@ def test_sa_end_to_end(env):
     a2, d2 = onboard(fork, k, module, pk2, 1500, via_dir=k.sa.requests_dir)
     assert usdc.call("balanceOf", a1) == 3000 * E6
 
-    # first tick: relayer onboards client 2 from the request queue; margin, swap, mint for both; one netted short
+    # first tick: relayer onboards client 2 from the request queue, margin for both; SA-3: swaps and mints wait for a
+    # trusted anchor (unchanged for minPriceStable and re-confirmed within it), so two more ticks 200 s apart; then
+    # swap and mint for both; one netted short
     st = k.tick()
     assert not st["errors"], st["errors"]
+    st = settle(fork, k, hl)
     assert os.listdir(os.path.join(k.sa.requests_dir, "done")) and usdc.call("balanceOf", a2) < 1500 * E6
     for a, usd in ((a1, 3000), (a2, 1500)):
         row = st["accounts"][a]
@@ -243,11 +257,10 @@ def test_sa_end_to_end(env):
     for i in range(4):
         n_actions = len(k.actions)
         trader.move_to(int(hl.mid() * 1e6))
-        st = k.tick()
-        assert not st["errors"], st["errors"]
+        st = settle(fork, k, hl)
         done = [x["fn"] for x in k.actions[n_actions:]]
         print("tick", i, done)
-        if done in ([], ["reportPrice"]):
+        if set(done) <= {"reportPrice"}:
             break
     else:
         raise AssertionError(f"keeper does not converge: {done}")
@@ -257,8 +270,9 @@ def test_sa_end_to_end(env):
     trader.move_to(p0)
     fork.advance(7 * 86400 + 60)
     hl.set(fork.now(), p0 / 1e6)
-    st = k.tick()
+    st = k.tick()  # the report after the gap counts as a move (SA-3 L-5)
     assert not st["errors"], st["errors"]
+    st = settle(fork, k, hl)
     fees = k.state.d.get("fees_by_account", {})
     for a in (a1, a2):
         fees_paid = k.r.account(a).fees_paid
