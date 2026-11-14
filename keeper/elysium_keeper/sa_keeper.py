@@ -87,6 +87,7 @@ class SAKeeper:
         else:
             self.ledger = HedgeLedger(self.state.d.setdefault("ledger", {}))
         self._sent = 0
+        self._hold_until = 0  # a fee is due: keep the anchor value unchanged until then (minPriceStable, SA-2 H-1)
         self.alert = Alerts(cfg.alerts, self.log, cfg.name, sink=alert_sink)
         self.info = hl_info or HLInfo(cfg.hl.api_url)
         self.adapter = adapter
@@ -178,6 +179,9 @@ class SAKeeper:
             return None, g
         price = S.sticky_price(pc.price, g.last_price, g.pool_price, g.params["poolBandBps"],
                                self.st.anchor_hysteresis_bps, self.st.band_safety)
+        if (now < self._hold_until and price != g.last_price and g.last_price
+                and abs(price - g.last_price) * BPS <= g.last_price * g.params["poolBandBps"] * self.st.band_safety):
+            price = g.last_price  # hold the anchor value (still re-reported for freshness) so a due fee can be charged
         stale = now - g.last_price_time >= min(self.sa.report_every_s, g.params["maxPriceAge"] // 2)
         if price != g.last_price or stale or g.clipped:
             self.act("reportPrice", price)
@@ -241,7 +245,7 @@ class SAKeeper:
                 break
             chunk = min(amount - done, chunk_max)
             while True:
-                why = self.probe("swap", a, sell_base, chunk, price)
+                why = self.probe("swap", a, sell_base, chunk, price, 0)  # minOut 0: the module's floor applies
                 if why is None:
                     break
                 if "BelowMinOut" in why and chunk > 2 * min_amt:
@@ -249,7 +253,7 @@ class SAKeeper:
                     continue
                 self.log("swap_probe_revert", account=a, reason=why, chunk=chunk)
                 return done
-            self.act("swap", a, sell_base, chunk, price)
+            self.act("swap", a, sell_base, chunk, price, 0)
             done += chunk
         return done
 
@@ -311,8 +315,12 @@ class SAKeeper:
         s = self.r.account(a)
         if now < s.last_fee_time + g.params["feeInterval"]:
             return
-        if g.clipped or now - g.last_price_time > g.params["maxPriceAge"]:
-            self.log("fee_waits_price", account=a)
+        if not g.trusted(now):
+            # SA-2: chargeFee needs a fresh, unclipped anchor within the pool band that has not changed for
+            # minPriceStable; hold the anchor value for a while so the window can elapse
+            self._hold_until = max(self._hold_until, now + 2 * g.params["minPriceStable"] + self.sa.report_every_s)
+            self.log("fee_waits_price", account=a, clipped=g.clipped, stable_in=max(
+                0, g.last_price_moved + g.params["minPriceStable"] - now))
             return
         if s.hedge_equity and (s.hedge_clipped or now - s.hedge_time > g.params["maxPriceAge"]):
             self.report_equity(s, refresh=True)  # chargeFee needs a recent, unclipped hedge report (SA-1 L-12)
@@ -320,7 +328,7 @@ class SAKeeper:
             if s.hedge_clipped:
                 self.log("fee_waits_hedge", account=a)
                 return
-        fee, new_hwm = hwm_fee(s.profit, s.hwm, g.params["feeBps"])
+        fee, new_hwm = hwm_fee(s.fee_profit, s.hwm, g.params["feeBps"])
         if fee <= 0:
             return
         need = int(fee * 5 * self.sa.fee_idle_margin) + 1

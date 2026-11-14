@@ -173,6 +173,11 @@
         "name": "maxPriceAge",
         "type": "uint32",
         "internalType": "uint32"
+       },
+       {
+        "name": "minPriceStable",
+        "type": "uint32",
+        "internalType": "uint32"
        }
       ]
      }
@@ -339,13 +344,13 @@
      },
      {
       "name": "snapAsset",
-      "type": "uint256",
-      "internalType": "uint256"
+      "type": "int256",
+      "internalType": "int256"
      },
      {
       "name": "snapBase",
-      "type": "uint256",
-      "internalType": "uint256"
+      "type": "int256",
+      "internalType": "int256"
      },
      {
       "name": "lastFeeTime",
@@ -870,7 +875,33 @@
  },
  {
   "type": "function",
+  "name": "lastPriceMoved",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
   "name": "lastPriceTime",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "lastReported",
   "inputs": [],
   "outputs": [
    {
@@ -1101,6 +1132,11 @@
    },
    {
     "name": "maxPriceAge",
+    "type": "uint32",
+    "internalType": "uint32"
+   },
+   {
+    "name": "minPriceStable",
     "type": "uint32",
     "internalType": "uint32"
    }
@@ -1556,6 +1592,11 @@
       "name": "maxPriceAge",
       "type": "uint32",
       "internalType": "uint32"
+     },
+     {
+      "name": "minPriceStable",
+      "type": "uint32",
+      "internalType": "uint32"
      }
     ]
    }
@@ -1618,6 +1659,11 @@
     "name": "keeperPrice",
     "type": "uint256",
     "internalType": "uint256"
+   },
+   {
+    "name": "minOut",
+    "type": "uint256",
+    "internalType": "uint256"
    }
   ],
   "outputs": [
@@ -1660,7 +1706,7 @@
   "name": "transferOwnership",
   "inputs": [
    {
-    "name": "newOwner",
+    "name": "n",
     "type": "address",
     "internalType": "address"
    }
@@ -1982,6 +2028,11 @@
       "name": "maxPriceAge",
       "type": "uint32",
       "internalType": "uint32"
+     },
+     {
+      "name": "minPriceStable",
+      "type": "uint32",
+      "internalType": "uint32"
      }
     ]
    }
@@ -2292,7 +2343,7 @@
  },
  {
   "type": "error",
-  "name": "BelowMinOut",
+  "name": "BelowMinOutOrBadSwap",
   "inputs": [
    {
     "name": "out",
@@ -2439,27 +2490,6 @@
  },
  {
   "type": "error",
-  "name": "TransferMismatch",
-  "inputs": []
- },
- {
-  "type": "error",
-  "name": "Unexpected",
-  "inputs": [
-   {
-    "name": "asset",
-    "type": "uint256",
-    "internalType": "uint256"
-   },
-   {
-    "name": "base",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ]
- },
- {
-  "type": "error",
   "name": "UnknownPosition",
   "inputs": []
  },
@@ -2507,6 +2537,11 @@
  },
  {
   "type": "error",
+  "name": "BadPermit",
+  "inputs": []
+ },
+ {
+  "type": "error",
   "name": "Subscribed",
   "inputs": [
    {
@@ -2518,8 +2553,81 @@
  },
  {
   "type": "error",
+  "name": "TransferMismatch",
+  "inputs": []
+ },
+ {
+  "type": "error",
   "name": "WindowOverflow",
   "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BadAmount",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BadPool",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BadValue",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "BelowMinOut",
+  "inputs": [
+   {
+    "name": "out",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "minOut",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "NotPoolManager",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "RefundFailed",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "SafeCastOverflowedUintDowncast",
+  "inputs": [
+   {
+    "name": "bits",
+    "type": "uint8",
+    "internalType": "uint8"
+   },
+   {
+    "name": "value",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "SafeCastOverflowedUintToInt",
+  "inputs": [
+   {
+    "name": "value",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
  },
  {
   "type": "error",
@@ -2534,11 +2642,6 @@
  },
  {
   "type": "error",
-  "name": "BadAmount",
-  "inputs": []
- },
- {
-  "type": "error",
   "name": "BadExecution",
   "inputs": []
  },
@@ -2550,11 +2653,6 @@
  {
   "type": "error",
   "name": "BadMode",
-  "inputs": []
- },
- {
-  "type": "error",
-  "name": "BadPool",
   "inputs": []
  },
  {
@@ -2599,11 +2697,6 @@
     "internalType": "address"
    }
   ]
- },
- {
-  "type": "error",
-  "name": "BadValue",
-  "inputs": []
  },
  {
   "type": "error",
@@ -2698,43 +2791,6 @@
     "name": "target",
     "type": "address",
     "internalType": "address"
-   }
-  ]
- },
- {
-  "type": "error",
-  "name": "NotPoolManager",
-  "inputs": []
- },
- {
-  "type": "error",
-  "name": "RefundFailed",
-  "inputs": []
- },
- {
-  "type": "error",
-  "name": "SafeCastOverflowedUintDowncast",
-  "inputs": [
-   {
-    "name": "bits",
-    "type": "uint8",
-    "internalType": "uint8"
-   },
-   {
-    "name": "value",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ]
- },
- {
-  "type": "error",
-  "name": "SafeCastOverflowedUintToInt",
-  "inputs": [
-   {
-    "name": "value",
-    "type": "uint256",
-    "internalType": "uint256"
    }
   ]
  },

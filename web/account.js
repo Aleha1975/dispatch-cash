@@ -44,7 +44,7 @@ const MODULE_ABI = parseAbi([
   'struct Caveat { address enforcer; bytes terms; bytes args; }',
   'struct Delegation { address delegate; address delegator; bytes32 authority; Caveat[] caveats; uint256 salt; bytes signature; }',
   'struct Position { uint256 tokenId; int24 tickLower; int24 tickUpper; }',
-  'struct Account { bytes32 delegationHash; address owner; uint8 kind; uint64 until; bool revoked; bool hedgeClipped; int256 contributed; int256 hwm; uint256 hedgeEquity; uint256 netMargin; uint256 hedgeEpoch; uint256 snapAsset; uint256 snapBase; uint256 lastFeeTime; uint256 feesPaid; uint256 hedgeTime; }',
+  'struct Account { bytes32 delegationHash; address owner; uint8 kind; uint64 until; bool revoked; bool hedgeClipped; int256 contributed; int256 hwm; uint256 hedgeEquity; uint256 netMargin; uint256 hedgeEpoch; int256 snapAsset; int256 snapBase; uint256 lastFeeTime; uint256 feesPaid; uint256 hedgeTime; }',
   'function account(address) view returns (Account)',
   'function revoke(address)',
   'function accountValue(address, uint256) view returns (uint256)',
@@ -52,7 +52,7 @@ const MODULE_ABI = parseAbi([
   'function isActive(address) view returns (bool)',
   'function positionsOf(address) view returns (Position[])',
   'function permissionContext(address) view returns (bytes)',
-  'function params() view returns (uint16 feeBps, uint16 hedgeCapBps, uint16 poolBandBps, uint16 maxSlippageBps, uint16 hedgeStepBps, uint16 refDriftBps, uint32 swapTurnoverBps, uint32 feeInterval, uint32 maxPriceAge)',
+  'function params() view returns (uint16 feeBps, uint16 hedgeCapBps, uint16 poolBandBps, uint16 maxSlippageBps, uint16 hedgeStepBps, uint16 refDriftBps, uint32 swapTurnoverBps, uint32 feeInterval, uint32 maxPriceAge, uint32 minPriceStable)',
   'function paused() view returns (bool)',
 ]);
 const DELEGATION_COMPONENTS = [
@@ -238,7 +238,11 @@ async function readAccount(a) {
   const registered = acc.delegationHash !== pad('0x00', { size: 32 });
   const value = registered ? await r('accountValue', [a, price]) : usdcBal;
   const liq = await Promise.all(positions.map((p) => pub.readContract({ address: SA.positionManager, abi: POSM_ABI, functionName: 'getPositionLiquidity', args: [p.tokenId] })));
-  return { address: a, registered, kind: acc.kind, until: Number(acc.until), revoked: acc.revoked, contributed: acc.contributed, hwm: acc.hwm,
+  // SA-2: a client flow (e.g. a USDC top-up sent straight to the account) is booked into `contributed` at the next
+  // trusted manager action; until then it is the idle difference to the module's snapshot (counted as deposit here).
+  const dBase = hype - acc.snapBase;
+  const pending = registered ? usdcBal - acc.snapAsset + (dBase >= 0n ? dBase * price / 10n ** 18n : -((-dBase * price + 10n ** 18n - 1n) / 10n ** 18n)) : 0n;
+  return { address: a, registered, kind: acc.kind, until: Number(acc.until), revoked: acc.revoked, contributed: acc.contributed + pending, hwm: acc.hwm,
     hedgeEquity: acc.hedgeEquity, netMargin: acc.netMargin, feesPaid: acc.feesPaid, price, active, value, usdc: usdcBal, hype, walletUsdc, deployed: (await pub.getCode({ address: a }))?.length > 2,
     positions: positions.map((p, i) => ({ ...p, liquidity: liq[i] })) };
 }
@@ -408,7 +412,7 @@ async function addFunds() {
       const data = encodeFunctionData({ abi: ERC20_ABI, functionName: 'transfer', args: [S.sa, parseUnits(v, UD)] });
       await waitTx(await req('eth_sendTransaction', [{ from: S.account, to: USDC, data }]));
     }
-    S.msg = 'Added. It counts as a deposit (not profit) at the next manager action.';
+    S.msg = 'Added. It counts as a deposit, not profit.';
   } catch (e) { S.err = plain(e); }
   S.busy = null; await load();
 }

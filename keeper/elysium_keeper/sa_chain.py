@@ -7,6 +7,7 @@ non-local RPC unless chain.allow_live_chain is set deliberately).
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 
@@ -197,10 +198,18 @@ class AccountSnap:
     revoked: bool = False
     hedge_clipped: bool = False
     hedge_time: int = 0
+    pending: int = 0  # live state - snapshot at the anchor: a client flow not booked yet (SA-2: booked at a trusted sync)
+    value_pool: int = 0  # accountValue at the pool price (the fee uses min(value, value_pool), SA-2 H-1)
 
     @property
     def profit(self) -> int:
-        return self.value - self.contributed
+        """Profit as the module books it: value minus contributed minus the not yet booked client flow."""
+        return self.value - self.contributed - self.pending
+
+    @property
+    def fee_profit(self) -> int:
+        """The profit chargeFee measures: min(value at the anchor, value at the pool) - contributed - pending."""
+        return min(self.value, self.value_pool or self.value) - self.contributed - self.pending
 
     def lp_amounts(self, sqrt_price: int):
         from . import v4math as M
@@ -216,7 +225,7 @@ class AccountSnap:
 class GlobalSnap:
     last_price: int
     last_price_time: int
-    clipped: bool
+    clipped: bool  # view: the anchor is outside the pool band of the keeper's last report (clears itself)
     paused: bool
     pool_price: int
     sqrt_price: int
@@ -228,6 +237,16 @@ class GlobalSnap:
     treasury_usdc: int = 0
     treasury_allowance: int = 0
     extra: dict = field(default_factory=dict)
+    last_price_moved: int = 0  # last change of the anchor value (fees and booking need minPriceStable since)
+    last_reported: int = 0
+
+    def trusted(self, now: int) -> bool:
+        """LPManagerModule._trusted(): fresh, unclipped, pool within band of the anchor, anchor stable long enough."""
+        p = self.params
+        lp = self.last_price
+        return (lp > 0 and not self.clipped and now - self.last_price_time <= p["maxPriceAge"]
+                and abs(self.pool_price - lp) * 10_000 <= lp * p["poolBandBps"]
+                and now >= self.last_price_moved + p["minPriceStable"])
 
 
 # LPManagerModule.budgets(a): (turnover window, hedge window, hedgeApproved, hedgeApprovedEpoch, hedgeApprovedUntil,
@@ -241,7 +260,7 @@ ACCOUNT_KEYS = ["delegationHash", "owner", "kind", "until", "revoked", "hedgeCli
                 "hedgeEquity", "netMargin", "hedgeEpoch", "snapAsset", "snapBase", "lastFeeTime", "feesPaid",
                 "hedgeTime"]
 PARAM_KEYS = ["feeBps", "hedgeCapBps", "poolBandBps", "maxSlippageBps", "hedgeStepBps", "refDriftBps",
-              "swapTurnoverBps", "feeInterval", "maxPriceAge"]
+              "swapTurnoverBps", "feeInterval", "maxPriceAge", "minPriceStable"]
 
 
 class ModuleReader:
@@ -277,7 +296,8 @@ class ModuleReader:
                        paused=c("paused"), pool_price=c("poolPrice"), sqrt_price=sp, tick=tick,
                        params=dict(zip(PARAM_KEYS, c("params"))),
                        price_budget=dict(zip(PRICE_BUDGET_KEYS, c("priceBudget")[1:])),
-                       treasury=self.treasury, fee_recipient=self.fee_recipient)
+                       treasury=self.treasury, fee_recipient=self.fee_recipient,
+                       last_price_moved=c("lastPriceMoved"), last_reported=c("lastReported"))
         g.price_budget["priceUsed"] = c("windows", ZERO_ADDRESS)[2]
         g.treasury_usdc = self.usdc.call("balanceOf", self.treasury)
         g.treasury_allowance = self.usdc.call("allowance", self.treasury, self.m.address)
@@ -293,14 +313,34 @@ class ModuleReader:
         ps = [APos(int(t[0]), int(t[1]), int(t[2]), int(self.posm.call("getPositionLiquidity", int(t[0]))))
               for t in c("positionsOf", a)]
         active = c("isActive", a)
-        return AccountSnap(
+        snap = AccountSnap(
             address=a, kind=KIND.get(s["kind"], str(s["kind"])), active=active, until=s["until"],
             contributed=s["contributed"], hwm=s["hwm"], hedge_equity=s["hedgeEquity"], net_margin=s["netMargin"],
             hedge_epoch=s["hedgeEpoch"], last_fee_time=s["lastFeeTime"], fees_paid=s["feesPaid"],
             usdc=self.usdc.call("balanceOf", a), native=self.rpc.balance(a), positions=ps,
             value=c("accountValue", a, price), budgets=dict(zip(BUDGET_KEYS, c("budgets", a)[2:])),
             windows=dict(zip(WINDOW_KEYS, c("windows", a))), owner=to_checksum_address(s["owner"]),
-            revoked=s["revoked"], hedge_clipped=s["hedgeClipped"], hedge_time=s["hedgeTime"])
+            revoked=s["revoked"], hedge_clipped=s["hedgeClipped"], hedge_time=s["hedgeTime"],
+            value_pool=c("accountValue", a, c("poolPrice")))
+        snap.pending = self.pending(snap, s, price)
+        return snap
+
+    def pending(self, snap: "AccountSnap", s: dict, price: int) -> int:
+        """Live state - snapshot at `price` (SABook.sync's flow): idle deltas plus the liquidity deltas of the
+        tracked positions, each valued with V4PositionMath.liquidityValue's formula. A few wei of rounding apart."""
+        from . import v4math as M
+        sp = math.isqrt(price * (1 << 192) // 10**18)
+        f = snap.usdc - s["snapAsset"]
+        db = snap.native - s["snapBase"]
+        f += db * price // 10**18 if db >= 0 else -((-db * price + 10**18 - 1) // 10**18)
+        for p in snap.positions:
+            old = self.m.call("snapLiquidity", p.token_id)
+            if p.liquidity != old:
+                sa_, sb = M.sqrt_price_at_tick(p.tl), M.sqrt_price_at_tick(p.tu)
+                for liq, sign in ((p.liquidity, 1), (old, -1)):
+                    x, y = M.amounts_for_liquidity(sp, sa_, sb, liq)
+                    f += sign * (y + x * price // 10**18)
+        return f
 
     def discover(self, from_block: int, to_block: int | None = None, step: int = 50_000) -> list[str]:
         """Accounts from Registered events (chunked eth_getLogs)."""
