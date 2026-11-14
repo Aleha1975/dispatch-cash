@@ -393,4 +393,26 @@ contract SARound3Test is SATestBase {
         vm.expectRevert(LPManagerModule.BadParam.selector);
         module.setPaused(true);
     }
+
+    /// L-12 / I-3 / L-13: no operation with a delay above MAX_DELAY; an expired operation reports itself expired; the
+    /// proposer role cannot be renounced.
+    function test_L12_TimelockDelayCapExpiryRenounce() public {
+        bytes memory data = abi.encodeCall(LPManagerModule.setPaused, (false));
+        uint256 cap = timelock.MAX_DELAY();
+        vm.prank(operator);
+        vm.expectRevert(VaultTimelock.DelayAboveCap.selector);
+        timelock.schedule(address(module), 0, data, bytes32(0), bytes32("x"), cap + 1);
+        vm.prank(operator);
+        timelock.schedule(address(module), 0, data, bytes32(0), bytes32("y"), 2 days);
+        bytes32 id = timelock.hashOperation(address(module), 0, data, bytes32(0), bytes32("y"));
+        vm.warp(vm.getBlockTimestamp() + 2 days + 7 days + 1);
+        assertTrue(timelock.isExpired(id));
+        vm.prank(operator);
+        vm.expectRevert(abi.encodeWithSelector(VaultTimelock.OperationExpired.selector, id));
+        timelock.execute(address(module), 0, data, bytes32(0), bytes32("y"));
+        bytes32 role = timelock.PROPOSER_ROLE();
+        vm.prank(operator);
+        vm.expectRevert(VaultTimelock.NoRenounce.selector);
+        timelock.renounceRole(role, operator);
+    }
 }

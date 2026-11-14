@@ -25,11 +25,16 @@ import {LPManagerModule} from "../src/sa/LPManagerModule.sol";
 ///    are created from test/fixtures/delegation-framework-v1.3.0 through the deterministic CREATE2 deployer, so they
 ///    land on the canonical addresses used on every other chain. Already-present contracts are skipped.
 /// 2. SwapExecutor, ElysiumCustodyEnforcer and LPManagerModule (owner = VaultTimelock; OWNER proposes/executes, OWNER
-///    and GUARDIAN cancel). Forge links SALib / V4PositionMath / RiskBudgets automatically.
-/// Env: OWNER, KEEPER, GUARDIAN, HEDGE_TREASURY, FEE_RECIPIENT, optional TIMELOCK_DELAY (default 48 h, >= 24 h).
+///    and GUARDIAN cancel). Forge links SALib / SABook / V4PositionMath automatically.
+/// Env: OWNER, KEEPER, GUARDIAN, HEDGE_TREASURY, FEE_RECIPIENT, optional TIMELOCK_DELAY (default 48 h, >= 24 h),
+/// optional ALLOW_EOA_OWNER (default false: the timelock operator must be a contract, i.e. a multisig; SA-3 L-13).
 /// After deploying: the keeper calls reportPrice once (anchor), the treasury approves the module for USDC.
 interface IPausable {
     function paused() external view returns (bool);
+}
+
+interface IPosmWiring {
+    function poolManager() external view returns (address);
 }
 
 contract DeploySA is Script {
@@ -70,6 +75,14 @@ contract DeploySA is Script {
         require(got == expected, "fixture does not derive the canonical address");
     }
 
+    /// SA-3 L-13 / L-16: a venue contract is accepted only if its runtime code equals the fixture the tests run on.
+    function _sameCode(address a, string memory name) internal view {
+        require(
+            keccak256(a.code) == keccak256(vm.parseBytes(vm.readFile(string.concat("test/fixtures/elysium/", name, ".runtime.hex")))),
+            string.concat(name, ": code differs from the fixture")
+        );
+    }
+
     function run() external returns (LPManagerModule module, ElysiumCustodyEnforcer enforcer, SwapExecutor executor) {
         require(block.chainid == CHAIN_ID, "wrong chain");
         address owner = vm.envAddress("OWNER");
@@ -95,6 +108,12 @@ contract DeploySA is Script {
                 && CREATE2_DEPLOYER.code.length != 0,
             "missing v4 / Delegation Framework / EntryPoint contracts"
         );
+        require(owner.code.length != 0 || vm.envOr("ALLOW_EOA_OWNER", false), "OWNER must be a multisig");
+        _sameCode(PM, "PoolManager");
+        _sameCode(POSM, "PositionManager");
+        _sameCode(PERMIT2, "Permit2");
+        _sameCode(ENTRYPOINT, "EntryPointV07");
+        require(IPosmWiring(POSM).poolManager() == PM, "PositionManager is not bound to this PoolManager");
         uint256 delay = vm.envOr("TIMELOCK_DELAY", uint256(48 hours));
         require(delay >= 24 hours && delay <= 30 days, "TIMELOCK_DELAY outside [24h, 30d]");
         PoolKey memory key = PoolKey(Currency.wrap(address(0)), Currency.wrap(USDC), 3000, 60, IHooks(address(0)));
@@ -168,13 +187,25 @@ contract DeploySA is Script {
         );
         bytes memory proxyInit = abi.encodePacked(_fixture("ERC1967Proxy"), abi.encode(HYBRID_IMPL, init));
         SALib.Expect memory e;
-        e.hybridImpl = HYBRID_IMPL;
-        e.factory = SIMPLE_FACTORY;
-        e.accountSalt = bytes32("ELYSIUM-LP-V1");
+        e.hybridImpl = module.hybridImpl(); // SA-3 L-13: the probe reads the deployed module, not local constants
+        e.factory = module.factory();
+        e.accountSalt = module.accountSalt();
         require(
             SALib.hybridAddress(e, probe)
                 == ISimpleFactory(SIMPLE_FACTORY).computeAddress(keccak256(proxyInit), bytes32("ELYSIUM-LP-V1")),
             "module and factory derive different account addresses"
+        );
+        // SA-3 L-13 / L-16: read the wiring back from the deployed contracts
+        require(module.owner() == address(timelock) && module.keeper() == keeper && module.guardian() == guardian, "module roles");
+        require(
+            module.positionManager() == IPositionManagerMin(POSM) && address(module.poolManager()) == PM
+                && module.swapExecutor() == address(executor) && module.enforcer() == address(enforcer),
+            "module wiring"
+        );
+        require(
+            timelock.hasRole(timelock.PROPOSER_ROLE(), owner) && timelock.hasRole(timelock.EXECUTOR_ROLE(), owner)
+                && timelock.hasRole(timelock.CANCELLER_ROLE(), guardian) && timelock.getMinDelay() == delay,
+            "timelock roles"
         );
         // operator step left: the treasury approves the module for USDC (returnHedgeMargin), sized per return
     }

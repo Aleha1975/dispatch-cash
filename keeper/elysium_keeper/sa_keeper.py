@@ -34,10 +34,11 @@ from .hl import DryRunAdapter, HLInfo, LiveAdapter
 from .infra import Alerts, Log, State, StatusServer
 from .ledger import HedgeLedger
 from .rpc import RPC, Chain, KeystoreSigner, ReadOnlySigner, TxRevert, UnlockedSigner, is_local
-from .sa_chain import AccountSnap, GlobalSnap, ModuleReader
+from .sa_chain import BOOK_BAND_BPS, AccountSnap, GlobalSnap, ModuleReader
 
 BPS = 10_000
 E18 = 10 ** 18
+SWAP_MIN_OUT_SLACK_BPS = 30  # minOut = the simulated output less this (the module floor still applies)
 
 
 def hwm_fee(profit: int, hwm: int, fee_bps: int, max_fee: int | None = None) -> tuple[int, int]:
@@ -179,10 +180,14 @@ class SAKeeper:
             return None, g
         price = S.sticky_price(pc.price, g.last_price, g.pool_price, g.params["poolBandBps"],
                                self.st.anchor_hysteresis_bps, self.st.band_safety)
+        # SA-3 L-21: hold the anchor value (still re-reported for freshness) only while a fee is due and positive, and
+        # only while the pool stays inside the booking band of it (a held anchor off the band blocks booking, swaps
+        # and adds for every account)
         if (now < self._hold_until and price != g.last_price and g.last_price
-                and abs(price - g.last_price) * BPS <= g.last_price * g.params["poolBandBps"] * self.st.band_safety):
-            price = g.last_price  # hold the anchor value (still re-reported for freshness) so a due fee can be charged
-        stale = now - g.last_price_time >= min(self.sa.report_every_s, g.params["maxPriceAge"] // 2)
+                and abs(g.pool_price - g.last_price) * BPS <= g.pool_price * BOOK_BAND_BPS * self.st.band_safety):
+            price = g.last_price
+        stale = now - g.last_price_time >= min(self.sa.report_every_s, g.params["maxPriceAge"] // 2,
+                                               g.params["minPriceStable"] * 2 // 5)
         if price != g.last_price or stale or g.clipped:
             self.act("reportPrice", price)
             g = self.r.global_snap()
@@ -201,7 +206,20 @@ class SAKeeper:
         if price is None:
             led["target"] = led["short"]  # keep the hedge as is while prices disagree
             return s
+        refused = int((self.state.d.get("fee_refusals", {}).get(a) or {}).get("n", 0))
+        if refused >= self.sa.fee_refusals_stop:
+            # SA-2 L-10 / SA-3 L-1: the account refused the fee on consecutive due dates: stop managing it (no new
+            # margin, no LP deploy, hedge closed); removals and the client's exit are unaffected
+            led["target"] = 0.0
+            self.alert("warn", f"fee_refused_{a}", f"{a} refused the fee {refused}x: not managed any more")
+            return s
+        if s.value < self.sa.min_account_usd * 1e6:
+            self.log("account_below_floor", account=a, value=s.value / 1e6)  # SA-3 L-20: read only
+            return s
         if not g.paused:
+            g = self.r.global_snap()
+            if s.pending and g.trusted(self.now()):
+                self.act("sync", a)  # SA-3 M-5: book a pending client flow at the first trusted moment
             self.margin(s, g, price)
             self.manage_lp(a, g, price, hw)
             self.fee(a, g, now)
@@ -245,15 +263,17 @@ class SAKeeper:
                 break
             chunk = min(amount - done, chunk_max)
             while True:
-                why = self.probe("swap", a, sell_base, chunk, price, 0)  # minOut 0: the module's floor applies
-                if why is None:
+                try:  # the module's floor applies to the probe; the sent swap pins what the probe got (SA-3 L-22)
+                    out = self.r.m.call("swap", a, sell_base, chunk, price, 0, sender=self.chain.signer.address)
                     break
+                except TxRevert as e:
+                    why = e.reason
                 if "BelowMinOut" in why and chunk > 2 * min_amt:
                     chunk //= 2
                     continue
                 self.log("swap_probe_revert", account=a, reason=why, chunk=chunk)
                 return done
-            self.act("swap", a, sell_base, chunk, price, 0)
+            self.act("swap", a, sell_base, chunk, price, int(out) * (BPS - SWAP_MIN_OUT_SLACK_BPS) // BPS)
             done += chunk
         return done
 
@@ -267,9 +287,13 @@ class SAKeeper:
                 self.act("burnPosition", a, p.token_id, x * k // BPS, y * k // BPS)
                 self.log("burned", account=a, token_id=p.token_id, why="out_of_range")
             s = self.r.account(a)
-        # swaps and adds must quote within the band of the anchor
+        # swaps and adds must quote within the band of the anchor, and (SA-3) need a trusted anchor
         if abs(price - g.last_price) * BPS > g.last_price * g.params["poolBandBps"] * self.st.band_safety:
             self.log("deploy_skipped_anchor", account=a)
+            return
+        g = self.r.global_snap()
+        if not g.trusted(self.now()):
+            self.log("deploy_waits_trusted", account=a)
             return
         pos = s.positions[0] if s.positions else None
         tl, tu = (pos.tl, pos.tu) if pos else S.range_ticks(price, hw)
@@ -331,6 +355,11 @@ class SAKeeper:
         fee, new_hwm = hwm_fee(s.fee_profit, s.hwm, g.params["feeBps"])
         if fee <= 0:
             return
+        if not g.fee_gate():
+            # SA-3 M-3: the anchor must not be above the pool nor more than poolBandBps above its trailing 24 h low
+            self._hold_until = max(self._hold_until, now + 2 * g.params["minPriceStable"] + self.sa.report_every_s)
+            self.log("fee_waits_gate", account=a, anchor=g.last_price, pool=g.pool_price, low=g.trailing_low)
+            return
         need = int(fee * 5 * self.sa.fee_idle_margin) + 1
         if s.usdc < need and s.positions:
             sp, _ = self.r.slot0()
@@ -338,11 +367,24 @@ class SAKeeper:
             _, y = M.amounts_for_liquidity(sp, M.sqrt_price_at_tick(p.tl), M.sqrt_price_at_tick(p.tu), p.liquidity)
             if y > 0:
                 q = min(1.0, (need - s.usdc) * 1.05 / y)
-                self.act("decreasePosition", a, p.token_id, int(p.liquidity * q), 0, 0)
+                liq = int(p.liquidity * q)
+                x0, y0 = M.amounts_for_liquidity(sp, M.sqrt_price_at_tick(p.tl), M.sqrt_price_at_tick(p.tu), liq)
+                k = BPS - self.st.burn_slippage_bps  # SA-3 L-22: removal minima
+                self.act("decreasePosition", a, p.token_id, liq, x0 * k // BPS, y0 * k // BPS)
                 s = self.r.account(a)
         if s.usdc * 2000 < fee * BPS:  # charged partially (20% of idle); the mark advances only by that part
             self.log("fee_partial", account=a, fee=fee / 1e6, idle=s.usdc / 1e6)
-        self.act("chargeFee", a)
+        refusals = self.state.d.setdefault("fee_refusals", {})
+        try:
+            self.act("chargeFee", a)
+        except TxRevert as e:
+            if "TransferMismatch" in (e.reason or "") or "BadExecution" in (e.reason or ""):
+                # the account's code refused the transfer: counted once per fee interval (consecutive due dates)
+                r = refusals.get(a) or {"n": 0, "t": 0}
+                if r["n"] == 0 or now - int(r["t"]) >= g.params["feeInterval"]:
+                    refusals[a] = {"n": r["n"] + 1, "t": now}
+            raise
+        refusals.pop(a, None)
         s2 = self.r.account(a)
         charged = s2.fees_paid - s.fees_paid
         rec = {"ts": now, "account": a, "fee": charged, "profit": s.profit, "hwm_before": s.hwm, "hwm": s2.hwm}
@@ -463,7 +505,12 @@ class SAKeeper:
         now = self.now()
         errors: list[str] = []
         self.ledger.mark_to_market(self.info.mid(self.cfg.hl.coin))
-        price, g = self.anchor(now)
+        try:
+            price, g = self.anchor(now)
+        except Exception as e:  # SA-3 L-21: a failed report never aborts the tick (no risk-adding actions)
+            errors.append(f"anchor: {e}")
+            self.log("anchor_failed", error=str(e))
+            price, g = None, self.r.global_snap()
         try:
             self.process_requests()
         except Exception as e:

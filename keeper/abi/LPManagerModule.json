@@ -188,6 +188,19 @@
  },
  {
   "type": "function",
+  "name": "BOOK_BAND_BPS",
+  "inputs": [],
+  "outputs": [
+   {
+    "name": "",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ],
+  "stateMutability": "view"
+ },
+ {
+  "type": "function",
   "name": "MAX_APPROVAL_TTL",
   "inputs": [],
   "outputs": [
@@ -1335,18 +1348,6 @@
   "inputs": [],
   "outputs": [
    {
-    "name": "window",
-    "type": "tuple",
-    "internalType": "struct SAWindow.W",
-    "components": [
-     {
-      "name": "b",
-      "type": "uint128[9]",
-      "internalType": "uint128[9]"
-     }
-    ]
-   },
-   {
     "name": "lo",
     "type": "uint256",
     "internalType": "uint256"
@@ -1360,6 +1361,18 @@
     "name": "until",
     "type": "uint256",
     "internalType": "uint256"
+   },
+   {
+    "name": "range",
+    "type": "tuple",
+    "internalType": "struct SARange.R",
+    "components": [
+     {
+      "name": "b",
+      "type": "uint256[9]",
+      "internalType": "uint256[9]"
+     }
+    ]
    }
   ],
   "stateMutability": "view"
@@ -1619,7 +1632,7 @@
  },
  {
   "type": "function",
-  "name": "snapLiquidity",
+  "name": "snapPos",
   "inputs": [
    {
     "name": "",
@@ -1629,9 +1642,19 @@
   ],
   "outputs": [
    {
-    "name": "",
+    "name": "liq",
     "type": "uint128",
     "internalType": "uint128"
+   },
+   {
+    "name": "g0",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "g1",
+    "type": "uint256",
+    "internalType": "uint256"
    }
   ],
   "stateMutability": "view"
@@ -1687,6 +1710,19 @@
    }
   ],
   "stateMutability": "view"
+ },
+ {
+  "type": "function",
+  "name": "sync",
+  "inputs": [
+   {
+    "name": "a",
+    "type": "address",
+    "internalType": "address"
+   }
+  ],
+  "outputs": [],
+  "stateMutability": "nonpayable"
  },
  {
   "type": "function",
@@ -2822,6 +2858,11 @@
  {
   "type": "error",
   "name": "EnforcedPause",
+  "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "RangeOverflow",
   "inputs": []
  }
 ]

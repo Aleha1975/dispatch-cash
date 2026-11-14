@@ -115,6 +115,8 @@ POOL_MANAGER_ABI = [
 POSM_ABI = [
     {"type": "function", "name": "getPositionLiquidity", "stateMutability": "view",
      "inputs": [{"name": "id", "type": "uint256"}], "outputs": [{"name": "", "type": "uint128"}]},
+    {"type": "function", "name": "ownerOf", "stateMutability": "view",
+     "inputs": [{"name": "id", "type": "uint256"}], "outputs": [{"name": "", "type": "address"}]},
 ]
 
 

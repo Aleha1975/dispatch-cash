@@ -239,7 +239,9 @@ async function readAccount(a) {
   const value = registered ? await r('accountValue', [a, price]) : usdcBal;
   const liq = await Promise.all(positions.map((p) => pub.readContract({ address: SA.positionManager, abi: POSM_ABI, functionName: 'getPositionLiquidity', args: [p.tokenId] })));
   // SA-2: a client flow (e.g. a USDC top-up sent straight to the account) is booked into `contributed` at the next
-  // trusted manager action; until then it is the idle difference to the module's snapshot (counted as deposit here).
+  // trusted sync (SA-3: the keeper calls sync(a) at the first trusted moment, anyone may); until then it is the idle
+  // difference to the module's snapshot (counted as deposit here). Approximation: LP fees the client collected
+  // itself are yield on chain (SA-3), shown here as a deposit until the next sync.
   const dBase = hype - acc.snapBase;
   const pending = registered ? usdcBal - acc.snapAsset + (dBase >= 0n ? dBase * price / 10n ** 18n : -((-dBase * price + 10n ** 18n - 1n) / 10n ** 18n)) : 0n;
   return { address: a, registered, kind: acc.kind, until: Number(acc.until), revoked: acc.revoked, contributed: acc.contributed + pending, hwm: acc.hwm,

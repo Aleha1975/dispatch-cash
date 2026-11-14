@@ -99,7 +99,10 @@ class SACfg:
     buffer_bps: int = 300  # USDC kept idle per account (fees, the enforcer's %-of-idle limits)
     min_deploy_usd: float = 50.0
     fee_idle_margin: float = 1.1  # free idle USDC to fee x 5 x this before chargeFee (enforcer: fee <= 20% idle)
-    report_every_s: int = 1800  # re-report the anchor at least this often (fees need maxPriceAge freshness)
+    report_every_s: int = 120  # re-report the anchor at least this often; SA-3: < minPriceStable (trust needs a
+    # confirmation within the last minPriceStable, and a gap longer than that counts as a move)
+    min_account_usd: float = 25.0  # SA-3 L-20: accounts worth less are only read (no swaps, mints, fees)
+    fee_refusals_stop: int = 2  # SA-2 L-10 / SA-3 L-1: stop managing after this many due fees refused
     ledger_path: str = "sa_ledger.json"
     requests_dir: str = ""  # relayer: onboarding requests (*.json) dropped by the web backend (sa-api)
     status_path: str = ""  # keeper writes the per-account summary here every tick (served by sa-api)

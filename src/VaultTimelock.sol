@@ -17,10 +17,15 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 ///           itself (role changes, delay changes). Otherwise a compromised guardian could veto its own removal forever.
 ///           A batch must target either only the timelock or no timelock call at all (mixed batches revert), so a
 ///           vault change can never borrow the "self-operation" status and escape the guardian's veto.
-///           Guardian rotation = two operations: (1) a timelock-only batch `revokeRole/grantRole(CANCELLER)`,
-///           (2) `vault.setGuardian(new)` (the old guardian no longer holds CANCELLER when it becomes ready).
-///         - A ready operation expires `GRACE_PERIOD` (7 days) after it became executable: levers cannot be
-///           stockpiled and fired later.
+///           Guardian rotation = two operations, in sequence (SA-3 L-11/L-12): (1) a timelock-only batch
+///           `revokeRole/grantRole(CANCELLER)`, which the old guardian cannot cancel; (2) `vault.setGuardian(new)`,
+///           scheduled only AFTER (1) has executed (while (1) waits, the old guardian can still cancel any vault
+///           operation). Against a hostile guardian a rotation therefore takes 2 x delay; meanwhile removals, margin
+///           returns and client exits keep working.
+///         - A ready operation expires `GRACE_PERIOD` (7 days) after it became executable, and no single operation
+///           may be scheduled with a delay above MAX_DELAY (SA-3 L-12): levers cannot be stockpiled and fired later.
+///           An expired operation stays "ready" in the stock views; `isExpired` tells, and a cancel frees its id.
+///         - The proposer role cannot be renounced (SA-3 L-13: a renounce would freeze ownership for good).
 ///
 ///         The guardian's `setPaused(true)` on the vault stays instant (the guardian calls the vault directly).
 contract VaultTimelock is TimelockController {
@@ -38,6 +43,7 @@ contract VaultTimelock is TimelockController {
     error OperationExpired(bytes32 id);
     error ZeroAddress();
     error ProposerOnlyCancel();
+    error NoRenounce();
 
     constructor(uint256 minDelay, address operator, address guardian)
         TimelockController(minDelay, _one(operator), _one(operator), address(0))
@@ -78,6 +84,7 @@ contract VaultTimelock is TimelockController {
         bytes32 salt,
         uint256 delay
     ) public override {
+        if (delay > MAX_DELAY) revert DelayAboveCap();
         super.schedule(target, value, data, predecessor, salt, delay);
         if (target == address(this)) isSelfOperation[hashOperation(target, value, data, predecessor, salt)] = true;
     }
@@ -90,6 +97,7 @@ contract VaultTimelock is TimelockController {
         bytes32 salt,
         uint256 delay
     ) public override {
+        if (delay > MAX_DELAY) revert DelayAboveCap();
         super.scheduleBatch(targets, values, payloads, predecessor, salt, delay);
         uint256 self;
         for (uint256 i; i < targets.length; ++i) {
@@ -121,10 +129,20 @@ contract VaultTimelock is TimelockController {
         super.executeBatch(targets, values, payloads, predecessor, salt);
     }
 
+    /// @notice True once a scheduled operation passed its GRACE_PERIOD without being executed (it can no longer run).
+    function isExpired(bytes32 id) public view returns (bool) {
+        uint256 ts = getTimestamp(id);
+        return ts > 1 && block.timestamp > ts + GRACE_PERIOD;
+    }
+
+    function renounceRole(bytes32 role, address account) public override {
+        if (role == PROPOSER_ROLE) revert NoRenounce();
+        super.renounceRole(role, account);
+    }
+
     /// @dev Pending/done/unset operations fall through to the stock checks.
     function _checkNotExpired(bytes32 id) private view {
-        uint256 ts = getTimestamp(id);
-        if (ts > 1 && block.timestamp > ts + GRACE_PERIOD) revert OperationExpired(id);
+        if (isExpired(id)) revert OperationExpired(id);
     }
 
     function cancel(bytes32 id) public override {

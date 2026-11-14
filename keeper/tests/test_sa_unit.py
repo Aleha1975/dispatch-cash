@@ -158,3 +158,32 @@ def test_config_sa_section():
     assert c.sa.module == MODULE and c.sa.stagger_s == 0
     with pytest.raises(ValueError):
         C.from_dict({"sa": {"modul": MODULE}})
+
+
+# ---------------------------------------------------------------- SA-3 price-trust mirrors (LPManagerModule._trusted)
+def _g(**kw):
+    from elysium_keeper.sa_chain import GlobalSnap, PARAM_KEYS
+    params = dict(zip(PARAM_KEYS, [1500, 3500, 150, 150, 500, 1000, 20000, 7 * 86400, 3600, 300]))
+    base = dict(last_price=40_000_000, last_price_time=1_000, clipped=False, paused=False, pool_price=40_000_000,
+                sqrt_price=0, tick=0, params=params, price_budget={}, treasury=TREAS, fee_recipient=FEE,
+                last_price_moved=700)
+    base.update(kw)
+    return GlobalSnap(**base)
+
+
+def test_trusted_needs_stable_recent_and_book_band():
+    assert _g().trusted(1_000)
+    assert not _g(last_price_moved=900).trusted(1_000)  # moved less than minPriceStable ago
+    assert not _g().trusted(1_301)  # no confirmation within the last minPriceStable
+    assert _g(pool_price=40_190_000).trusted(1_000)  # 47 bps off: inside BOOK_BAND_BPS
+    assert not _g(pool_price=40_250_000).trusted(1_000)  # 62 bps: fresh (poolBand 150) but not trusted
+    assert _g(pool_price=40_250_000).fresh(1_000)
+
+
+def test_fee_gate_and_trailing_low():
+    from elysium_keeper.sa_chain import ModuleReader
+    lo = ModuleReader.trailing_low(40_000_000, 2 * 10**16)  # range (hi - lo) / lo = 2%
+    assert lo == 39_215_686
+    assert not _g(trailing_low=lo).fee_gate()  # anchor 2% above the low > poolBandBps 1.5%
+    assert _g(trailing_low=39_500_000).fee_gate()
+    assert not _g(pool_price=39_990_000).fee_gate()  # anchor above the pool

@@ -20,6 +20,7 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODULE_ABI_PATH = os.path.join(HERE, "abi", "LPManagerModule.json")
 PROXY_INITCODE_PATH = os.path.join(HERE, "abi", "ERC1967Proxy.initcode.hex")
 POOLS_SLOT = 6
+POSITIONS_OFFSET = 6  # StateLibrary.POSITIONS_OFFSET
 
 # Delegation Framework v1.3.0 (canonical CREATE2 addresses; DM / 7702 / TimestampEnforcer live on Elysium 99901)
 DM = "0xdb9B1e94B5b69Df7e401DDbedE43491141047dB3"
@@ -199,7 +200,7 @@ class AccountSnap:
     hedge_clipped: bool = False
     hedge_time: int = 0
     pending: int = 0  # live state - snapshot at the anchor: a client flow not booked yet (SA-2: booked at a trusted sync)
-    value_pool: int = 0  # accountValue at the pool price (the fee uses min(value, value_pool), SA-2 H-1)
+    value_pool: int = 0  # accountValue at the pool price (margin sends cap on min(value, value_pool))
 
     @property
     def profit(self) -> int:
@@ -208,8 +209,9 @@ class AccountSnap:
 
     @property
     def fee_profit(self) -> int:
-        """The profit chargeFee measures: min(value at the anchor, value at the pool) - contributed - pending."""
-        return min(self.value, self.value_pool or self.value) - self.contributed - self.pending
+        """The profit chargeFee measures (SA-3 M-3): value at the anchor - contributed, after the sync inside
+        chargeFee has booked the pending flow at that same anchor (so - pending)."""
+        return self.value - self.contributed - self.pending
 
     def lp_amounts(self, sqrt_price: int):
         from . import v4math as M
@@ -239,15 +241,31 @@ class GlobalSnap:
     extra: dict = field(default_factory=dict)
     last_price_moved: int = 0  # last change of the anchor value (fees and booking need minPriceStable since)
     last_reported: int = 0
+    trailing_low: int = 0  # SA-3: lowest anchor of the trailing 24 h range (the fee gate), 0 = unknown
 
-    def trusted(self, now: int) -> bool:
-        """LPManagerModule._trusted(): fresh, unclipped, pool within band of the anchor, anchor stable long enough."""
+    def fresh(self, now: int) -> bool:
+        """LPManagerModule._freshOk(): reported within maxPriceAge, not clipped, pool within poolBandBps."""
         p = self.params
         lp = self.last_price
         return (lp > 0 and not self.clipped and now - self.last_price_time <= p["maxPriceAge"]
-                and abs(self.pool_price - lp) * 10_000 <= lp * p["poolBandBps"]
-                and now >= self.last_price_moved + p["minPriceStable"])
+                and abs(self.pool_price - lp) * 10_000 <= self.pool_price * p["poolBandBps"])
 
+    def trusted(self, now: int) -> bool:
+        """LPManagerModule._trusted() (SA-3): fresh; unchanged for minPriceStable and confirmed by a report within the
+        last minPriceStable; the pool within BOOK_BAND_BPS of the anchor. Booking, swaps, LP adds and fees need it."""
+        st = self.params["minPriceStable"]
+        lp = self.last_price
+        return (self.fresh(now) and now >= self.last_price_moved + st and now <= self.last_price_time + st
+                and abs(self.pool_price - lp) * 10_000 <= self.pool_price * BOOK_BAND_BPS)
+
+    def fee_gate(self) -> bool:
+        """SALib.feeGate: the anchor not above the pool and within poolBandBps of its trailing 24 h low."""
+        lp = self.last_price
+        lo = self.trailing_low or lp
+        return lp <= self.pool_price and lp * 10_000 <= lo * (10_000 + self.params["poolBandBps"])
+
+
+BOOK_BAND_BPS = 50  # LPManagerModule.BOOK_BAND_BPS (read from the module when available)
 
 # LPManagerModule.budgets(a): (turnover window, hedge window, hedgeApproved, hedgeApprovedEpoch, hedgeApprovedUntil,
 # hedgeApprovedEra); the windows are read through windows(a)
@@ -295,13 +313,20 @@ class ModuleReader:
         g = GlobalSnap(last_price=c("lastPrice"), last_price_time=c("lastPriceTime"), clipped=c("lastPriceClipped"),
                        paused=c("paused"), pool_price=c("poolPrice"), sqrt_price=sp, tick=tick,
                        params=dict(zip(PARAM_KEYS, c("params"))),
-                       price_budget=dict(zip(PRICE_BUDGET_KEYS, c("priceBudget")[1:])),
+                       price_budget=dict(zip(PRICE_BUDGET_KEYS, c("priceBudget")[0:3])),
                        treasury=self.treasury, fee_recipient=self.fee_recipient,
                        last_price_moved=c("lastPriceMoved"), last_reported=c("lastReported"))
-        g.price_budget["priceUsed"] = c("windows", ZERO_ADDRESS)[2]
+        g.price_budget["priceUsed"] = c("windows", ZERO_ADDRESS)[2]  # (hi - lo) / lo of the trailing range, WAD
+        g.trailing_low = self.trailing_low(g.last_price, g.price_budget["priceUsed"])
         g.treasury_usdc = self.usdc.call("balanceOf", self.treasury)
         g.treasury_allowance = self.usdc.call("allowance", self.treasury, self.m.address)
         return g
+
+    @staticmethod
+    def trailing_low(last_price: int, used_wad: int) -> int:
+        """Lower bound of the trailing range is not exposed on its own; windows(0)[2] = (hi - lo) / lo. The keeper
+        only needs a conservative low for the fee gate: assume the anchor is the high, lo = anchor / (1 + used)."""
+        return last_price * 10**18 // (10**18 + used_wad) if last_price else 0
 
     def account(self, a: str, price: int | None = None) -> AccountSnap:
         c = self.m.call
@@ -327,20 +352,47 @@ class ModuleReader:
 
     def pending(self, snap: "AccountSnap", s: dict, price: int) -> int:
         """Live state - snapshot at `price` (SABook.sync's flow): idle deltas plus the liquidity deltas of the
-        tracked positions, each valued with V4PositionMath.liquidityValue's formula. A few wei of rounding apart."""
+        tracked positions, each valued with V4PositionMath.liquidityValue's formula. SA-3: LP fees paid out of a
+        tracked position since the books' last look (PoolManager feeGrowthInsideLast - the module's mark, times the
+        booked liquidity) are yield, added to the snapshot first. A few wei of rounding apart."""
         from . import v4math as M
         sp = math.isqrt(price * (1 << 192) // 10**18)
-        f = snap.usdc - s["snapAsset"]
-        db = snap.native - s["snapBase"]
+        snap_asset, snap_base = s["snapAsset"], s["snapBase"]
+        marks = {}
+        for p in snap.positions:
+            old, g0, g1 = self.m.call("snapPos", p.token_id)
+            marks[p.token_id] = old
+            pm_liq, l0, l1 = self.position_info(p)
+            try:
+                owned = to_checksum_address(self.posm.call("ownerOf", p.token_id)) == snap.address
+            except Exception:  # burned
+                owned = False
+            n = min(p.liquidity, old) if owned else 0
+            if pm_liq == 0:
+                n = old
+            snap_base += ((l0 - g0) % (1 << 256)) * n >> 128
+            snap_asset += ((l1 - g1) % (1 << 256)) * n >> 128
+        f = snap.usdc - snap_asset
+        db = snap.native - snap_base
         f += db * price // 10**18 if db >= 0 else -((-db * price + 10**18 - 1) // 10**18)
         for p in snap.positions:
-            old = self.m.call("snapLiquidity", p.token_id)
+            old = marks[p.token_id]
             if p.liquidity != old:
                 sa_, sb = M.sqrt_price_at_tick(p.tl), M.sqrt_price_at_tick(p.tu)
                 for liq, sign in ((p.liquidity, 1), (old, -1)):
                     x, y = M.amounts_for_liquidity(sp, sa_, sb, liq)
                     f += sign * (y + x * price // 10**18)
         return f
+
+    def position_info(self, p: "APos"):
+        """PoolManager.getPositionInfo for the POSM-owned position `p` (liquidity, feeGrowthInside0/1 last), read
+        through extsload: pools[id].positions[keccak(owner, tl, tu, salt)]."""
+        pos_key = keccak(_b(self.posm.address) + int(p.tl).to_bytes(32, "big", signed=True)[-3:]
+                         + int(p.tu).to_bytes(32, "big", signed=True)[-3:] + int(p.token_id).to_bytes(32, "big"))
+        base = int.from_bytes(self.slot0_key, "big") + POSITIONS_OFFSET
+        slot = int.from_bytes(keccak(pos_key + base.to_bytes(32, "big")), "big")
+        w = [int.from_bytes(self.pm.call("extsload", (slot + i).to_bytes(32, "big")), "big") for i in range(3)]
+        return w[0] & ((1 << 128) - 1), w[1], w[2]
 
     def discover(self, from_block: int, to_block: int | None = None, step: int = 50_000) -> list[str]:
         """Accounts from Registered events (chunked eth_getLogs)."""
