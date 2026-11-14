@@ -267,7 +267,6 @@ def test_end_to_end(env):
     assert st["price"]["status"] == "skip" and gv.call("epoch") == ep
     assert any("skipping tick" in t for _, t in alerts)
     hl.set(fork.now(), pool / 1e6)
-
     print("\nE2E REPORT", json.dumps(report, indent=1, default=str))
     print("alerts sent:", len(alerts), "| logs in", tmp)
 
@@ -283,6 +282,10 @@ def test_cli_run_once_with_real_hl_info(env):
     v = fork.deploy_vault(hedged=True, owner=OWNER, keeper=KEEPER, guardian=GUARDIAN, fee_to=FEE_TO,
                           treasury=TREASURY, name="CLI smoke", symbol="cli")
     deposit(fork, vault_contract(fork, v), BOB, 500)
+    # this test reads the REAL HL price; the fork may be pinned to an old block (or be left anywhere by the test
+    # above), so put the pool where HL is now
+    from elysium_keeper.hl import HLInfo
+    Trader(fork, vault_contract(fork, v)).move_to(int(HLInfo().mid("HYPE") * 1e6))
     cfg = {"name": "cli", "chain": {"rpc_url": fork.url, "vault": v, "keeper": KEEPER},
            "strategy": {"mode": "hedged", "max_clamp_dev_bps": 500},
            "state_path": os.path.join(tmp, "cli", "state.json"), "log_path": os.path.join(tmp, "cli", "log.jsonl")}

@@ -11,7 +11,7 @@ import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
@@ -37,8 +37,21 @@ contract Trader is IUnlockCallback {
         pm.unlock(abi.encode(zeroForOne, amountIn));
     }
 
+    /// Third-party LP: deep liquidity so tests do not depend on how thin the live pool is today.
+    function seed(int24 tl, int24 tu, uint128 liquidity) external {
+        pm.unlock(abi.encode(true, tl, tu, liquidity));
+    }
+
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         require(msg.sender == address(pm));
+        (bool isSeed) = abi.decode(data, (bool));
+        if (data.length > 64 && isSeed) {
+            (, int24 tl, int24 tu, uint128 liq) = abi.decode(data, (bool, int24, int24, uint128));
+            (BalanceDelta dl,) = pm.modifyLiquidity(key, ModifyLiquidityParams(tl, tu, int256(uint256(liq)), 0), "");
+            _pay(key.currency0, dl.amount0());
+            _pay(key.currency1, dl.amount1());
+            return "";
+        }
         (bool z, uint256 amt) = abi.decode(data, (bool, uint256));
         BalanceDelta d = pm.swap(
             key,
@@ -59,6 +72,19 @@ contract Trader is IUnlockCallback {
         }
         pm.take(cOut, address(this), uint256(uint128(dOut)));
         return "";
+    }
+
+    function _pay(Currency c, int128 d) internal {
+        require(d <= 0);
+        uint256 pay = uint256(uint128(-d));
+        if (pay == 0) return;
+        if (c.isAddressZero()) {
+            pm.settle{value: pay}();
+        } else {
+            pm.sync(c);
+            IERC20(Currency.unwrap(c)).transfer(address(pm), pay);
+            pm.settle();
+        }
     }
 }
 

@@ -143,6 +143,21 @@ class Trader:
         self.c = Contract(fork.rpc, self.address, art["abi"])
         fork.deal_usdc(self.address, 50_000_000 * 10 ** 6)
         fork.set_balance(self.address, 1_000_000 * 10 ** 18)
+        self.seed_depth(vault.call("poolPrice"))
+
+    def seed_depth(self, p: int, usd_below: float = 150_000, half_range: float = 0.5):
+        """Third-party liquidity over +-50% (tick-aligned): the live pool's depth varies a lot with the day (it can
+        be a few $k per 1%, where a $5k swap runs out of liquidity and the price falls off the curve), so the
+        scenarios must not depend on it. ~$150k below the price means ~$5k of depth per 1%."""
+        from elysium_keeper import v4math as M
+        if p <= 0:  # pool already off the curve; nothing sane to anchor on
+            raise RuntimeError("pool price is zero at fork time")
+        t = M.tick_at_price(p)
+        tl = (math.floor(t + math.log(1 - half_range) / M.LOG_BASE) // 60) * 60
+        tu = (math.ceil(t + math.log(1 + half_range) / M.LOG_BASE) // 60) * 60
+        sc, sl = M.sqrt_price_at_tick(int(t)), M.sqrt_price_at_tick(tl)
+        liq = int(usd_below * 1e6 * M.Q96 // (sc - sl))
+        self.fork.send(DEPLOYER, self.c, "seed", tl, tu, liq)
 
     def price(self) -> int:
         return self.vault.call("poolPrice")
