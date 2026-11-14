@@ -31,8 +31,8 @@ export const CONFIG = {
     enforcer: null,
     hedgeTreasury: null,
     feeRecipient: null,
-    relayerUrl: '/elysium-api/sa/onboard', // POST {owner, kind, delegation, permit} -> {account, tx}
-    statusUrl: '/elysium-api/sa/status', // keeper status (ledger, fees); optional
+    relayerUrl: '/elysium-api/sa/onboard', // POST {owner, kind, delegation, permit} -> 202 {ok, state, account} (keeper/elysium_keeper/sa_api.py)
+    statusUrl: '/elysium-api/sa/status', // GET ?owner= -> onboarding state + keeper summary; null disables
     delegationDays: 180,
     // Delegation Framework v1.3.0 (canonical addresses) and ERC-4337 EntryPoint v0.7
     delegationManager: '0xdb9B1e94B5b69Df7e401DDbedE43491141047dB3',

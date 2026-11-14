@@ -1,0 +1,62 @@
+# Smart-account relayer API (keeper/elysium_keeper/sa_api.py): validates onboarding requests and drops them into the
+# keeper's queue directory. It holds NO key and never signs; the SA keeper (sa-run) sends the transactions.
+#
+# One-time setup (not done by this file):
+#   useradd --system --no-create-home --shell /usr/sbin/nologin --gid elysium-keeper elysium-sa-api
+#   install -d -o elysium-keeper -g elysium-keeper -m 2770 /var/lib/elysium-keeper/sa-requests   # queue (setgid)
+#   install -d -o elysium-keeper -g elysium-keeper -m 0750 /var/lib/elysium-keeper/sa-status     # keeper writes
+#   /etc/elysium-sa-api/sa-api.json: same `chain` (rpc_url = the public Elysium RPC, signer "readonly") and `sa`
+#   (module, requests_dir, status_path, api_*) as the SA keeper's config; no keystore, no env secrets.
+#   nginx: keeper/deploy/nginx_elysium_api.conf
+[Unit]
+Description=Elysium smart-account relayer API (validate + enqueue, no keys)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=elysium-sa-api
+Group=elysium-keeper
+UMask=0027
+WorkingDirectory=/opt/elysium-lp-vault/keeper
+ExecStart=/usr/bin/python3 -m elysium_keeper sa-api --config /etc/elysium-sa-api/sa-api.json
+Restart=always
+RestartSec=5
+
+# filesystem: everything read-only; the keeper's state dir is hidden except the queue (rw) and the status file (ro)
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+TemporaryFileSystem=/var/lib/elysium-keeper:ro
+BindPaths=/var/lib/elysium-keeper/sa-requests
+BindReadOnlyPaths=/var/lib/elysium-keeper/sa-status
+ReadWritePaths=/var/lib/elysium-keeper/sa-requests
+InaccessiblePaths=-/etc/elysium-keeper
+
+# privileges
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+MemoryMax=256M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

@@ -8,6 +8,14 @@
 // A wallet that is already a MetaMask smart account (EIP-7702, EIP7702StatelessDeleGator) can use itself as the
 // account: one signature, the funds never leave the wallet.
 // Exit = one transaction from the wallet: revoke the delegation and close every position into the account.
+//
+// Relayer API (keeper/elysium_keeper/sa_api.py, behind nginx at /elysium-api/sa/):
+//   POST onboard {owner, kind, delegation, permit{amount, deadline, v, r, s, token, spender} | null}
+//        -> 202 {ok, state: 'queued', owner, account, kind, duplicate} | 4xx {ok: false, error, detail}
+//   GET  status?owner=0x.. -> {ok, owner, account, kind, state: none|queued|failed|onchain|active|revoked, error,
+//        summary: {value, usdc, hype, contributed, profit, hwm, fees_paid, hedge_equity, net_margin, until,
+//                  positions, stale, hedge: {short, equity, margin_in, margin_out, closed}} | null,
+//        keeper: {last_tick, age_s, fresh, paused, price}}
 import {
   createPublicClient, http, parseAbi, encodeFunctionData, decodeAbiParameters, encodeAbiParameters, keccak256,
   concat, getAddress, hashTypedData, formatUnits, parseUnits, parseSignature, stringToHex, toHex, pad,
@@ -181,7 +189,7 @@ async function waitTx(hash) {
 async function load() {
   S.err = '';
   if (!S.account) { render(); return; }
-  if (MOCK) { S.info = mockInfo(); S.sa = S.info.address; S.kind = S.info.kind; render(); return; }
+  if (MOCK) { S.info = mockInfo(); S.sa = S.info.address; S.kind = S.info.kind; if (!S.info.registered) await showRelayerState(); render(); return; }
   const code = await pub.getCode({ address: S.account });
   S.is7702 = !!code && code.toLowerCase() === ('0xef0100' + SA.eip7702Impl.slice(2)).toLowerCase();
   const hybrid = await hybridAddress(S.account);
@@ -194,7 +202,31 @@ async function load() {
   S.sa = a;
   S.info = await readAccount(a);
   S.kind = S.info.registered ? (S.info.kind === 2 ? 'eip7702' : 'hybrid') : null;
+  if (!S.info.registered && S.busy == null) await showRelayerState();
+  else if (S.msg === QUEUED_MSG) S.msg = '';
   render();
+}
+const QUEUED_MSG = 'Your account is being created. This page updates by itself.';
+let relayerPoll = null;
+async function showRelayerState() {
+  const st = await relayerStatus(S.account);
+  if (st?.state === 'queued') {
+    S.msg = QUEUED_MSG;
+    clearTimeout(relayerPoll);
+    relayerPoll = setTimeout(() => { if (S.busy == null) load(); }, 5000);
+  } else if (st?.state === 'failed' && !S.err) {
+    S.err = `The last attempt did not go through (${st.error || 'unknown reason'}). Nothing was moved; you can try again.`;
+  }
+}
+/** Relayer/keeper view of the wallet's onboarding (GET status). null if the API is unreachable. */
+async function relayerStatus(owner) {
+  if (MOCK) return S.mock === 'queued' ? { state: 'queued' } : null;
+  if (!SA.statusUrl) return null;
+  try {
+    const res = await fetch(`${SA.statusUrl}?owner=${owner}`, { headers: { accept: 'application/json' }, cache: 'no-store' });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch { return null; }
 }
 async function readAccount(a) {
   const r = (fn, args = []) => pub.readContract({ address: SA.module, abi: MODULE_ABI, functionName: fn, args });
@@ -232,7 +264,9 @@ async function start() {
     const domSep = keccak256(encodeAbiParameters([{ type: 'bytes32' }, { type: 'bytes32' }, { type: 'bytes32' }, { type: 'uint256' }, { type: 'address' }],
       [keccak256(stringToHex('EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)')), keccak256(stringToHex('DelegationManager')), keccak256(stringToHex('1')), BigInt(CHAIN.id), SA.delegationManager]));
     if (local !== keccak256(concat(['0x1901', domSep, onchain]))) throw new Error('Delegation encoding mismatch; not signing');
-    d.signature = await signTyped(typed);
+    // v in {27, 28}: the account's ERC-1271 check (OpenZeppelin ECDSA) and the relayer accept nothing else
+    const ds = parseSignature(await signTyped(typed));
+    d.signature = concat([ds.r, ds.s, toHex(ds.v != null ? (Number(ds.v) < 27 ? Number(ds.v) + 27 : Number(ds.v)) : 27 + ds.yParity, { size: 1 })]);
     let permit = null;
     if (!use7702) {
       S.busy = 1; render();
@@ -240,16 +274,37 @@ async function start() {
     }
     S.busy = S.steps.length - 1; render();
     const body = { owner: S.account, kind: use7702 ? 'eip7702' : 'hybrid', delegation: { ...d, salt: d.salt.toString() }, permit };
-    const res = await fetch(SA.relayerUrl, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
-    if (!res.ok) throw new Error(`Relayer: ${res.status} ${await res.text()}`);
-    for (let i = 0; i < 60; i++) {
-      const acc = await pub.readContract({ address: SA.module, abi: MODULE_ABI, functionName: 'account', args: [account] });
-      if (acc.delegationHash !== pad('0x00', { size: 32 })) break;
+    const res = await fetch(SA.relayerUrl, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify(body) });
+    let out = null;
+    try { out = await res.json(); } catch { /* not JSON (proxy error) */ }
+    if (!res.ok || !out?.ok) throw new Error(relayerError(res.status, out));
+    if (getAddress(out.account) !== getAddress(account)) throw new Error('Relayer returned a different account; stopping');
+    // the keeper picks the request up on its next tick (about a minute): follow it through the status endpoint,
+    // the chain is the fallback and the final word
+    let live = false;
+    for (let i = 0; i < 90 && !live; i++) {
       await new Promise((r) => setTimeout(r, 2000));
+      const st = await relayerStatus(S.account);
+      if (st?.state === 'failed') throw new Error(`The relayer could not create the account: ${st.error || 'unknown reason'}`);
+      if (st && ['onchain', 'active'].includes(st.state)) live = true;
+      else if (i % 5 === 4) {
+        const acc = await pub.readContract({ address: SA.module, abi: MODULE_ABI, functionName: 'account', args: [account] });
+        live = acc.delegationHash !== pad('0x00', { size: 32 });
+      }
     }
-    S.busy = null; S.steps = null; S.msg = 'Your account is live. The manager starts within a few minutes.';
+    S.busy = null; S.steps = null;
+    S.msg = live ? 'Your account is live. The manager starts within a few minutes.' : 'Your request is queued. The account appears here within a few minutes.';
     await load();
   } catch (e) { S.busy = null; S.steps = null; S.err = plain(e); render(); }
+}
+function relayerError(status, out) {
+  const d = out?.detail ? `: ${out.detail}` : '';
+  if (status === 429) return 'Too many attempts. Please wait a minute and try again.';
+  if (out?.error === 'already_registered') return 'This account is already set up. Reload the page.';
+  if (out?.error === 'already_queued') return 'A request for this wallet is already being processed. Please wait.';
+  if (out?.error === 'permit_amount') return `Amount not accepted${d}`;
+  if (status >= 500 || !out) return 'The relayer is unavailable right now. Nothing was moved; please try again shortly.';
+  return `Relayer refused the request (${out.error})${d}`;
 }
 async function signPermit(amount) {
   const [name, sep, nonce] = await Promise.all([
@@ -269,7 +324,7 @@ async function signPermit(amount) {
     message: { owner: S.account, spender: SA.module, value: amount, nonce, deadline } });
   const p = parseSignature(raw);
   const v = p.v != null ? Number(p.v) : 27 + p.yParity;
-  return { amount: amount.toString(), deadline: deadline.toString(), v: v < 27 ? v + 27 : v, r: p.r, s: p.s };
+  return { amount: amount.toString(), deadline: deadline.toString(), v: v < 27 ? v + 27 : v, r: p.r, s: p.s, token: USDC, spender: SA.module };
 }
 
 // ------------------------------------------------------------------ exit / withdraw (one transaction from the wallet)
@@ -362,7 +417,7 @@ async function addFunds() {
 function mockInfo() {
   const e6 = (x) => BigInt(Math.round(x * 1e6));
   const base = { address: '0x5A00000000000000000000000000000000000c1E', kind: 1, until: Math.floor(Date.now() / 1000) + 179 * 86400, price: e6(40.12), hwm: 0n, walletUsdc: e6(5000) };
-  if (S.mock === 'new') return { ...base, registered: false, active: false, contributed: 0n, value: 0n, usdc: 0n, hype: 0n, hedgeEquity: 0n, netMargin: 0n, feesPaid: 0n, deployed: false, positions: [] };
+  if (S.mock === 'new' || S.mock === 'queued') return { ...base, registered: false, active: false, contributed: 0n, value: 0n, usdc: 0n, hype: 0n, hedgeEquity: 0n, netMargin: 0n, feesPaid: 0n, deployed: false, positions: [] };
   const live = { ...base, registered: true, active: true, contributed: e6(3000), value: e6(3041.27), usdc: e6(92.4), hype: 10n ** 16n, hedgeEquity: e6(752.1), netMargin: e6(750), feesPaid: e6(6.15), hwm: e6(34.9), deployed: true,
     positions: [{ tokenId: 1287n, tickLower: -239580, tickUpper: -238980, liquidity: 10n ** 13n }] };
   if (S.mock === 'live') return live;
@@ -372,9 +427,9 @@ function mockInfo() {
 function mockBar() {
   if (!MOCK) return;
   $('mockbar').classList.remove('hidden');
-  $('mockbar-inner').innerHTML = ['disconnected', 'new', 'live', 'exited', 'withdrawn'].map((m) => `<button data-m="${m}" class="${S.mock === m ? 'on' : ''}">${m}</button>`).join('');
+  $('mockbar-inner').innerHTML = ['disconnected', 'new', 'queued', 'live', 'exited', 'withdrawn'].map((m) => `<button data-m="${m}" class="${S.mock === m ? 'on' : ''}">${m}</button>`).join('');
   $('mockbar-inner').querySelectorAll('button').forEach((b) => (b.onclick = async () => {
-    S.mock = b.dataset.m; S.account = S.mock === 'disconnected' ? null : '0xA11cE00000000000000000000000000000000001'; await load(); }));
+    S.mock = b.dataset.m; S.msg = ''; S.err = ''; S.account = S.mock === 'disconnected' ? null : '0xA11cE00000000000000000000000000000000001'; await load(); }));
 }
 
 // ------------------------------------------------------------------ view

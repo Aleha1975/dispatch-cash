@@ -7,6 +7,7 @@
   python -m elysium_keeper sa-run     --config cfg.json [--once]   # per-client smart accounts (LPManagerModule)
   python -m elysium_keeper sa-status  --config cfg.json            # accounts, ledger, fees; sends nothing
   python -m elysium_keeper sa-onboard --config cfg.json --request req.json   # relayer: deploy account + onboard
+  python -m elysium_keeper sa-api     --config cfg.json            # relayer HTTP endpoint: validate + enqueue only
 """
 from __future__ import annotations
 
@@ -20,7 +21,7 @@ from .infra import State
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="elysium_keeper")
-    ap.add_argument("cmd", choices=["run", "status", "margin", "sa-run", "sa-status", "sa-onboard"])
+    ap.add_argument("cmd", choices=["run", "status", "margin", "sa-run", "sa-status", "sa-onboard", "sa-api"])
     ap.add_argument("--request", default=None, help="sa-onboard: onboarding request JSON (from the web flow)")
     ap.add_argument("--config", required=True)
     ap.add_argument("--once", action="store_true")
@@ -41,6 +42,13 @@ def main(argv=None):
         st.save()
         print(json.dumps({"in_transit_usdc": st.d.get("in_transit_usdc", 0) / 1e6,
                           "hl_sim": st.d.get("hl_sim")}))
+        return
+
+    if a.cmd == "sa-api":  # no signer, no keeper key: validates and writes into sa.requests_dir
+        from .infra import Log
+        from .sa_api import serve
+
+        serve(cfg, Log(cfg.log_path, cfg.name + "-api"))
         return
 
     if a.cmd.startswith("sa-"):

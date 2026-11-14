@@ -374,11 +374,41 @@ enforcer/treasury/fee recipient), L-15 (min-out and a sqrtPrice limit at the anc
   `chain.allow_live_chain`; `readonly` plan mode; RPC sends a User-Agent and refuses Alchemy.
 - Relayer: deploy the HybridDeleGator (SimpleFactory) + `module.onboard` in one Multicall3 `aggregate3` transaction, after checking the
   counterfactual address and simulating.
+- Status file (`sa.status_path`): written atomically every tick (per account: owner, kind, active/revoked, expiry, value, idle,
+  positions, contributed/profit/HWM/fees, hedge equity / net margin, ledger share; an account whose tick failed keeps its last row
+  flagged `stale`). No alerts, errors or actions in it: it is served to clients by the relayer API.
+
+### Relayer API (`keeper/elysium_keeper/sa_api.py`, `python -m elysium_keeper sa-api`)
+
+Stdlib `http.server` on 127.0.0.1 (nginx proxies `/elysium-api/sa/`, `keeper/deploy/nginx_elysium_api.conf`); no key, never signs,
+only validates and writes `<owner>.json` into `sa.requests_dir` (temp file + `link`, so it is atomic and never overwrites).
+
+- `POST /elysium-api/sa/onboard` `{owner, kind, delegation, permit}` → `202 {ok, state: "queued", owner, account, kind}`;
+  errors `{ok: false, error, detail}` (400 schema/shape, 401 signature, 409 `already_registered` / `already_queued`, 411/413/415,
+  429, 503). Checks, all before anything is queued: strict schema (exact keys, hex shapes, uint as number or decimal string, no
+  floats / duplicate keys, body ≤ 16 KB); the delegation equals `module_delegation(account, module, enforcer, treasury, feeRecipient,
+  until, salt)` (delegate = module, ROOT, exactly the custody caveat with the module's terms + TimestampEnforcer `0 ‖ until`, empty
+  args, 65-byte signature) with `until ∈ [now + MIN_DELEGATION_LIFETIME + 1 h, now + 400 d]`; account = CREATE2 HybridDeleGator of the
+  owner (owner not a protocol address) or, for 7702, the owner EOA carrying the canonical designator; both EIP-712 signatures recover
+  to the owner (low s, v ∈ {27, 28}, DM domain on 99901); delegation not disabled; account not registered; permit (hybrid only):
+  token = `module.asset()`, spender = module, `0 < value ≤` the wallet's USDC balance, deadline in [now + 10 min, now + 1 day],
+  signed over the owner's current nonce (a used or front-run permit no longer verifies). At start the API cross-checks the module's
+  DM / TimestampEnforcer / factory / hybrid impl / 7702 impl / account salt / `enforcerTermsHash` against the constants it hashes with.
+  One pending request per owner (an identical resubmission returns 200); rate limits per client IP (before any work) and per owner
+  (after the delegation signature proved the owner).
+- `GET /elysium-api/sa/status?owner=` → `{owner, account, kind, state, error, summary, keeper}`; `state` ∈ none / queued / failed (with
+  the keeper's reason, URLs stripped) / onchain (registered, not yet in the keeper's file) / active / revoked; `summary` from the
+  keeper's status file; `keeper` = last tick, age, fresh, paused, anchor.
+- `GET /elysium-api/sa/health` → `{ok, pending, chain_id, module, keeper}` (503 if the queue is not writable).
+- Logs: addresses and outcome codes only (the default access log, which prints IPs, is off). systemd unit
+  `keeper/deploy/elysium-sa-api.service`: dedicated user in the keeper's group, `ProtectSystem=strict`, the keeper's state dir hidden
+  except the queue (rw) and the status dir (ro), `NoNewPrivileges`, no capabilities, syscall filter.
 
 ### Web (`web/account.html`, `web/account.js`)
 
 Plain MetaMask `eth_signTypedData_v4` on 99901: (1) the delegation (hash checked against `DelegationManager.getDelegationHash` before
-signing), (2) the USDC permit (spender = module); POST to the relayer; the page shows the counterfactual account. A wallet already
+signing), (2) the USDC permit (spender = module); POST to the relayer API, then follow `GET status` until the account is on
+chain (the chain read is the fallback); a queued or failed request is shown on reload. The page shows the counterfactual account. A wallet already
 upgraded to `0x63c0…` can use itself (one signature). Account view (value, net deposits, profit, fees, HWM, idle, hedge margin, ranges,
 expiry), "Add USDC", "Stop and close positions" (one transaction; the user-op hash is checked against the account's own
 `getPackedUserOperationTypedDataHash` before signing), "Withdraw to wallet". `?mock=1` walks through every state without a wallet.
@@ -399,6 +429,10 @@ e2e checks against the chain.
   multicall, SwapExecutor, gas.
 - `test/fork/SmartAccount.fork.t.sol` (3, `ELYSIUM_FORK=true`): canonical framework on 99901, hybrid end to end with the real USDC
   permit (onboard → margin → swap → mint → volume → fee → exit → margin back into the account), 7702 end to end.
+- Relayer API: `tests/test_sa_api.py` (schema rejects, bad / high-s / wrong-chain signatures, delegate / caveats / expiry, permit
+  edge cases and replay after the nonce moved, already registered / disabled, 7702 designator, idempotency, per-IP and per-owner
+  limits, status states, the HTTP layer) and `tests/test_sa_api_e2e_fork.py` (anvil fork: web-shaped body → API over HTTP → queue →
+  keeper tick and `sa-onboard --request` → two accounts live → status active → replays 409 → revoke → status revoked).
 - Keeper: `tests/test_sa_unit.py` (16: fee mirror, ledger, EIP-712 vs `eth_account`'s independent encoder, addresses) and
   `tests/test_sa_e2e_fork.py` (anvil fork: deploy script, two clients via relayer and request queue, ticks, convergence, fee, one-tx exit,
   wind-down, restart no-op).
@@ -423,7 +457,8 @@ A full re-range (burn + swap + mint) is ~1.1–1.3M gas, ≈ 0.0006 HYPE at 0.5 
 1. Audit pending (`docs/audit_sa_round1.txt`). The enforcer's v4 decoding is the critical piece.
 2. MetaMask still does not 7702-upgrade on 99901 (section 3): the 7702 path is built and tested but only usable once it does; until then
    MetaMask may also refuse the 7702 self-call exit (the HybridDeleGator path does not depend on it).
-3. The relayer HTTP endpoint (`/elysium-api/sa/onboard` → `sa.requests_dir`) is not written; the keeper side is.
+3. The relayer HTTP endpoint is written (`sa_api.py`, branch `sa-relayer`) but not deployed: needs the user/dirs, the API config,
+   the nginx include, and an `sa-run` keeper unit with `sa.requests_dir` / `sa.status_path` set (see the unit file header).
 4. Hedge margin top-ups are limited to 35%/day of idle USDC by the enforcer (by design); a client whose value is all in the LP gets
    top-ups only after the keeper frees USDC.
 5. Fee leakage: a client can take profit out between keeper touches (booked as a withdrawal); fees collected by the client directly

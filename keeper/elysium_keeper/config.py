@@ -101,7 +101,21 @@ class SACfg:
     fee_idle_margin: float = 1.1  # free idle USDC to fee x 5 x this before chargeFee (enforcer: fee <= 20% idle)
     report_every_s: int = 1800  # re-report the anchor at least this often (fees need maxPriceAge freshness)
     ledger_path: str = "sa_ledger.json"
-    requests_dir: str = ""  # relayer: onboarding requests (*.json) dropped by the web backend
+    requests_dir: str = ""  # relayer: onboarding requests (*.json) dropped by the web backend (sa-api)
+    status_path: str = ""  # keeper writes the per-account summary here every tick (served by sa-api)
+    # sa-api (relayer HTTP endpoint: validates and enqueues, never signs)
+    api_host: str = "127.0.0.1"
+    api_port: int = 8790
+    api_trust_proxy: bool = True  # take the client IP from X-Real-IP only when the peer is loopback (nginx)
+    api_max_body: int = 16384
+    api_ip_onboard_per_min: int = 6
+    api_owner_onboard_per_hour: int = 6
+    api_ip_status_per_min: int = 120
+    api_permit_min_window_s: int = 600  # the permit must stay valid this long after submission (queue latency)
+    api_permit_max_window_s: int = 86400
+    api_delegation_margin_s: int = 3600  # expiry >= now + module MIN_DELEGATION_LIFETIME + this margin
+    api_delegation_max_days: int = 400
+    api_status_stale_s: int = 600  # keeper status file older than this: reported as stale
 
 
 @dataclass

@@ -466,7 +466,8 @@ class SAKeeper:
             self._sent = 0
             try:
                 s = self.account_tick(a, price, g, now, hw)
-                rows[a] = {"kind": s.kind, "active": s.active, "value": s.value / 1e6, "usdc": s.usdc / 1e6,
+                rows[a] = {"owner": s.owner, "kind": s.kind, "active": s.active, "revoked": s.revoked,
+                           "until": s.until, "value": s.value / 1e6, "usdc": s.usdc / 1e6,
                            "hype": s.native / 1e18, "positions": [vars(p) for p in s.positions],
                            "contributed": s.contributed / 1e6, "profit": s.profit / 1e6, "hwm": s.hwm / 1e6,
                            "fees_paid": s.fees_paid / 1e6, "hedge_equity": s.hedge_equity / 1e6,
@@ -495,8 +496,46 @@ class SAKeeper:
             self.status.update({"ok": not errors, "errors": errors, "accounts": rows, "paused": g.paused,
                                 "tick_seconds": round(time.time() - t0, 2), "last_tick_wall": int(time.time()),
                                 "actions": self.actions[-20:], "alerts": self.alert.recent[-15:]})
+        try:
+            self.write_status_file(rows, g, now)
+        except Exception as e:
+            self.log("status_file_failed", error=str(e))
         self.log("tick", ok=not errors, accounts=len(rows), errors=errors)
         return self.get_status()
+
+    def write_status_file(self, rows: dict, g: GlobalSnap, now: int):
+        """Per-account summary for the relayer API (sa-api serves it at /elysium-api/sa/status). Atomic replace;
+        group-readable. An account whose tick failed keeps its previous row, flagged `stale`. No alerts, errors or
+        actions: the file is served to clients."""
+        path = self.sa.status_path
+        if not path:
+            return
+        prev = getattr(self, "_status_rows", None)
+        if prev is None:  # after a restart: carry the last written rows over
+            try:
+                with open(path) as fh:
+                    prev = json.load(fh).get("accounts") or {}
+            except (OSError, ValueError, AttributeError):
+                prev = {}
+        out_rows = {a: dict(r, stale=False) for a, r in rows.items()}
+        for a, r in prev.items():
+            if a not in out_rows:
+                out_rows[a] = dict(r, stale=True)
+        self._status_rows = out_rows
+        price = self.status.get("price") or {}
+        doc = {"version": 1, "module": self.r.m.address, "written_at": int(time.time()), "last_tick": now,
+               "paused": g.paused, "price": {"anchor": g.last_price / 1e6, "pool": price.get("pool"),
+                                             "status": price.get("status")},
+               "accounts": out_rows}
+        if os.path.dirname(path):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp{os.getpid()}"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o640)
+        with os.fdopen(fd, "w") as fh:
+            json.dump(doc, fh, default=str)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
 
     def get_status(self) -> dict:
         with self.lock:

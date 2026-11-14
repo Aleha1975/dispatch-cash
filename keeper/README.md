@@ -26,6 +26,8 @@ account. The tests run on a local anvil fork, with HL in dry-run.
 | `abi/UniV4LPVault.json` | Vault ABI extracted from `forge build` |
 | `config/*.json` | Fork configs and a live template |
 | `deploy/elysium-keeper@.service` | systemd template unit |
+| `elysium_keeper/sa_api.py` | Smart-account relayer API (`sa-api`): validates onboarding requests, enqueues them for `sa-run`; no keys |
+| `deploy/elysium-sa-api.service`, `deploy/nginx_elysium_api.conf` | Hardened unit and nginx locations for `sa-api` |
 | `tests/` | Unit tests (`test_strategy.py`) and fork end-to-end tests (`test_e2e_fork.py`, `forkutil.py`) |
 
 ## Per-tick sequence (default every 60 s; one settlement at least every `settle_interval_s` = 1 h)
