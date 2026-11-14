@@ -1,0 +1,117 @@
+Elysium LP smart accounts: per-client MetaMask Delegation Framework accounts managed through one module, with a custom custody caveat enforcer - audit round 3 (verification of the round-2 root-cause fixes, in particular the new flow-booking design)
+
+SCOPE
+- src/sa/LPManagerModule.sol: the keeper's only delegate (onboarding, revoke, keeper actions, hedge margin / equity, fee,
+  guardian approvals, pause, multicall).
+- src/sa/SABook.sol (NEW, external linked library): the books. sync (live - snapshot booked at the anchor), value, and the
+  computed effect of LP adds / removals from PoolManager state.
+- src/sa/SALib.sol (external linked library): delegation shape check, account identity, registration, permit-only pull,
+  HWM fee, budgets (movePrice, moveHedge, turnover), execution builders with approval resets, verified transfers out.
+- src/sa/SwapExecutor.sol: CHANGED - records (count, paid, received) per payer in transient storage (lastSwap).
+- src/sa/SAWindow.sol, src/sa/ElysiumCustodyEnforcer.sol, src/sa/vendor/DelegationFramework.sol (unchanged since round 2).
+- script/DeploySA.s.sol (new precondition checks).
+- Reused unchanged: src/V4PositionMath.sol, src/VaultTimelock.sol. The pooled vault is shelved and OUT of scope.
+solc 0.8.26, via-IR, optimizer runs 1, evm cancun. OpenZeppelin 5.4.0, v4-core/periphery from lib/. NOT deployed.
+Runtime: module 23,899 B (677 under EIP-170), SALib 16,174 B, SABook 6,452 B, enforcer 7,802 B, SwapExecutor 3,627 B.
+Foundry: test/sa/SARound2.t.sol (25, new), test/sa/SARegressions.t.sol (33), test/sa/LPManagerModule.t.sol (31),
+test/sa/CustodyEnforcer.t.sol (27), test/fork/SmartAccount.fork.t.sol (3, ELYSIUM_FORK=true). Keeper (Python) unit +
+anvil-fork e2e.
+
+SOURCE
+{{REPO_URL}} at commit {{COMMIT}}. Part of the submission:
+- docs/audit/sa_round2_report_1225.md: round-2 report (0 C, 1 H, 4 M, 16 L, 11 I).
+- docs/audit/sa_round2_rootcause.md: findings grouped into root-cause classes B' (books), D' (price trust), A''
+  (consent), with the invariant claimed, the structural change and the siblings we checked. WRITTEN BEFORE THE FIXES.
+- docs/audit/sa_round2_response.md: per-finding status, commits, regression tests, rebuttals, residuals.
+- docs/SMART_ACCOUNT_DESIGN.md section 6: as-built design.
+- Earlier rounds: docs/audit/sa_round1_*.md.
+
+CHAIN CONTEXT
+Unchanged from round 2: Elysium mainnet, chain id 99901, Arbitrum Orbit (Nitro) L2, native gas token HYPE, Prague/7702.
+Pool: PoolKey(native HYPE, USDC 0xb47c4C8F73F009CC0C0d3f92B388d13E293F0B65, fee 3000, tickSpacing 60, hooks 0). PoolManager
+0xE2e105d3F7209A9DA11f83cCf3E7398a753823F1, PositionManager 0x1d1C51b9d07fD27d36412A2b66CC23D19Eb3E518, Permit2
+0x000000000022D473030F116dDEE9F6B43aC78BA3. Delegation Framework v1.3.0 (DelegationManager 0xdb9B1e94B5b69Df7e401DDbedE43491141047dB3).
+Pool depth is a few hundred thousand USD.
+
+WHAT CHANGED (details in the response file)
+- Books (class B'): the snapshot (idle USDC, idle HYPE, each tracked position's liquidity) is never read back from the
+  account after a module action. The module adds its own effect, computed from state the account cannot write: PoolManager
+  slot0 and position info BEFORE the action plus the liquidity it asked for (adds rounded up, removals rounded down, plus
+  uncollected fees), the SwapExecutor's per-payer transient record (exactly one new swap, received >= minOut), the
+  verified recipient delta of a transfer, the deposited amount. Claim: live - snapshot is exactly the client's own flow,
+  inside or outside a bracket. sync books it valued with the SAME function and SAME price as value() (the anchor), and
+  only while the anchor is trusted; otherwise it stays pending. Claim: a client flow cannot change profit.
+  Removed: _snap, _post, _conserved, _checkAdd, the min/max booking price. Registration books nothing; deposit / onboard
+  book USDC at face value. Removals remove only min(requested, snapshot) as booked liquidity.
+- Fee: needs a trusted anchor, syncs first, charges on min(V(anchor), V(pool)) - contributed.
+- Price trust (class D'): lastPriceClipped() is a view (anchor outside the band of the keeper's last report) and clears
+  itself; fresh = age <= maxPriceAge, not clipped, pool within band of the anchor; trusted = fresh AND the anchor value
+  unchanged for minPriceStable (new param, [60 s, 1 day], default 300 s). Guardian range used only when move > room.
+  hedgeClipped cleared only by a lower report or an approval. Band measured against the reference.
+- Consent (A''): onboard needs a permit that succeeds; a front-run permit is accepted only for the same signature
+  (nonce - 1, deadline not passed, recovers to the owner, allowance == amount). No standing allowance is ever used.
+- Lows: L-1, L-2, L-5, L-6, L-7, L-8, L-9, L-11, L-14, L-16 fixed; L-4, L-13, L-15 partly; L-3, L-10, L-12 acknowledged.
+
+TASK 1: VERIFY THE STRUCTURAL FLOW-BOOKING CLAIM (highest priority)
+The claim: "live - snapshot equals exactly what the client did, and since sync values it with the same function and
+price as value(), no client action - inside or outside a module bracket, through upgraded account code, hooks, receive,
+isValidSignature or executeFromExecutor - can change profit; only market moves on booked holdings, LP fee growth and
+hedge equity change it."
+1. Is every module write to snapAsset / snapBase / snapLiquidity equal to the true effect of the module's own call on the
+   account, to the wei (or rounded against the client), on EVERY path? Compare SABook.lpAdd / lpRemove with what
+   PositionManager / PoolManager actually do: slot0 read before vs. during the unlock, fee collection on increase /
+   decrease / burn, SETTLE_PAIR / TAKE_PAIR / SWEEP / CLOSE_CURRENCY, native refunds, positions at tick boundaries,
+   zero-liquidity positions, liquidity the client added to or removed from a tracked position directly.
+2. Can account code make the module's computed effect differ from the real one in the client's favour (e.g. move slot0
+   inside the bracket, re-enter PositionManager, run a second swap through SwapExecutor so the record is not the
+   module's swap, write the transient record slots from another context)?
+3. Is sync's valuation of live - snapshot really the same function as value()? Look for terms in one and not the other:
+   uncollected fees, hedge equity, positions dropped (burned / transferred by the client), positions added by the client,
+   rounding of negative base deltas, int256 snapshots below zero.
+4. Can a flow be booked twice or never (pending forever while the anchor is never trusted; a position dropped while
+   pending; revoke / re-register; MAX_POSITIONS)?
+5. The fee: can profit as charged (min(V(anchor), V(pool)) - contributed after a trusted sync) exceed the client's real
+   gain? Consider a keeper that walks the anchor within the window and holds it minPriceStable, a pool held displaced for
+   minPriceStable, a multicall with reportPrice + chargeFee, hedge equity reports.
+6. Our rebuttal of booking at min/max in the client's favour (response, Rebuttal 1): does the one-price design open a
+   path the min/max design would have closed?
+
+TASK 2: SIBLING PATHS
+List any other path that shares a root cause with a round-2 finding and is still open, especially where the fix moved
+the problem (e.g. a flow that is now "pending" but can be made to be booked at a price of the attacker's choosing; a
+check that the trusted gate turns into a liveness problem for fees, margin sends or the client).
+
+TASK 3: REBUTTALS AND RESIDUALS
+Review the three rebuttals and the acknowledged residuals in docs/audit/sa_round2_response.md. Say whether each holds.
+
+TASK 4: LENSES / AREAS THAT RECEIVED LESS COVERAGE IN ROUND 2 (please run them)
+Round 2's coverage caveats: no code was executed; Delegation Framework internals from memory; SwapExecutor, VaultTimelock,
+DeploySA, keeper and web read in less depth. This round:
+- execute the code: build and run the Foundry suites if policy allows; otherwise attach concrete traces. The offline
+  replica (test/sa/SATestBase.sol) runs real v4 + Delegation Framework v1.3.0 bytecode; test/sa/SAHostile.sol has hostile
+  account modes 0-6 (incl. skipping executions, adding to other positions, skimming after an executor call).
+- SwapExecutor (changed): the transient record (slot derivation, n / paid / received, payer = msg.sender), unlock
+  callback, native refunds, price limit, exact-input semantics, reentrancy from account code during the swap.
+- Delegation Framework v1.3.0 internals from the fixture bytecode or the v1.3.0 source, not from memory: redeemDelegations
+  hooks order, DM pause, HybridDeleGator upgradeToAndCall, EIP7702StatelessDeleGator executeFromExecutor, ERC-1271.
+- VaultTimelock as the module owner: rotation order, canceller powers (I-6), delay bounds.
+- DeploySA.s.sol: simulate it (preconditions, canonical address derivation, post-broadcast hybridAddress check).
+- math-precision on SABook: principal rounding vs. PoolManager, _mul toward minus infinity, liquidityValue at
+  sqrt(price) vs. principal at slot0, int256 casts.
+- the keeper (keeper/elysium_keeper/sa_chain.py, sa_keeper.py) where on-chain safety assumes operator behaviour: the
+  anchor hold while a fee is due, fee timing, minOut 0 in swaps, pending-flow display.
+
+TRUST MODEL AND ROLES (unchanged from round 2)
+client: owns the account, every token and position NFT; acts directly at any time; revoke() stops management. module owner
+= VaultTimelock (>= 24 h). keeper (hot key): every module action within on-chain budgets. guardian: pause, one-shot price
+ranges and hedge approvals. relayer: deploys accounts, first registration and onboard (permissionless). hedgeTreasury /
+feeRecipient: immutable operator addresses.
+
+OUT OF SCOPE (INTENTIONAL)
+Keeper honesty within the bounds; Hyperliquid, the bridge, the treasury's custody, the off-chain ledger; Uniswap v4,
+Permit2, USDC and the Delegation Framework themselves (their interaction with our contracts is in scope); the shelved
+pooled vault.
+
+DELIVERABLE
+Findings with severity, a concrete trace or a Foundry test, and the smallest fix. For every round-2 finding state: fixed /
+partly fixed / not fixed / regressed. State which lenses ran and which areas received less coverage.
