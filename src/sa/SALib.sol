@@ -218,7 +218,8 @@ library SALib {
     }
 
     /// @notice The module may act for `a`: registered, not revoked by the client, not expired, and the account's
-    ///         code / owner unchanged since registration (L-14: a change is a revocation). The DelegationManager's
+    ///         7702 designator / hybrid owner unchanged since registration (L-14: the module stops acting; the
+    ///         delegation itself stays valid in the DM, the client re-registers or revokes). The DelegationManager's
     ///         own disabled flag is checked by the DM at redemption (and by LPManagerModule.isActive).
     function live(Account storage s, address a, bytes32 designatorHash) public view returns (bool) {
         if (s.delegationHash == 0 || s.revoked || block.timestamp >= s.until) return false;

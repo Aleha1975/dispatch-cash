@@ -33,7 +33,7 @@ interface IPositionManagerView {
 ///         |                   |      sqrtPriceLimitX96)            | for native input, else 0 (executor pays msg.sender) |
 ///         | Permit2           | approve(token, spender, amt, exp)  | token = a pool ERC-20; spender = PositionManager or |
 ///         |                   |                                    | SwapExecutor; amt <= delegator balance; expiring in |
-///         |                   |                                    | this block (exp 0 or now); amt 0 always allowed     |
+///         |                   |                                    | this timestamp (exp 0 or now) amt 0 always allowed |
 ///         | pool ERC-20       | approve(Permit2, amt)              | amt <= delegator balance                            |
 ///         | asset (USDC)      | transfer(hedgeTreasury, amt)       | <= HEDGE_DAY_BPS (35%) of the delegator's USDC per  |
 ///         |                   |                                    | sliding 24 h window (fraction of the balance at each|
@@ -308,7 +308,7 @@ contract ElysiumCustodyEnforcer is ICaveatEnforcer {
         if (token == address(0) || (token != currency0 && token != currency1)) revert BadToken(token);
         if (spender != positionManager && spender != swapExecutor) revert BadSpender(spender);
         if (amount == 0) return; // revoking is always fine
-        if (expiration != 0 && expiration != block.timestamp) revert BadExpiration(); // Permit2: 0 = this block
+        if (expiration != 0 && expiration != block.timestamp) revert BadExpiration(); // Permit2: 0 = this timestamp (may span blocks)
         if (amount > IERC20(token).balanceOf(delegator)) revert BadAmount();
     }
 

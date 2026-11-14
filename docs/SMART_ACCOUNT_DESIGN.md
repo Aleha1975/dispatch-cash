@@ -261,21 +261,22 @@ own checks, so they are a fair proxy for the module.
 8. **Missing contracts.** Canonical HybridDeleGatorImpl, SimpleFactory, AllowedTargets and AllowedMethods must be deployed by us at their
    canonical addresses. Verify the code hash against Base after deploying.
 
-## 6. As built (branch `smart-account`, audit SA-1 fixes on `sa-r1-fixes`, SA-2 fixes on `sa-r2-fixes`)
+## 6. As built (branch `smart-account`, audit SA-1 fixes on `sa-r1-fixes`, SA-2 on `sa-r2-fixes`, SA-3 on `sa-r3-fixes`)
 
 ### Contracts (`src/sa/`, solc 0.8.26 via-IR, runs 1; runtime sizes)
 
 | Contract | Bytes | Role |
 |---|---|---|
-| `LPManagerModule` | 23,899 (677 under EIP-170) | The keeper's only delegate. Ownable2Step (owner = `VaultTimelock`), transient reentrancy guard. |
-| `SALib` (external, linked) | 16,174 | Delegation shape check, account identity (CREATE2 derivation / 7702 designator), registration, permit pull, HWM fee, budgets (`movePrice`, `moveHedge`, turnover), execution builders with approval resets, verified transfers out. |
-| `SABook` (external, linked) | 6,452 | The books (SA-2): `sync` (live − snapshot booked at the anchor), `value`, and the computed effect of LP adds / removals from PoolManager state. |
+| `LPManagerModule` | 23,672 (904 under EIP-170) | The keeper's only delegate. Ownable2Step (owner = `VaultTimelock`), transient reentrancy guard. |
+| `SALib` (external, linked) | 17,113 | Delegation shape check, account identity (CREATE2 derivation / 7702 designator), registration, permit pull (each signature once, SA-3), HWM fee, fee gate, budgets (`movePrice` on the trailing range, `moveHedge`, turnover), execution builders with approval resets, verified transfers out. |
+| `SABook` (external, linked) | 6,993 | The books (SA-2): `sync` (SA-3: fees paid out of a tracked position since its checkpoint are yield; then live − snapshot booked at the anchor), `value`, `book` (the computed effect of LP adds / removals from PoolManager state, checkpoint rewritten). |
 | `SAWindow` (internal) | — | Sliding 24 h budget: nine 3 h buckets; any 24 h window admits at most 1x the cap. |
+| `SARange` (internal, SA-3) | — | Trailing 24 h (min, max) of the anchor in nine 3 h buckets: the drift budget is net displacement. |
 | `ElysiumCustodyEnforcer` | 7,802 | Client-signed caveat (MetaMask Delegation Framework v1.3.0 `ICaveatEnforcer`). |
-| `SwapExecutor` | 3,627 | v4 unlock-callback router: exact input, pays only `msg.sender`, min-out, sqrtPrice limit, refunds unused native; records (count, paid, received) per payer in transient storage (`lastSwap`, SA-2). |
+| `SwapExecutor` | 3,774 | v4 unlock-callback router: exact input, pays only `msg.sender`, min-out, sqrtPrice limit, refunds unused native; records (count, paid, received, keccak256(calldata)) per payer in transient storage (`lastSwap`, SA-2 / SA-3: the module requires its own call's hash). |
 | `vendor/DelegationFramework.sol` | interfaces | `ModeCode`, `Caveat`, `Delegation`, `Execution`, DM / DeleGator / HybridDeleGator / SimpleFactory interfaces, EIP-712 hash. |
 
-Reused unchanged: `V4PositionMath`, `VaultTimelock`. The SA path no longer uses `RiskBudgets` (it stays as is for the shelved vault). The pooled vault (`LPVaultBase`, `UniV4LPVault`) is untouched.
+Reused: `V4PositionMath` (unchanged), `VaultTimelock` (SA-3: per-operation delay ≤ 30 days, `isExpired`, proposer cannot renounce; guardian rotation = revoke/grant CANCELLER, executed, THEN `setGuardian`: 2 × delay against a hostile guardian). The SA path no longer uses `RiskBudgets` (it stays as is for the shelved vault). The pooled vault (`LPVaultBase`, `UniV4LPVault`) is untouched.
 Deployment: `script/DeploySA.s.sol` (not run on a live chain) creates HybridDeleGatorImpl (+ its linked SCL library at CREATE2 salt 0)
 and SimpleFactory from `test/fixtures/delegation-framework-v1.3.0` through the Arachnid CREATE2 deployer; the tests assert they land
 on the canonical addresses `0x48dB…FEC4` and `0x69Aa…c77c`. DM, 7702 delegator and TimestampEnforcer are the ones already on 99901.
@@ -318,34 +319,42 @@ Consequence for the keeper: hedge margin is limited by the account's **idle** US
   state the account cannot write (PoolManager slot0 and position info before the action, the liquidity it asks PositionManager to add
   or remove, the SwapExecutor's per-payer transient record of the swap it just ran, the verified recipient delta of a transfer). So
   `live − snapshot` is exactly what the client did, inside or outside a module bracket, and `sync` books exactly that as a client flow,
-  valued with the same function and the same price as `value` (the anchor), then moves the snapshot. A flow is booked only while the
-  anchor is **trusted** (fresh, within the band of the keeper's last report, the pool within the band of the anchor, and the anchor value
-  unchanged for `minPriceStable`, default 300 s); otherwise it stays pending, exact. A client flow therefore moves `value` and
+  valued with the same function and the same price as `value` (the anchor), then moves the snapshot. SA-3: LP fees PoolManager paid
+  out of a tracked position since its checkpoint (`snapPos(id)` = booked liquidity + feeGrowthInside marks) are added to the snapshot
+  first, so fees the client collects itself stay profit. A flow is booked only while the anchor is **trusted** (fresh, within the band
+  of the keeper's last report, the anchor value unchanged for `minPriceStable` (default 300 s), re-confirmed by a report within the last
+  `minPriceStable` (a report after a longer gap counts as a move), and the pool within `BOOK_BAND_BPS` = 50 bps of it); otherwise it
+  stays pending, exact. Swaps, mints and increases need the same trusted anchor (their sync books first); anyone may call `sync(a)`. A client flow therefore moves `value` and
   `contributed` by the same amount and cannot change profit. `deposit` / `onboard` book USDC at face value at once; registration books
   nothing. Liquidity the client changed directly stays pending on both sides (position and idle). Positions the account no longer owns
   are dropped at a trusted sync. Positions with a subscriber are refused. A client may add or take funds directly at any time.
-- **Liveness** (`isActive`): registered, not revoked, not expired, delegation not disabled, and the account's identity unchanged (7702
+- **Liveness** (`isActive`): registered, not revoked, not expired, delegation not disabled, DelegationManager not paused (SA-3), and the account's identity unchanged (7702
   designator, hybrid `owner()` == pinned owner): an owner change or a re-delegation is a revocation (L-14).
 - **Account value** at a price: idle USDC + idle HYPE × price + each position's principal at sqrt(price) + its uncollected fees +
   reported hedge equity. No pool-spot term (M-4); fee and margin sends need an anchor that is fresh, unclipped and within the pool band.
-- **Budgets** (`SAWindow`, sliding 24 h, 1x): per account turnover (swaps + LP adds) and keeper-only hedge decreases; one global anchor
-  drift window, charged |Δ| / min both ways (M-7). Guardian price ranges and hedge approvals are one-shot, TTL ≤ 1 day, cleared by a pause
+- **Budgets** (`SAWindow`, sliding 24 h, 1x): per account turnover (swaps + LP adds) and keeper-only hedge decreases. Anchor (SA-3,
+  `SARange`): the keeper alone moves it at most `refDriftBps` from every value it held in the trailing 24 h; an oscillation that comes
+  back costs nothing; a guardian range applies one report the budget would clip and resets the window. Guardian price ranges and hedge approvals are one-shot, TTL ≤ 1 day, cleared by a pause
   / guardian change; a hedge approval binds (account, epoch, stored value, value, guardian era) and every margin move bumps the epoch (M-3).
 - **HWM fee**: `fee = feeBps × (profit − hwm)` capped at 20% of idle USDC; a capped fee advances the mark only by the gain it charged
-  (L-11). `profit = min(value at the anchor, value at the pool) − contributed`, after a sync that booked every pending flow (SA-2).
-  Needs a trusted anchor (so no anchor move and fee in one transaction, SA-2 L-16), a recent unclipped hedge report (L-12),
-  `feeInterval` since the last fee, not paused. The keeper holds the anchor value while a fee waits for the stable window.
+  (L-11). SA-3: `profit = value at the anchor − contributed`, after a sync that booked every pending flow at that anchor (a parked
+  flow is neutral), and only while the anchor is not above the pool and within `poolBandBps` of its trailing 24 h low
+  (`SALib.feeGate`: a walked-up anchor carries a fee only after a day in public view). Needs a trusted anchor, a recent unclipped
+  hedge report (L-12), `feeInterval` since the last fee, not paused. The keeper holds the anchor value while a positive fee waits for
+  the stable window, only while the pool stays inside the booking band.
 - **Anchor clipping** (SA-2 M-4): `lastPriceClipped()` is a view (the anchor is outside the band of the keeper's last report) and clears
   itself when the anchor catches up; a guardian price range is consumed only by a report that needs it (move > room).
-- **Hedge margin**: `sendHedgeMargin` (keeper, not while paused, fresh anchor) is verified at the treasury (recipient delta, H-2).
+- **Hedge margin**: `sendHedgeMargin` (keeper, not while paused, anchor reported within `maxPriceAge`; cap on the lower of the value
+  at the anchor and at the pool) is verified at the treasury (recipient delta, H-2).
   `returnHedgeMargin` (keeper or treasury, never paused) always pays INTO the account, live or not, inside a sync/snapshot bracket; the
   keeper may return at most the account's own hedge equity (H-1), the treasury itself any amount.
 - **Onboarding**: `onboard(delegation, amount, permit)` registers and pulls USDC from the HybridDeleGator's **owner** into that account
   only. Every onboard / top-up needs its own valid permit for exactly that amount (SA-2 M-3: a standing allowance is never used; a
-  front-run permit is accepted only if it is the same signature: nonce − 1, deadline not passed, allowance == amount). 7702 accounts
-  already hold their funds.
+  front-run permit is accepted only if it is the same signature: nonce − 1, deadline not passed, allowance == amount; SA-3: each
+  (owner, nonce) once, and only into a live account). 7702 accounts already hold their funds.
 - **Batching**: `multicall(bytes[], allowFailure)` (self-delegatecall) for many accounts per transaction.
-- **Client stop**: `revoke(account)` by the account or its pinned owner: one plain call, no external calls, not pausable (M-8).
+- **Client stop**: `revoke(account)` by the account or its pinned owner: one plain call, no external calls, not pausable (M-8). SA-3:
+  an account can revoke before it is registered (the relayer then cannot register it; the client can).
 - Max 4 positions per account. `renounceOwnership` disabled. Owner, keeper, guardian, treasury, fee recipient and the module pairwise
   distinct (constructor and setters, L-8). Approvals the module builds are reset to 0 in the same redemption (L-17).
 
@@ -375,6 +384,9 @@ enforcer/treasury/fee recipient), L-15 (min-out and a sqrtPrice limit at the anc
 
 - `python -m elysium_keeper sa-run | sa-status | sa-onboard --request req.json`; config section `sa` (module, accounts / event scan
   from block, stagger, margin target 25% of value, idle buffer 3%, ledger path, relayer request directory).
+- SA-3: re-reports the anchor every 120 s (< `minPriceStable`), books pending flows with `sync(a)` when trusted, swaps / adds only
+  when trusted (re-checked between chunks), `minOut` = simulated output − 30 bps, removal minima, fee gate mirror, stops managing an
+  account that refused the fee on two due dates, skips accounts under `sa.min_account_usd`.
 - Tick: anchor (HL mid → same price choice as the vault keeper) → relayer queue → for each account, re-read from the chain: exited →
   wind down; live → margin first, LP (burn out of range, swap to the range split in ≤ $1.5k chunks with `eth_call` probes, mint or
   increase within the turnover room), fee when due, hedge target = LP HYPE + idle HYPE, report hedge equity (down only; alert the
@@ -429,6 +441,10 @@ e2e checks against the chain.
 
 ### Tests
 
+- `test/sa/SARound3.t.sol` (19): audit SA-3 regressions, PoC + sibling per Medium of both reports (client-collected fees, substituted
+  swaps via hostile modes 7 / 8, walk + fee, booking band, trusted gate and `sync(a)`, parked flows) plus the Lows (gap = move, hedge
+  flag, permit once, onboard liveness, pre-registration revoke, ownership cancel, pause repeat, timelock cap / expiry / renounce).
+- `test/sa/SARound2.t.sol` (25): audit SA-2 regressions.
 - `test/sa/SARegressions.t.sol` (33): audit SA-1 regressions: for C-1, every High and every Medium the auditor's PoC and at least
   one sibling path from `docs/audit/sa_round1_rootcause.md` (hostile account code via a real UUPS upgrade, 7702 re-delegation, owner
   rotation, subscribers, racing burns against the exit), plus L-3 / L-4 / L-10 / L-17.
@@ -466,13 +482,15 @@ A full re-range (burn + swap + mint) is ~1.1–1.3M gas, ≈ 0.0006 HYPE at 0.5 
 
 ### Open issues
 
-1. Audit pending (`docs/audit_sa_round1.txt`). The enforcer's v4 decoding is the critical piece.
+1. Audit round 4 (final pre-pilot, principal-loss paths only) pending: `docs/audit_sa_round4.txt`. Pilot: about USD 250 of own funds,
+   `swapTurnoverBps` 5000, a guardian bot that pauses on an anchor / HL gap.
 2. MetaMask still does not 7702-upgrade on 99901 (section 3): the 7702 path is built and tested but only usable once it does; until then
    MetaMask may also refuse the 7702 self-call exit (the HybridDeleGator path does not depend on it).
 3. The relayer HTTP endpoint is written (`sa_api.py`, branch `sa-relayer`) but not deployed: needs the user/dirs, the API config,
    the nginx include, and an `sa-run` keeper unit with `sa.requests_dir` / `sa.status_path` set (see the unit file header).
 4. Hedge margin top-ups are limited to 35%/day of idle USDC by the enforcer (by design); a client whose value is all in the LP gets
    top-ups only after the keeper frees USDC.
-5. Fee leakage: a client can take profit out between keeper touches (booked as a withdrawal); fees collected by the client directly
-   are booked as contributions. Bounded by the fee interval; accepted.
+5. Fee accuracy residuals (accepted, they lower only our fee; list in `docs/audit/sa_round3_response.md`): fees of an NFT moved out,
+   client timing inside the 50 bps booking band, fee deferral in a rally. Stated keeper bounds: fee after a 1.5% pool push ≤ 0.225% of
+   base exposure per fee interval; stolen-keeper oscillation ≈ (band + slippage) × turnover per day.
 6. The live HL adapter and treasury ↔ HL bridging stay manual / gated exactly as for the pooled vault.
