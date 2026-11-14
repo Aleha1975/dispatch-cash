@@ -22,13 +22,14 @@ interface IPermit2Transfer {
 ///         payer and the only recipient: the input is pulled from `msg.sender` (ERC-20 through the caller's own,
 ///         same-block Permit2 allowance; native as `msg.value`), the output is taken by PoolManager straight to
 ///         `msg.sender`, and unspent native input (a swap stopped by its price limit) is refunded to `msg.sender`.
-///         There is no other recipient parameter, no owner, no state and no token custody between calls, so a
+///         There is no other recipient parameter, no owner, no persistent state and no token custody between calls, so a
 ///         client account may let a delegate call it without any recipient checks.
 ///         The caller bounds the trade with `minOut` (reverts below it) and `sqrtPriceLimitX96` (the pool price the
 ///         swap may not cross; the LPManagerModule sets it to the edge of its price anchor band).
-///         SA-2 (flow booking): every swap is recorded per payer in transient storage (count, paid, received), so the
-///         LPManagerModule books the swap's effect on the account from this contract's record, never from balances
-///         the account's own code could move inside the bracket.
+///         SA-2 (flow booking): every swap is recorded per payer in transient storage (count, paid, received, and
+///         since SA-3 the hash of the call's calldata), so the LPManagerModule books the swap's effect on the account
+///         from this contract's record of exactly the call it built, never from balances the account's own code could
+///         move inside the bracket, and never from a different swap the account's code made instead (SA-3 M-2).
 contract SwapExecutor is IUnlockCallback, ReentrancyGuardTransient {
     using SafeCast for uint256;
 
@@ -90,21 +91,25 @@ contract SwapExecutor is IUnlockCallback, ReentrancyGuardTransient {
             if (!ok) revert RefundFailed();
         }
         bytes32 k = keccak256(abi.encode(msg.sender, RECORD));
-        assembly {
+        bytes32 args = keccak256(msg.data); // SA-3 M-2: binds the record to exactly this call (direction, size, limits)
+        assembly ("memory-safe") {
             tstore(k, add(tload(k), 1))
             tstore(add(k, 1), paid)
             tstore(add(k, 2), out)
+            tstore(add(k, 3), args)
         }
         emit Swapped(msg.sender, zeroForOne, paid, out);
     }
 
-    /// @notice (number of swaps paid by `payer` in this transaction, input paid and output received by the last one).
-    function lastSwap(address payer) external view returns (uint256 n, uint256 paid, uint256 received) {
+    /// @notice (number of swaps paid by `payer` in this transaction; input paid, output received and keccak256 of the
+    ///         calldata of the last one).
+    function lastSwap(address payer) external view returns (uint256 n, uint256 paid, uint256 received, bytes32 args) {
         bytes32 k = keccak256(abi.encode(payer, RECORD));
-        assembly {
+        assembly ("memory-safe") {
             n := tload(k)
             paid := tload(add(k, 1))
             received := tload(add(k, 2))
+            args := tload(add(k, 3))
         }
     }
 

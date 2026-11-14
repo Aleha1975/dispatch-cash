@@ -91,6 +91,7 @@ contract SARegressionsTest is SATestBase {
         vm.expectRevert(); // pinned owner has no allowance; the treasury is never the payer
         module.onboard(d, 100_000e6, block.timestamp + 1 hours, 0, bytes32(0), bytes32(0));
         assertEq(usdc.balanceOf(treasury), 100_000e6);
+        _stable();
         uint256 p = poolPrice();
         vm.prank(keeper);
         vm.expectRevert(LPManagerModule.NotLive.selector);
@@ -366,14 +367,17 @@ contract SARegressionsTest is SATestBase {
         module.sendHedgeMargin(a, 100e6);
         _reportEquity(a, 400e6); // stale anchor: no keeper-only move
         assertEq(module.account(a).hedgeEquity, 500e6);
-        assertTrue(module.account(a).hedgeClipped);
+        assertFalse(module.account(a).hedgeClipped, "SA-3 L-3: no flag while no decrease is possible");
         vm.prank(keeper);
         module.reportPrice(ref); // fresh again
         _moveTo(ref * 103 / 100);
+        uint256 vMin = module.accountValue(a, poolPrice() < ref ? poolPrice() : ref);
         vm.startPrank(keeper);
-        vm.expectRevert(LPManagerModule.StalePrice.selector); // pool off the anchor band: not fresh
+        // SA-3 M-7: a margin send needs a recent report only; its cap uses the lower of the two valuations
+        vm.expectPartialRevert(LPManagerModule.HedgeCap.selector);
+        module.sendHedgeMargin(a, vMin * 3500 / 10_000 - 500e6 + 2e6);
         module.sendHedgeMargin(a, 100e6);
-        vm.expectRevert(LPManagerModule.StalePrice.selector); // SA-2: fees need a trusted anchor
+        vm.expectRevert(LPManagerModule.StalePrice.selector); // fees need a trusted anchor (pool in the book band)
         module.chargeFee(a);
         vm.stopPrank();
     }
@@ -495,6 +499,7 @@ contract SARegressionsTest is SATestBase {
     /// PoC: the linear-decay budget admitted ~2x in 24 h (turnover, anchor drift, hedge step).
     function test_M7_PoC_TurnoverOncePerSlidingDay() public {
         (address a,) = _onboardHybrid(ALICE_PK, 10_000e6);
+        _stable();
         uint256 p = poolPrice();
         uint256 cap = module.accountValue(a, module.lastPrice()) * 2;
         for (uint256 i; i < 2; ++i) {
@@ -512,32 +517,46 @@ contract SARegressionsTest is SATestBase {
         assertGt(used, cap * 9 / 10);
         vm.warp(vm.getBlockTimestamp() + 23 hours);
         _report();
+        _stable();
         p = poolPrice();
         vm.prank(keeper);
         vm.expectRevert(SAWindow.WindowOverflow.selector);
         module.swap(a, true, a.balance, p, 0);
         vm.warp(vm.getBlockTimestamp() + 4 hours);
         _report();
+        _stable();
         p = poolPrice();
         vm.prank(keeper);
         module.swap(a, true, a.balance, p, 0);
     }
 
-    /// Siblings: the anchor drift window (up then down is charged both ways, no reset at 24 h), and the hedge step.
+    /// Siblings: the anchor drift budget is the trailing 24 h range (SA-3: net displacement; a move that came back
+    /// costs nothing, a net move is held against the budget for 24-27 h), and the hedge step.
     function test_M7_Sibling_AnchorWindowBothWays() public {
         uint256 p0 = module.lastPrice();
         _moveTo(p0 * 105 / 100);
         _report();
         _moveTo(p0);
-        _report(); // 5% up + ~4.8% down: ~10% of the 10% window used
-        uint256 now0 = module.lastPrice();
+        _report(); // 5% up and back: the trailing range is 5%
         vm.warp(vm.getBlockTimestamp() + 23 hours);
         _moveTo(p0 * 103 / 100);
+        _report(); // within [high / 1.1, low * 1.1]: applied
+        assertFalse(module.lastPriceClipped());
+        assertEq(module.lastPrice(), poolPrice());
+        // a net move: low p0, so the anchor may not exceed p0 * 1.1 inside the window
+        _moveTo(p0 * 109 / 100);
+        _report();
+        _moveTo(p0 * 112 / 100);
         uint256 p = poolPrice();
         vm.prank(keeper);
         module.reportPrice(p);
         assertTrue(module.lastPriceClipped());
-        assertLt(module.lastPrice(), now0 * 1005 / 1000);
+        assertApproxEqRel(module.lastPrice(), p0 * 110 / 100, 0.001e18);
+        // once the low of p0 has left the window (24-27 h after it was last held), the anchor follows
+        vm.warp(vm.getBlockTimestamp() + 27 hours);
+        vm.prank(keeper);
+        module.reportPrice(p);
+        assertEq(module.lastPrice(), p);
     }
 
     function test_M7_Sibling_HedgeStepSlidingWindow() public {
@@ -571,25 +590,26 @@ contract SARegressionsTest is SATestBase {
         _moveTo(p0 * 108 / 100);
         _report(); // fits the 10% room: the range is not used
         assertFalse(module.lastPriceClipped());
-        (,,, uint256 until) = module.priceBudget();
+        (,, uint256 until,) = module.priceBudget();
         assertGt(until, 0, "a routine report does not burn the approval");
         (,, uint256 pu) = module.windows(address(0));
-        assertGt(pu, 0.07e18, "charged to the window");
+        assertGt(pu, 0.07e18, "the trailing range");
         _moveTo(p0 * 125 / 100);
         _report(); // beyond the room: the range applies it unclipped and is consumed
         assertApproxEqRel(module.lastPrice(), p0 * 125 / 100, 0.001e18);
         assertFalse(module.lastPriceClipped());
-        (,,, until) = module.priceBudget();
+        (,, until,) = module.priceBudget();
         assertEq(until, 0, "one-shot");
         (,, pu) = module.windows(address(0));
-        assertEq(pu, 0.1e18, "charged min(move, room): the window is full, not beyond");
-        _moveTo(p0 * 126 / 100);
-        _report(); // no room: not applied, but within the band of the report, so not "clipped" (M-4)
-        assertApproxEqRel(module.lastPrice(), p0 * 125 / 100, 0.001e18);
-        assertFalse(module.lastPriceClipped());
+        assertEq(pu, 0, "SA-3: an approved level starts a new window, it does not consume the keeper's room");
         _moveTo(p0 * 130 / 100);
-        _report();
-        assertTrue(module.lastPriceClipped(), "anchor out of band of the report");
+        _report(); // +4% from the approved level: inside the new window
+        assertApproxEqRel(module.lastPrice(), p0 * 130 / 100, 0.001e18);
+        assertFalse(module.lastPriceClipped());
+        _moveTo(p0 * 139 / 100);
+        _report(); // +11.2% from the approved level: clipped at +10%
+        assertApproxEqRel(module.lastPrice(), p0 * 1375 / 1000, 0.001e18);
+        assertFalse(module.lastPriceClipped(), "within the band of the report");
         // cleared by a pause
         vm.prank(guardian);
         module.approvePrice(p0 / 2, p0 * 2, block.timestamp + 1 hours);
@@ -664,6 +684,8 @@ contract SARegressionsTest is SATestBase {
     function test_L10_MintAfterClientBurnAtMaxPositions() public {
         (address a,) = _onboardHybrid(ALICE_PK, 40_000e6);
         _buyBase(a, 16_000e6);
+        _report();
+        _stable();
         uint256 hype = a.balance / 4;
         uint256 usd = usdc.balanceOf(a) / 4;
         uint256 first;

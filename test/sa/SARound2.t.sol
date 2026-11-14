@@ -135,7 +135,7 @@ contract SARound2Test is SATestBase {
         for (uint256 k; k < 4; ++k) {
             int256 c0 = _acct(a).contributed;
             _sendNative(ALICE_PK, a, vm.addr(ALICE_PK), 0.1 ether);
-            _moveTo(ref * (k % 2 == 0 ? 10_120 : 9_880) / 10_000); // inside the 1.5% band
+            _moveTo(ref * (k % 2 == 0 ? 10_040 : 9_960) / 10_000); // inside the 0.5% booking band (SA-3)
             vm.startPrank(keeper);
             if (k == 0) module.decreasePosition(a, id, 0, 0, 0);
             if (k == 1) module.returnHedgeMargin(a, 100e6);
@@ -238,6 +238,8 @@ contract SARound2Test is SATestBase {
     function _twoPositions(uint256 usd) internal returns (address a, uint256 A, uint256 B) {
         (a,) = _onboardHybrid(ALICE_PK, usd);
         _buyBase(a, usd * 2 / 5);
+        _report();
+        _stable();
         (int24 tl, int24 tu) = _range(300);
         (uint128 liq, uint128 m0, uint128 m1) = _liqFor(a, tl, tu, a.balance / 2, usdc.balanceOf(a) / 2);
         uint256 p = poolPrice();
@@ -370,9 +372,9 @@ contract SARound2Test is SATestBase {
     }
 
     // ================================================================== M-4: clipped flag and window saturation
-    /// PoC: a guardian-approved jump fills the window; a later report one unit away from the anchor used to set
-    /// the global clipped flag and block sends and fees for a day. Now the anchor counts as clipped only while it
-    /// is outside the band of the report.
+    /// PoC: a guardian-approved jump filled the window; a later report one unit away from the anchor used to set
+    /// the global clipped flag and block sends and fees for a day. The anchor counts as clipped only while it is
+    /// outside the band of the report; SA-3: the approved level starts a new window, so the keeper keeps its room.
     function test_M4_PoC_SaturatedWindowOneUnitDoesNotBlock() public {
         (address a,) = _withHype(ALICE_PK, 20_000e6);
         uint256 p0 = module.lastPrice();
@@ -381,11 +383,11 @@ contract SARound2Test is SATestBase {
         _moveTo(p0 * 125 / 100);
         _report();
         (,, uint256 pu) = module.windows(address(0));
-        assertEq(pu, 0.1e18, "window full");
+        assertEq(pu, 0, "a new window, not a full one");
         uint256 anchor = module.lastPrice();
         vm.prank(keeper);
         module.reportPrice(anchor + 1);
-        assertEq(module.lastPrice(), anchor);
+        assertEq(module.lastPrice(), anchor + 1, "room left: applied");
         assertFalse(module.lastPriceClipped());
         _stable();
         vm.prank(keeper);
@@ -395,28 +397,32 @@ contract SARound2Test is SATestBase {
         module.chargeFee(a);
     }
 
-    /// Sibling: no guardian; oscillation uses the whole window; a report within the band of the anchor does not
-    /// block, one outside it does, and the anchor un-clips by itself when the market comes back.
+    /// Sibling (SA-3 M-7 / L-2): no guardian; an oscillation costs nothing (net displacement, not path length), a
+    /// net move beyond the 24 h range clips, a clipped anchor does not stop margin sends, and it un-clips by itself
+    /// when the market comes back.
     function test_M4_Sibling_OscillationAndAutoClear() public {
         (address a,) = _withHype(ALICE_PK, 20_000e6);
         uint256 p0 = module.lastPrice();
-        _moveTo(p0 * 105 / 100);
-        _report();
-        _moveTo(p0);
-        _report();
-        _moveTo(p0 * 101 / 100);
-        _report(); // ~0.2% of room left: clipped, but in band
+        for (uint256 i; i < 10; ++i) {
+            _moveTo(p0 * 104 / 100);
+            _report();
+            _moveTo(p0);
+            _report();
+        }
+        _moveTo(p0 * 108 / 100);
+        _report(); // 80% of absolute moves in a day, 8% net: applied
+        assertEq(module.lastPrice(), poolPrice());
         assertFalse(module.lastPriceClipped());
         _stable();
         vm.prank(keeper);
         module.sendHedgeMargin(a, 100e6);
-        _moveTo(p0 * 104 / 100);
+        _moveTo(p0 * 113 / 100);
         _report();
         assertTrue(module.lastPriceClipped());
+        assertLe(module.lastPrice(), p0 * 110 / 100, "at most the 24 h low x 1.1");
         vm.prank(keeper);
-        vm.expectRevert(LPManagerModule.StalePrice.selector);
-        module.sendHedgeMargin(a, 100e6);
-        _moveTo(p0 * 1005 / 1000);
+        module.sendHedgeMargin(a, 100e6); // SA-3 M-7: needs a recent report, not an unclipped anchor
+        _moveTo(p0 * 1095 / 1000);
         _report();
         assertFalse(module.lastPriceClipped(), "auto-clears");
     }
@@ -520,6 +526,7 @@ contract SARound2Test is SATestBase {
     /// L-15: the keeper can tighten min-out.
     function test_L15_KeeperMinOut() public {
         (address a,) = _onboardHybrid(ALICE_PK, 10_000e6);
+        _stable();
         uint256 p = poolPrice();
         uint256 fair = 1_000e6 * 1e18 / p;
         vm.prank(keeper);

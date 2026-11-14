@@ -14,6 +14,7 @@ import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
+import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {LiquidityAmounts} from "@uniswap/v4-periphery/src/libraries/LiquidityAmounts.sol";
 
 import {V4PositionMath} from "../../src/V4PositionMath.sol";
@@ -510,6 +511,8 @@ abstract contract SATestBase is Test {
 
     // ------------------------------------------------------------------ keeper flows
     function _mintAll(address a) internal returns (uint256 id) {
+        _report(); // SA-3: adds need the pool within BOOK_BAND_BPS of a stable anchor (a buy before moved the pool)
+        _stable();
         (int24 tl, int24 tu) = _range(300);
         (uint128 liq, uint128 m0, uint128 m1) = _liqFor(a, tl, tu, a.balance, usdc.balanceOf(a));
         uint256 p = poolPrice();
@@ -519,6 +522,7 @@ abstract contract SATestBase is Test {
 
     /// Buy HYPE with `usd` of the account's USDC.
     function _buyBase(address a, uint256 usd) internal {
+        _stable();
         uint256 p = poolPrice();
         vm.prank(keeper);
         module.swap(a, false, usd, p, 0);
@@ -544,30 +548,55 @@ abstract contract SATestBase is Test {
         id = _mintAll(a);
     }
 
-    /// Wait until the anchor has been unchanged for minPriceStable (booking and fees need it; SA-2 H-1 / L-16).
+    /// Wait until the anchor has been unchanged for minPriceStable (booking and fees need it; SA-2 H-1 / L-16), and
+    /// re-confirm it with a report of the stored value if the last report is older than that (SA-3 L-5).
     function _stable() internal {
         (,,,,,,,, , uint32 st) = module.params();
         uint256 t = module.lastPriceMoved() + st;
         if (block.timestamp < t) vm.warp(t);
+        if (block.timestamp > module.lastPriceTime() + st) {
+            uint256 lp = module.lastPrice();
+            vm.prank(keeper);
+            module.reportPrice(lp);
+            vm.warp(block.timestamp + st);
+            vm.prank(keeper);
+            module.reportPrice(lp);
+        }
     }
 
-    /// Unbooked client flow (live state - snapshot) valued at the anchor, as SABook.sync would book it.
+    /// Unbooked client flow (live state - snapshot) valued at the anchor, as SABook.sync would book it (SA-3: LP fees
+    /// paid out of a tracked position since the books' last look are yield, not part of the flow).
     function _pending(address a) internal view returns (int256 f) {
         uint256 ref = module.lastPrice();
         SALib.Account memory s = module.account(a);
-        f = int256(usdc.balanceOf(a)) - s.snapAsset;
-        int256 db = int256(a.balance) - s.snapBase;
-        f += db >= 0 ? int256(uint256(db) * ref / 1e18) : -int256((uint256(-db) * ref + 1e18 - 1) / 1e18);
+        int256 sa = s.snapAsset;
+        int256 sb = s.snapBase;
         V4PositionMath.Position[] memory ps = module.positionsOf(a);
         for (uint256 i; i < ps.length; ++i) {
             uint128 liq;
+            bool owned;
             try POSM.ownerOf(ps[i].tokenId) returns (address o) {
-                if (o == a) liq = POSM.getPositionLiquidity(ps[i].tokenId);
+                if (o == a) {
+                    liq = POSM.getPositionLiquidity(ps[i].tokenId);
+                    owned = true;
+                }
             } catch {}
-            uint128 old = module.snapLiquidity(ps[i].tokenId);
+            (uint128 old, uint256 g0, uint256 g1) = module.snapPos(ps[i].tokenId);
+            (uint128 pmLiq, uint256 l0, uint256 l1) = PM.getPositionInfo(
+                key.toId(), POSM_ADDR, ps[i].tickLower, ps[i].tickUpper, bytes32(ps[i].tokenId)
+            );
+            uint128 n = owned ? (liq < old ? liq : old) : 0;
+            if (pmLiq == 0) n = old;
+            unchecked {
+                sb += int256(FullMath.mulDiv(l0 - g0, n, 1 << 128));
+                sa += int256(FullMath.mulDiv(l1 - g1, n, 1 << 128));
+            }
             f += int256(V4PositionMath.liquidityValue(ps[i].tickLower, ps[i].tickUpper, liq, ref, true))
                 - int256(V4PositionMath.liquidityValue(ps[i].tickLower, ps[i].tickUpper, old, ref, true));
         }
+        f += int256(usdc.balanceOf(a)) - sa;
+        int256 db = int256(a.balance) - sb;
+        f += db >= 0 ? int256(uint256(db) * ref / 1e18) : -int256((uint256(-db) * ref + 1e18 - 1) / 1e18);
     }
 
     function _syncTouch(address a) internal {

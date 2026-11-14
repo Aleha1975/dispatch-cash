@@ -320,19 +320,21 @@ contract LPManagerModuleTest is SATestBase {
         (address a,) = _onboardHybrid(ALICE_PK, 10_000e6);
         _buyBase(a, 2_000e6);
         uint256 anchor = module.lastPrice();
-        _moveTo(anchor * 10_250 / 10_000);
+        _moveTo(anchor * 10_040 / 10_000); // pool within BOOK_BAND_BPS of the anchor: trusted
         uint256 p = poolPrice();
         vm.startPrank(keeper);
         vm.expectRevert(LPManagerModule.BadPrice.selector); // in band of the pool, not of the anchor
-        module.swap(a, false, 100e6, p, 0);
-        vm.expectPartialRevert(LPManagerModule.PoolPriceOff.selector); // the anchor itself is off the pool
-        module.swap(a, false, 100e6, anchor, 0);
-        // a price in band of both passes the price check; buying base would push the pool further past the
-        // anchor band (L-15 limit), selling base moves it back
-        vm.expectRevert();
-        module.swap(a, false, 100e6, anchor * 10_140 / 10_000, 0);
-        module.swap(a, true, 1 ether, anchor * 10_140 / 10_000, 0);
+        module.swap(a, false, 100e6, anchor * 10_160 / 10_000, 0);
+        vm.expectPartialRevert(LPManagerModule.PoolPriceOff.selector); // off the pool
+        module.swap(a, false, 100e6, anchor * 9_860 / 10_000, 0);
+        module.swap(a, true, 1 ether, p, 0); // in band of both
         vm.stopPrank();
+        // SA-3: a pool more than BOOK_BAND_BPS from the anchor stops swaps and adds altogether
+        _moveTo(anchor * 10_250 / 10_000);
+        p = poolPrice();
+        vm.prank(keeper);
+        vm.expectRevert(LPManagerModule.StalePrice.selector);
+        module.swap(a, false, 100e6, anchor * 10_140 / 10_000, 0);
     }
 
     function test_H2_AnchorMovesOnlyWithinBudgetAndFreezesWhilePaused() public {
@@ -370,14 +372,14 @@ contract LPManagerModuleTest is SATestBase {
 
     // ------------------------------------------------------------------ swaps (L-15) and turnover
     function test_L15_SwapLimitedToAnchorBand() public {
-        (address a,) = _onboardHybrid(ALICE_PK, 10_000e6);
-        _buyBase(a, 4_000e6);
+        (address a,) = _onboardHybrid(ALICE_PK, 60_000e6);
+        _buyBase(a, 25_000e6);
         uint256 anchor = module.lastPrice();
-        _moveTo(anchor * 9_760 / 10_000); // pool 2.4% below the anchor
-        uint256 kp = anchor * 9_860 / 10_000; // within 1.5% of both
-        uint256 hype = a.balance / 2;
+        _moveTo(anchor * 9_955 / 10_000); // pool 0.45% below the anchor (trusted)
+        uint256 kp = poolPrice();
+        uint256 hype = a.balance;
         vm.prank(keeper);
-        vm.expectRevert(); // selling base would push the pool further below the anchor band edge
+        vm.expectRevert(); // selling it all would push the pool past the anchor band edge: stopped, below min-out
         module.swap(a, true, hype, kp, 0);
         vm.prank(keeper);
         module.swap(a, false, 100e6, kp, 0); // buying base moves it back toward the anchor: fine
@@ -386,6 +388,7 @@ contract LPManagerModuleTest is SATestBase {
     function test_SwapTurnoverIsPerAccount() public {
         (address a,) = _onboardHybrid(ALICE_PK, 10_000e6);
         (address b,) = _onboardHybrid(BOB_PK, 10_000e6);
+        _stable();
         uint256 p = poolPrice();
         // 2x account value per 24 h window: 10k account -> ~20k notional
         for (uint256 i; i < 2; ++i) {
@@ -403,6 +406,7 @@ contract LPManagerModuleTest is SATestBase {
         module.swap(b, false, 5_000e6, p, 0); // bob's budget is his own
         vm.warp(vm.getBlockTimestamp() + 27 hours);
         _report();
+        _stable();
         p = poolPrice();
         vm.prank(keeper);
         module.swap(a, false, 4_000e6, p, 0);
@@ -419,8 +423,10 @@ contract LPManagerModuleTest is SATestBase {
         int24 tl = tu - 60;
         uint128 liq =
             LiquidityAmounts.getLiquidityForAmount1(TickMath.getSqrtPriceAtTick(tl), TickMath.getSqrtPriceAtTick(tu), 10_000e6);
+        // SA-3: the pool is more than BOOK_BAND_BPS from the anchor, so no add is possible at all; within that band
+        // the H-3 value check bounds an add's loss at the anchor by maxSlippageBps
         vm.prank(keeper);
-        vm.expectPartialRevert(SALib.AddValue.selector);
+        vm.expectRevert(LPManagerModule.StalePrice.selector);
         module.mintPosition(a, tl, tu, liq, 0, 10_000e6, kp);
     }
 
@@ -582,6 +588,7 @@ contract LPManagerModuleTest is SATestBase {
         // a drawdown below the mark charges nothing
         vm.warp(vm.getBlockTimestamp() + 7 days);
         _report();
+        _stable();
         vm.prank(keeper);
         assertEq(module.chargeFee(a), 0);
     }
@@ -761,6 +768,7 @@ contract LPManagerModuleTest is SATestBase {
     function test_Multicall_ManyAccounts() public {
         (address a,) = _onboardHybrid(ALICE_PK, 10_000e6);
         (address b,) = _onboardHybrid(BOB_PK, 10_000e6);
+        _stable();
         uint256 p = poolPrice();
         bytes[] memory calls = new bytes[](3);
         calls[0] = abi.encodeCall(LPManagerModule.swap, (a, false, 3_000e6, p, 0));

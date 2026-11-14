@@ -15,6 +15,7 @@ import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {V4PositionMath} from "../V4PositionMath.sol";
 import {IPositionManagerMin} from "../interfaces/IExternal.sol";
 import {SAWindow} from "./SAWindow.sol";
+import {SARange} from "./SARange.sol";
 import {
     Delegation,
     IDelegationManager,
@@ -65,6 +66,7 @@ library SALib {
     error TransferMismatch();
     error NotOwnAccount();
     error BadPermit();
+    error StalePrice(); // same selector as LPManagerModule.StalePrice
 
     event Registered(address indexed account, bytes32 delegationHash, uint8 kind, uint256 until, bool first);
 
@@ -98,11 +100,14 @@ library SALib {
     }
 
     struct PriceBudget {
-        SAWindow.W window; // relative anchor moves (WAD, charged against the lower of the two prices)
         uint256 lo; // guardian range, one-shot
         uint256 hi;
         uint256 until;
+        SARange.R range; // SA-3: trailing 24 h (min, max) of the anchor: the drift budget is net displacement
     }
+
+    /// keccak256("elysium.SALib.usedPermit"): (owner, nonce) of every permit the module pulled on (SA-3 L-5 / L-7)
+    bytes32 internal constant USED_PERMIT = 0x6abd87adb26a402fe713f1d3f200068eae79f0e9a26a829d328b8969c2899fff;
 
     struct Expect {
         IDelegationManager dm;
@@ -173,6 +178,7 @@ library SALib {
     ///           account reports is only a candidate: it is accepted iff it re-derives the account address.
     ///         Anything else reverts BadAccount.
     function accountKind(address a, Expect memory e) public view returns (uint8, address) {
+        if (a == e.hedgeTreasury || a == e.feeRecipient) revert BadAccount(); // SA-3 I-1: before both branches
         bytes memory code = a.code;
         if (code.length == 23 && code[0] == 0xef && code[1] == 0x01 && code[2] == 0x00) {
             address impl;
@@ -236,7 +242,11 @@ library SALib {
         bytes32 old = s.delegationHash;
         if (old != 0 && old == e.dm.getDelegationHash(d) && !s.revoked) return false;
         (bytes32 h, uint8 kind, uint256 until, address o) = checkDelegation(d, e);
-        if (old != 0 && msg.sender != a && msg.sender != s.owner) revert NotOwnAccount();
+        // M-1 / SA-3 L-14: replacing, resuming after a revoke, or a first registration of a slot the account revoked
+        // in advance: only the account or its (pinned / derived) owner
+        if ((old != 0 || s.revoked) && msg.sender != a && msg.sender != (old != 0 ? s.owner : o)) {
+            revert NotOwnAccount();
+        }
         s.delegationHash = h;
         s.owner = o;
         s.kind = kind;
@@ -270,19 +280,21 @@ library SALib {
     /// @notice SA-2 M-3: move `amount` USDC from the pinned owner `o` into its account `a` only on a fresh EIP-2612
     ///         permit for exactly this spender and amount. A permit that was front-run is accepted only if this very
     ///         signature was the owner's last permit (nonce - 1), it has not expired and the allowance it set is
-    ///         untouched; a standing allowance from `approve` is never used.
+    ///         untouched. SA-3 L-5 / L-7: every (owner, nonce) is pulled on at most once, so a consumed permit cannot
+    ///         be replayed against a later standing approval of the same amount; a standing allowance is never used.
     function pull(address asset, address o, address a, uint256 amount, uint256 deadline, uint8 v, bytes32 r, bytes32 s_)
         external
     {
+        uint256 n = IERC20Permit(asset).nonces(o);
         try IERC20Permit(asset).permit(o, address(this), amount, deadline, v, r, s_) {}
         catch {
-            uint256 n = IERC20Permit(asset).nonces(o);
             if (n == 0 || block.timestamp > deadline) revert BadPermit();
+            n -= 1;
             bytes32 digest = keccak256(
                 abi.encodePacked(
                     "\x19\x01",
                     IERC20Permit(asset).DOMAIN_SEPARATOR(),
-                    keccak256(abi.encode(PERMIT_TYPEHASH, o, address(this), amount, n - 1, deadline))
+                    keccak256(abi.encode(PERMIT_TYPEHASH, o, address(this), amount, n, deadline))
                 )
             );
             (address signer, ECDSA.RecoverError err,) = ECDSA.tryRecover(digest, v, r, s_);
@@ -290,6 +302,13 @@ library SALib {
                 revert BadPermit();
             }
         }
+        bytes32 slot = keccak256(abi.encode(o, n, USED_PERMIT));
+        bool used;
+        assembly {
+            used := sload(slot)
+            sstore(slot, 1)
+        }
+        if (used) revert BadPermit();
         IERC20 t = IERC20(asset);
         uint256 b0 = t.balanceOf(a);
         SafeERC20.safeTransferFrom(t, o, a, amount);
@@ -317,29 +336,43 @@ library SALib {
     }
 
     // ------------------------------------------------------------------ budgets
-    /// @notice Move the anchor `ref` toward `p`. The first report (ref == 0) is free. The move is limited by the
-    ///         room left in the sliding 24 h window of `capWad`; a step costs |p - ref| / min(p, ref), the same up and
-    ///         down (E). Only a move that does NOT fit the room uses a guardian range covering `p` (SA-2 I-7: a
-    ///         routine report does not burn the approval): it is applied unclipped, the range is consumed (one-shot)
-    ///         and the window is charged min(move, room) (SA-2 M-4: an approval never costs the keeper more room than
-    ///         it had).
+    /// @notice Move the anchor `ref` toward `p` (SA-3: net displacement, not path length). The first report
+    ///         (ref == 0) is free. A new anchor must stay inside [max / (1 + cap), min * (1 + cap)], where min / max
+    ///         are the lowest / highest anchor held during the trailing 24 h (SARange), so the anchor's 24 h range is
+    ///         at most 1 + cap and an oscillation that comes back costs nothing (a path-length budget is exhausted by
+    ///         ordinary volatility: about sigma^2 / hysteresis per day). Cap 0 (paused) freezes the anchor. A report
+    ///         that does not fit uses a guardian range covering `p` (one-shot): applied unclipped, and it starts a new
+    ///         window (history forgotten: an approval never leaves the keeper without room, SA-3 M-7 / L-2).
     function movePrice(PriceBudget storage b, uint256 ref, uint256 p, uint256 capWad) external returns (uint256, bool) {
-        if (ref == 0) return (p, false);
-        uint256 move = Math.mulDiv(p > ref ? p - ref : ref - p, WAD, p > ref ? ref : p, Math.Rounding.Ceil);
-        uint256 room = SAWindow.room(b.window, capWad);
-        bool clipped = move > room;
-        if (clipped && block.timestamp <= b.until && p >= b.lo && p <= b.hi) {
-            b.until = 0;
-            SAWindow.add(b.window, room);
+        if (ref == 0) {
+            SARange.record(b.range, p);
             return (p, false);
         }
-        if (clipped) {
-            move = room;
-            // up: p = ref (1 + room); down: p = ref / (1 + room)
-            p = p > ref ? ref + Math.mulDiv(ref, room, WAD) : Math.mulDiv(ref, WAD, WAD + room, Math.Rounding.Ceil);
+        (uint256 lo, uint256 hi) = SARange.bounds(b.range, ref);
+        uint256 up = Math.mulDiv(lo, WAD + capWad, WAD);
+        uint256 dn = Math.mulDiv(hi, WAD, WAD + capWad, Math.Rounding.Ceil);
+        uint256 q = p;
+        if (dn > up) q = ref; // the window no longer admits a move (cap 0 while paused, or a lowered cap)
+        else if (q > up) q = up;
+        else if (q < dn) q = dn;
+        bool clipped = q != p;
+        if (clipped && block.timestamp <= b.until && p >= b.lo && p <= b.hi) {
+            b.until = 0;
+            SARange.reset(b.range);
+            SARange.record(b.range, p);
+            return (p, false);
         }
-        SAWindow.add(b.window, move);
-        return (p, clipped);
+        SARange.record(b.range, ref);
+        SARange.record(b.range, q);
+        return (q, clipped);
+    }
+
+    /// @notice SA-3 M-3 / M-6: a fee is measured at the anchor (the booking price), and only while the anchor is not
+    ///         above the pool and not more than `bandBps` above the lowest anchor of the trailing 24 h. A walked-up
+    ///         anchor must therefore be held in public view for a day before it can carry a fee.
+    function feeGate(PriceBudget storage b, uint256 ref, uint256 pool, uint256 bandBps) external view {
+        (uint256 lo,) = SARange.bounds(b.range, ref);
+        if (ref > pool || ref * BPS > lo * (BPS + bandBps)) revert StalePrice();
     }
 
     /// @notice New hedge equity for a keeper report `v`. The guardian's approval for exactly this account, epoch,
@@ -356,7 +389,6 @@ library SALib {
         returns (uint256, bool)
     {
         uint256 old = s.hedgeEquity;
-        s.hedgeTime = block.timestamp;
         if (
             b.hedgeApprovedEpoch == s.hedgeEpoch + 1 && b.hedgeApprovedEra == era && b.hedgeApproved == v
                 && block.timestamp <= b.hedgeApprovedUntil
@@ -371,9 +403,17 @@ library SALib {
             s.hedgeEquity = v;
             if (changed) s.hedgeEpoch++;
             s.hedgeClipped = false;
+            s.hedgeTime = block.timestamp;
             return (v, false);
         }
-        if (v >= old) return (old, v != old); // SA-2 L-1: an equal / higher report never clears hedgeClipped
+        if (v >= old) {
+            s.hedgeTime = block.timestamp;
+            return (old, v != old); // SA-2 L-1: an equal / higher report never clears hedgeClipped
+        }
+        // SA-3 L-3: no keeper-only decrease is possible now (paused, anchor not fresh, step 0): no state change at
+        // all (no flag that outlives the cause, no report time)
+        if (cap == 0) return (old, true);
+        s.hedgeTime = block.timestamp;
         uint256 d = old - v;
         uint256 room = SAWindow.room(b.hedge, cap);
         bool clipped = d > room;
@@ -397,8 +437,11 @@ library SALib {
         return (SAWindow.used(b.turnover), SAWindow.used(b.hedge));
     }
 
-    function priceUsed(PriceBudget storage b) external view returns (uint256) {
-        return SAWindow.used(b.window);
+    /// @notice SA-3: the anchor's trailing 24 h range (max / min - 1, WAD) given the current anchor `ref`.
+    function priceUsed(PriceBudget storage b, uint256 ref) external view returns (uint256) {
+        if (ref == 0) return 0;
+        (uint256 lo, uint256 hi) = SARange.bounds(b.range, ref);
+        return Math.mulDiv(hi - lo, WAD, lo);
     }
 
     // ------------------------------------------------------------------ misc

@@ -13,6 +13,13 @@ interface IModifyLike {
     function modifyLiquidities(bytes calldata unlockData, uint256 deadline) external payable;
 }
 
+interface ISwapExecutorLike {
+    function swap(bool zeroForOne, uint256 amountIn, uint256 minOut, uint160 sqrtPriceLimitX96)
+        external
+        payable
+        returns (uint256);
+}
+
 interface IPosmSubscribe {
     function subscribe(uint256 tokenId, address newSubscriber, bytes calldata data) external payable;
     function nextTokenId() external view returns (uint256);
@@ -38,6 +45,11 @@ contract AnySubscriber {
 ///   mode 5: after a PositionManager removal (decrease / burn), the proceeds are added to another tracked position
 ///           `aux` (liquidity `auxLiq`) inside the bracket (M-2);
 ///   mode 6: after a SwapExecutor call, 1% of the idle USDC goes to `sink` (L-14: output kept above min-out).
+///   SA-3:
+///   mode 7: the module's SwapExecutor call is replaced by the account's own swap in the same direction and
+///           size, without the price limit and with min-out 1 (M-2 of 1227, trace A: a substituted swap booked as the module's);
+///   mode 8: the module's SwapExecutor call is replaced by a 1 USDC swap in the OTHER direction (trace B / L-4 of
+///           1226: wei booked as USDC units).
 contract HostileAccount {
     bytes32 internal constant IMPL_SLOT = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
     address internal immutable claimedOwner;
@@ -112,6 +124,18 @@ contract HostileAccount {
                 IERC20(usdc).transfer(sink, amt);
                 return r;
             }
+        }
+        if (mode == 7 && target == executor) {
+            (bool z, uint256 amt,,) = abi.decode(cd[4:], (bool, uint256, uint256, uint160));
+            r[0] = abi.encode(ISwapExecutorLike(executor).swap{value: value}(z, amt, 1, 0));
+            return r;
+        }
+        if (mode == 8 && target == executor) {
+            (bool z,,,) = abi.decode(cd[4:], (bool, uint256, uint256, uint160));
+            IERC20(usdc).approve(permit2, 1e6);
+            IPermit2Like(permit2).approve(usdc, executor, 1e6, uint48(block.timestamp));
+            r[0] = abi.encode(ISwapExecutorLike(executor).swap(!z, 1e6, 1, 0));
+            return r;
         }
         if (mode == 4 && (target == posm || target == executor)) {
             if (value != 0) payable(sink).transfer(value);
