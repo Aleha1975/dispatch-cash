@@ -4,9 +4,18 @@ It only VALIDATES and ENQUEUES. It holds no key and never signs or sends a trans
 relayer queue in `sa.requests_dir`) deploys the account and calls `module.onboard` after its own checks and an
 eth_call simulation.
 
-  POST /elysium-api/sa/onboard   {owner, kind, delegation, permit}  -> 202 {ok, state: "queued", owner, account, kind}
-  GET  /elysium-api/sa/status?owner=0x..                         -> {owner, account, kind, state, summary, keeper}
+  POST /elysium-api/sa/onboard   {owner, kind, delegation, permit, strategy?} -> 202 {ok, state: "queued", owner,
+                                                                                   account, kind}
+  POST /elysium-api/sa/strategy  {owner, kind, strategy}            -> 202 {ok, state: "queued", owner, account, nonce}
+  GET  /elysium-api/sa/status?owner=0x..                         -> {owner, account, kind, state, summary, keeper,
+                                                                     strategy, strategy_pending}
+  GET  /elysium-api/sa/recommend                                 -> the keeper's recommendation file (recommend.py)
   GET  /elysium-api/sa/health                                    -> {ok, pending, keeper}
+
+Strategy (prefs.py): the client's signed EIP-712 preference (width auto / manual half-width, hedged or not). Checked
+here (binding to owner / account / module, bounds, deadline, nonce above the current one, signature) and again by the
+keeper before it is applied; queued as `strategy/<owner>-<nonce>.json` (never overwrites). Optional at onboarding (an
+account without one is managed with auto width, hedged).
 
 Onboarding checks (everything the module's `checkDelegation` / `onboard` would check, before anything is queued):
   - strict JSON schema (exact keys, types, hex shapes), body <= sa.api_max_body;
@@ -41,6 +50,7 @@ from eth_abi import encode as abi_encode
 from eth_account import Account
 from eth_utils import keccak, to_checksum_address
 
+from . import prefs as P
 from .sa_chain import (ACCOUNT_SALT, DM, EIP7702_IMPL, HYBRID_IMPL, MODULE_ABI_PATH, ROOT_AUTHORITY, SIMPLE_FACTORY,
                        TIMESTAMP_ENFORCER, Delegation, delegation_hash, dm_domain, hybrid_address, module_delegation,
                        permit_digest, typed_digest)
@@ -156,6 +166,7 @@ class OnboardRequest:
     kind: str  # hybrid | eip7702
     delegation: Delegation
     permit: dict | None  # {amount, deadline, v, r, s, token, spender} (ints / bytes / addresses)
+    strategy: P.Strategy | None = None
 
     def keeper_json(self) -> dict:
         """The exact request format Relayer.onboard (sa_chain) consumes."""
@@ -164,11 +175,21 @@ class OnboardRequest:
             p = {"amount": str(self.permit["amount"]), "deadline": str(self.permit["deadline"]), "v": self.permit["v"],
                  "r": "0x" + self.permit["r"].hex(), "s": "0x" + self.permit["s"].hex(),
                  "token": self.permit["token"], "spender": self.permit["spender"]}
-        return {"owner": self.owner, "kind": self.kind, "delegation": self.delegation.to_json(), "permit": p}
+        out = {"owner": self.owner, "kind": self.kind, "delegation": self.delegation.to_json(), "permit": p}
+        if self.strategy is not None:
+            out["strategy"] = self.strategy.to_json()
+        return out
+
+
+def _strategy(v) -> P.Strategy:
+    try:
+        return P.parse(v)
+    except P.PrefsError as e:
+        raise Reject(e.status, e.code, e.detail)
 
 
 def parse_request(obj: dict) -> OnboardRequest:
-    _keys(obj, "request", {"owner", "kind", "delegation", "permit"})
+    _keys(obj, "request", {"owner", "kind", "delegation", "permit"}, {"strategy"})
     owner = _addr(obj["owner"], "owner")
     kind = obj["kind"]
     if kind not in ("hybrid", "eip7702"):
@@ -198,7 +219,8 @@ def parse_request(obj: dict) -> OnboardRequest:
                   "spender": _addr(p["spender"], "permit.spender")}
     elif p is not None:
         raise _bad("permit_unexpected", "a 7702 account holds its funds already: permit must be null")
-    return OnboardRequest(owner, kind, dg, permit)
+    st = _strategy(obj["strategy"]) if obj.get("strategy") is not None else None
+    return OnboardRequest(owner, kind, dg, permit, st)
 
 
 def recover(digest: bytes, v: int, r: bytes, s: bytes) -> str | None:
@@ -292,11 +314,24 @@ class Policy:
     permit_max_window_s: int = 86400
     delegation_margin_s: int = 3600
     delegation_max_days: int = 400
+    strategy: P.Bounds = None  # manual width bounds and the Strategy deadline window
+
+    def __post_init__(self):
+        if self.strategy is None:
+            self.strategy = P.Bounds(deadline_min_s=300)
 
     @classmethod
     def from_cfg(cls, sa) -> "Policy":
         return cls(sa.api_permit_min_window_s, sa.api_permit_max_window_s, sa.api_delegation_margin_s,
-                   sa.api_delegation_max_days)
+                   sa.api_delegation_max_days, P.Bounds.from_cfg(sa, sa.api_strategy_min_window_s))
+
+
+def verify_strategy(st: P.Strategy, owner: str, account: str, f: Facts, now: int, pol: Policy, last_nonce: int = 0):
+    try:
+        P.verify(st, owner=owner, account=account, module=f.module, chain_id=f.chain_id, now=now, b=pol.strategy,
+                 last_nonce=last_nonce)
+    except P.PrefsError as e:
+        raise Reject(e.status, e.code, e.detail)
 
 
 def account_of(req: OnboardRequest) -> str:
@@ -350,6 +385,8 @@ def verify_offchain(req: OnboardRequest, f: Facts, now: int, pol: Policy) -> str
         if not now + pol.permit_min_window_s <= p["deadline"] <= now + pol.permit_max_window_s:
             raise _bad("permit_deadline", f"deadline must be within [now + {pol.permit_min_window_s} s, "
                                           f"now + {pol.permit_max_window_s} s]")
+    if req.strategy is not None:
+        verify_strategy(req.strategy, req.owner, account, f, now, pol)
     return account
 
 
@@ -439,6 +476,25 @@ class Queue:
                 best = (out, mt, self._read(p))
         return best
 
+    # ---- strategy updates: strategy/<owner>-<nonce>.json (the keeper moves each to strategy/done or strategy/failed)
+    def strategy_nonces(self, owner: str) -> list[int]:
+        d = self._p("strategy")
+        out = []
+        try:
+            names = os.listdir(d)
+        except OSError:
+            return out
+        for n in names:
+            if n.startswith(owner + "-") and n.endswith(".json"):
+                try:
+                    out.append(int(n[len(owner) + 1:-5]))
+                except ValueError:
+                    pass
+        return sorted(out)
+
+    def strategy_pending(self, owner: str, nonce: int):
+        return self._read(self._p("strategy", f"{owner}-{nonce}.json"))
+
     def count(self) -> int:
         try:
             return sum(1 for n in os.listdir(self.path) if OWNER_FILE_RE.match(n))
@@ -448,11 +504,12 @@ class Queue:
     def writable(self) -> bool:
         return os.path.isdir(self.path) and os.access(self.path, os.W_OK | os.X_OK)
 
-    def enqueue(self, owner: str, payload: dict) -> bool:
-        """Atomically create `<owner>.json` (never overwrites). Returns False if one is already pending."""
-        os.makedirs(self.path, exist_ok=True)
-        final = self._p(f"{owner}.json")
-        tmp = self._p(f".tmp-{owner}-{secrets.token_hex(6)}")
+    def enqueue(self, owner: str, payload: dict, name: str | None = None, sub: str = "") -> bool:
+        """Atomically create `<owner>.json` (or `sub/name`; never overwrites). False if it already exists."""
+        d = self._p(sub) if sub else self.path
+        os.makedirs(d, exist_ok=True)
+        final = os.path.join(d, name or f"{owner}.json")
+        tmp = os.path.join(d, f".tmp-{owner}-{secrets.token_hex(6)}")
         data = json.dumps(payload, sort_keys=True).encode()
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
         try:
@@ -471,7 +528,7 @@ class Queue:
             except OSError:
                 pass
         try:
-            dfd = os.open(self.path, os.O_RDONLY)
+            dfd = os.open(d, os.O_RDONLY)
             try:
                 os.fsync(dfd)
             finally:
@@ -510,7 +567,7 @@ class StatusFile:
 
 
 SUMMARY_KEYS = ("value", "usdc", "hype", "contributed", "profit", "hwm", "fees_paid", "hedge_equity", "net_margin",
-                "until", "positions", "stale")
+                "until", "positions", "stale", "return_pct", "range", "strategy")
 LEDGER_KEYS = ("short", "equity", "margin_in", "margin_out", "closed")
 URL_RE = re.compile(r"https?://\S+")
 
@@ -523,11 +580,15 @@ def _public_error(e) -> str:
 class SAApi:
     def __init__(self, chain, queue: Queue, status: StatusFile, pol: Policy, log, *, ip_onboard: RateLimiter,
                  owner_onboard: RateLimiter, ip_status: RateLimiter, stale_s: int = 600, max_body: int = 16384,
-                 wall=time.time):
+                 wall=time.time, recommend: StatusFile | None = None, owner_strategy: RateLimiter | None = None,
+                 recommend_stale_s: int = 7200):
         self.chain, self.q, self.status, self.pol, self.log = chain, queue, status, pol, log
         self.f: Facts = chain.facts
         self.rl_ip, self.rl_owner, self.rl_status = ip_onboard, owner_onboard, ip_status
+        self.rl_strategy = owner_strategy or RateLimiter(12, 3600)
         self.stale_s, self.max_body, self.wall = stale_s, max_body, wall
+        self.recommend = recommend or StatusFile("")
+        self.recommend_stale_s = recommend_stale_s
 
     @classmethod
     def from_config(cls, cfg, log, chain=None):
@@ -543,7 +604,10 @@ class SAApi:
                    ip_onboard=RateLimiter(sa.api_ip_onboard_per_min, 60),
                    owner_onboard=RateLimiter(sa.api_owner_onboard_per_hour, 3600),
                    ip_status=RateLimiter(sa.api_ip_status_per_min, 60),
-                   stale_s=sa.api_status_stale_s, max_body=sa.api_max_body)
+                   stale_s=sa.api_status_stale_s, max_body=sa.api_max_body,
+                   recommend=StatusFile(sa.recommend_path),
+                   owner_strategy=RateLimiter(sa.api_owner_strategy_per_hour, 3600),
+                   recommend_stale_s=sa.api_recommend_stale_s)
 
     # ---------------------------------------------------------------- POST /onboard
     def onboard(self, body: bytes, ip: str) -> tuple[int, dict]:
@@ -569,6 +633,78 @@ class SAApi:
         self.log("sa_api_queued", owner=req.owner, account=account, kind=req.kind,
                  amount=(req.permit or {}).get("amount", 0))
         return 202, self._queued(req, account)
+
+    # ---------------------------------------------------------------- POST /strategy
+    def _row(self, account: str) -> dict | None:
+        r = (self.status.load().get("accounts") or {}).get(account)
+        return r if isinstance(r, dict) else None
+
+    def _last_nonce(self, owner: str, account: str) -> int:
+        """Highest Strategy nonce known for the account: active (keeper status), queued updates, queued onboarding."""
+        n = int(((self._row(account) or {}).get("strategy") or {}).get("nonce") or 0)
+        qs = self.q.strategy_nonces(owner)
+        if qs:
+            n = max(n, qs[-1])
+        pend = self.q.pending(owner) or {}
+        if isinstance(pend.get("strategy"), dict):
+            try:
+                n = max(n, int(pend["strategy"]["nonce"]))
+            except (KeyError, ValueError, TypeError):
+                pass
+        return n
+
+    def strategy(self, body: bytes, ip: str) -> tuple[int, dict]:
+        if not self.rl_ip.allow("ip:" + ip):
+            raise Reject(429, "rate_limited", "too many requests from this address; try again in a minute")
+        obj = parse_json(body)
+        _keys(obj, "request", {"owner", "kind", "strategy"})
+        owner = _addr(obj["owner"], "owner")
+        kind = obj["kind"]
+        if kind not in ("hybrid", "eip7702"):
+            raise _bad("schema", "kind must be hybrid or eip7702")
+        st = _strategy(obj["strategy"])
+        account = hybrid_address(owner) if kind == "hybrid" else owner
+        now = self.chain.now()
+        verify_strategy(st, owner, account, self.f, now, self.pol)  # binding, values, deadline, signature
+        if not self.rl_strategy.allow("owner:" + owner):
+            raise Reject(429, "rate_limited", "too many strategy changes for this wallet; try again later")
+        name = f"{owner}-{st.nonce}.json"
+        payload = {"owner": owner, "kind": kind, "account": account, "strategy": st.to_json()}
+        dup = self.q.strategy_pending(owner, st.nonce)
+        if dup is not None:
+            if {k: dup.get(k) for k in payload} == payload:
+                return 200, {"ok": True, "state": "queued", "owner": owner, "account": account, "nonce": st.nonce,
+                             "duplicate": True}
+            raise Reject(409, "strategy_nonce", "another strategy with this nonce is already queued")
+        last = self._last_nonce(owner, account)
+        if st.nonce <= last:
+            raise Reject(409, "strategy_nonce", f"nonce must be above the current one ({last})")
+        pend = self.q.pending(owner)
+        if pend is None:
+            acc = self.chain.account(account)
+            if not acc["registered"] or acc["owner"] != owner:
+                raise Reject(409, "not_registered", "no account for this wallet yet: onboard first")
+            if acc["revoked"] or not acc["active"]:
+                raise Reject(409, "not_active", "the manager is stopped for this account")
+        elif pend.get("kind") != kind:
+            raise _bad("kind", "kind differs from the queued onboarding")
+        if not self.q.enqueue(owner, dict(payload, received_at=int(self.wall())), name=name, sub="strategy"):
+            raise Reject(409, "strategy_nonce", "another strategy with this nonce is already queued")
+        self.log("sa_api_strategy_queued", owner=owner, account=account, mode=st.mode, width_bps=st.width_bps,
+                 hedged=st.hedged, nonce=st.nonce)
+        return 202, {"ok": True, "state": "queued", "owner": owner, "account": account, "nonce": st.nonce,
+                     "duplicate": False}
+
+    # ---------------------------------------------------------------- GET /recommend
+    def get_recommend(self, ip: str) -> tuple[int, dict]:
+        if not self.rl_status.allow("ip:" + ip):
+            raise Reject(429, "rate_limited", "too many requests; try again in a minute")
+        doc = self.recommend.load()
+        if not doc:
+            raise Reject(503, "no_recommendation", "not computed yet; try again shortly")
+        g = doc.get("generated_at")
+        age = int(self.wall() - g) if isinstance(g, (int, float)) else None
+        return 200, dict(doc, ok=True, age_s=age, stale=age is None or age > self.recommend_stale_s)
 
     @staticmethod
     def _queued(req, account, duplicate=False) -> dict:
@@ -619,12 +755,35 @@ class SAApi:
             if account is None:
                 account, kind = hybrid_address(owner), kind or "hybrid"
         summary = None
+        strategy = None
         if row is not None:
             summary = {k: row.get(k) for k in SUMMARY_KEYS}
             led = row.get("ledger") or {}
             summary["hedge"] = {k: led.get(k) for k in LEDGER_KEYS}
+            strategy = row.get("strategy")
+        else:
+            ps = (self.q.pending(owner) or {}).get("strategy")
+            if isinstance(ps, dict):
+                strategy = self._public_strategy(ps, "queued")
+        pending = None
+        for n in reversed(self.q.strategy_nonces(owner)):
+            if n > int((strategy or {}).get("nonce") or 0):
+                rec = self.q.strategy_pending(owner, n) or {}
+                if isinstance(rec.get("strategy"), dict):
+                    pending = self._public_strategy(rec["strategy"], "queued")
+                break
         return 200, {"ok": True, "owner": owner, "account": account, "kind": kind, "state": state, "error": error,
-                     "summary": summary, "keeper": self._keeper(st)}
+                     "summary": summary, "keeper": self._keeper(st), "strategy": strategy,
+                     "strategy_pending": pending}
+
+    @staticmethod
+    def _public_strategy(m: dict, source: str) -> dict:
+        try:
+            manual = int(m.get("widthMode", 0)) == P.MODE_MANUAL
+            return {"mode": "manual" if manual else "auto", "width_bps": int(m["widthBps"]) if manual else None,
+                    "hedged": bool(m.get("hedged")), "nonce": int(m.get("nonce", 0)), "source": source}
+        except (KeyError, ValueError, TypeError):
+            return None
 
     def _keeper(self, st: dict) -> dict:
         w = st.get("written_at")
@@ -687,7 +846,11 @@ def make_handler(api: SAApi, trust_proxy: bool = True):
                     self._send(*api.health())
                 elif r == "/status":
                     self._send(*api.get_status(u.query, self._ip()))
-                elif r == "/onboard":
+                elif r == "/recommend":
+                    if u.query:
+                        raise _bad("query", "no query string")
+                    self._send(*api.get_recommend(self._ip()))
+                elif r in ("/onboard", "/strategy"):
                     raise Reject(405, "method", "POST only")
                 else:
                     raise Reject(404, "not_found")
@@ -700,8 +863,8 @@ def make_handler(api: SAApi, trust_proxy: bool = True):
         def do_POST(self):  # noqa: N802
             r, u = self._route()
             try:
-                if r != "/onboard":
-                    raise Reject(404 if r not in ("/status", "/health") else 405, "not_found")
+                if r not in ("/onboard", "/strategy"):
+                    raise Reject(404 if r not in ("/status", "/health", "/recommend") else 405, "not_found")
                 if u.query:
                     raise _bad("query", "no query string")
                 ct = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
@@ -719,7 +882,7 @@ def make_handler(api: SAApi, trust_proxy: bool = True):
                 body = self.rfile.read(n)
                 if len(body) != n:
                     raise _bad("schema", "truncated body")
-                status, out = api.onboard(body, self._ip())
+                status, out = (api.onboard if r == "/onboard" else api.strategy)(body, self._ip())
                 self._send(status, out)
             except Reject as e:
                 if e.status not in (404, 405, 411, 413, 415, 429):
