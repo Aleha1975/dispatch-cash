@@ -6,7 +6,10 @@
 #   install -d -o elysium-keeper -g elysium-keeper -m 2770 /var/lib/elysium-keeper/sa-requests   # queue (setgid)
 #   install -d -o elysium-keeper -g elysium-keeper -m 0750 /var/lib/elysium-keeper/sa-status     # keeper writes
 #   /etc/elysium-sa-api/sa-api.json: same `chain` (rpc_url = the public Elysium RPC, signer "readonly") and `sa`
-#   (module, requests_dir, status_path, api_*) as the SA keeper's config; no keystore, no env secrets.
+#   (module, requests_dir, status_path, recommend_path, api_*) as the SA keeper's config; no keystore, no env secrets.
+#   recommend_path and status_path both live in sa-status/ (keeper writes, API reads); strategy updates are queued in
+#   sa-requests/strategy/ (created by the API; the keeper moves them to strategy/done | strategy/failed).
+#   One API + one keeper instance per whitelisted pool (one LPManagerModule per pool; docs/PRODUCT_FLOW.md).
 #   nginx: keeper/deploy/nginx_elysium_api.conf
 [Unit]
 Description=Elysium smart-account relayer API (validate + enqueue, no keys)
