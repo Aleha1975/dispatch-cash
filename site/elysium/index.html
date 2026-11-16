@@ -38,7 +38,7 @@ nav.tabs{display:flex;gap:4px}
 nav.tabs a{font-size:13px;font-weight:600;color:var(--tx2);text-decoration:none;padding:7px 12px;border-radius:10px}
 nav.tabs a:hover{background:var(--card);color:var(--tx)}
 /* hero */
-.hero{padding:44px 0 18px;display:grid;grid-template-columns:1.25fr 1fr;gap:28px;align-items:end}
+.hero{padding:44px 0 18px;max-width:760px}
 .eyebrow{display:inline-flex;gap:8px;align-items:center;font:600 12px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--gold);background:rgba(255,210,74,.08);border:1px solid rgba(255,210,74,.25);padding:5px 10px;border-radius:999px}
 h1{font-size:44px;line-height:1.08;letter-spacing:-.03em;font-weight:800;margin:16px 0 12px}
 h1 em{font-style:normal;background:linear-gradient(90deg,var(--gold),#ff9d00);-webkit-background-clip:text;background-clip:text;color:transparent}
@@ -139,15 +139,6 @@ footer{border-top:1px solid var(--line);margin-top:50px;padding:24px 0 40px;colo
       <span class="eyebrow">● Private pilot · Elysium mainnet</span>
       <h1>Hedged liquidity on <em>Elysium</em>.<br>Earn the fees, not the drawdown.</h1>
       <p class="lead">We provide concentrated Uniswap v4 liquidity in HYPE/USDC and short the HYPE exposure on Hyperliquid. Your funds stay in your own smart account. You pay 15% of profit — only above your high-water mark.</p>
-    </div>
-    <div class="ticker">
-      <div class="lbl">HYPE/USDC · Uniswap v4 0.30% · live from chain</div>
-      <div class="px" id="px">—</div>
-      <div class="row">
-        <span>Hyperliquid <b id="hlpx">—</b></span>
-        <span>Spread <b id="spread">—</b></span>
-        <span>Block <b id="blk">—</b></span>
-      </div>
     </div>
   </div>
 
@@ -313,14 +304,13 @@ async function pollChain(){
   try{
     const [slot,bn]=await Promise.all([rpc('eth_call',[{to:PM,data:'0x1e2eaeaf'+SLOT0.slice(2)},'latest']),rpc('eth_blockNumber',[])]);
     const sp=BigInt(slot)&((1n<<160n)-1n); const px=(Number(sp)/2**96)**2*1e12;
-    const el=$('px'); if(lastPx!=null&&px!==lastPx){el.classList.remove('flash-up','flash-dn');void el.offsetWidth;el.classList.add(px>lastPx?'flash-up':'flash-dn');setTimeout(()=>el.classList.remove('flash-up','flash-dn'),900)}
-    lastPx=px; el.textContent='$'+fmt(px,3); $('blk').textContent=parseInt(bn,16).toLocaleString('en-US');
-    tick(px); updRange(px); spread(); rpcOk=Date.now(); status();
+    lastPx=px;
+    tick(px); updRange(px); rpcOk=Date.now(); status();
   }catch(e){status()}
 }
 async function pollHL(){
   try{const r=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'allMids'})});
-    const j=await r.json(); hlPx=+j.HYPE; $('hlpx').textContent='$'+fmt(hlPx,3); spread();
+    const j=await r.json(); hlPx=+j.HYPE;
     const now=Math.floor(Date.now()/1000); const t=now-now%15;
     if(!hlPts.length||hlPts[hlPts.length-1].time<t){hlPts.push({time:t,value:hlPx}); if(hlPts.length===1) hlLine.setData(hlPts); else hlLine.update({time:t,value:hlPx});}
   }catch(e){}
@@ -383,7 +373,7 @@ async function loadLive(first){
     const pl=live.pool; $('p-vol').textContent=kfmt(pl.vol24); $('p-swaps').textContent=`${pl.swaps24.toLocaleString('en-US')} swaps`;
     $('p-fees').textContent=usd(pl.fees24); $('p-depth').textContent=kfmt(pl.depth_1pct);
     vV.setData(pl.daily.map(d=>({time:d[0],value:d[1]}))); vF.setData(pl.daily.map(d=>({time:d[0],value:d[2]}))); vF.applyOptions({title:'LP fees $'}); vch.timeScale().fitContent();
-    if(lastPx==null){ $('px').textContent='$'+fmt(pl.price,3); updRange(pl.price); }
+    if(lastPx==null){ updRange(pl.price); }
   }catch(e){console.warn(e)}
 }
 
