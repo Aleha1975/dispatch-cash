@@ -57,13 +57,28 @@ def amounts(sp, sa, sb, L):
 def sint(b, bits):
     v = int.from_bytes(b, "big"); return v - (1 << 256) if v >> 255 else v
 
+_ANCH = []
+def _bts(b):
+    return int(rpc("eth_getBlockByNumber", [hex(b), False])["timestamp"], 16)
 def block_at(ts):
-    lo, hi = INIT_BLOCK, int(rpc("eth_blockNumber", []), 16)
-    while lo < hi:
-        m = (lo + hi) // 2
-        if int(rpc("eth_getBlockByNumber", [hex(m), False])["timestamp"], 16) < ts: lo = m + 1
-        else: hi = m
-    return lo
+    """first block with timestamp >= ts (interpolation search)"""
+    if not _ANCH:
+        h = int(rpc("eth_blockNumber", []), 16); _ANCH.extend([(INIT_BLOCK, _bts(INIT_BLOCK)), (h, _bts(h))])
+    lo = max((a for a in _ANCH if a[1] < ts), default=_ANCH[0])
+    hi = min((a for a in _ANCH if a[1] >= ts), default=None)
+    if hi is None:
+        h = int(rpc("eth_blockNumber", []), 16); hi = (h, _bts(h)); _ANCH.append(hi)
+        if hi[1] < ts: return h
+    (lb, lt), (hb, ht) = lo, hi
+    while hb - lb > 1:
+        g = lb + int((ts - lt) * (hb - lb) / max(ht - lt, 1))
+        g = min(max(g, lb + 1), hb - 1)
+        if hb - lb > 64:  # keep interpolation from crawling
+            g = min(max(g, lb + (hb - lb) // 64), hb - (hb - lb) // 64)
+        gt = _bts(g); _ANCH.append((g, gt))
+        if gt < ts: lb, lt = g, gt
+        else: hb, ht = g, gt
+    return hb
 
 def pos_state(tid, blk, sp, tick):
     try:
@@ -199,7 +214,24 @@ def main():
     daily = {}
     for k in keys:
         dd = int(k) - int(k) % 86400; e = daily.setdefault(dd, [0, 0, 0]); e[0] += m5[k][4]; e[1] += m5[k][5]; e[2] += m5[k][6]
+    # equity curve: pilot total return vs HYPE, 30-min steps (usd kept server-side only)
+    cv = st.setdefault("curve", {})
+    STEP = 1800
+    c30 = hl({"type": "candleSnapshot", "req": {"coin": "HYPE", "interval": "30m", "startTime": PILOT_START * 1000 - STEP * 1000, "endTime": now * 1000}})
+    opens = {int(c["t"]) // 1000: float(c["o"]) for c in c30}
+    s0 = seq[0]; p0 = s0["hl"]; v0 = s0["hype"] * p0 + s0["usdc"]
+    t = PILOT_START - PILOT_START % STEP + STEP
+    while t <= now - 60:
+        if str(t) not in cv and t in opens:
+            sn = snapshot(ts=t); pt = opens[t]
+            pnl_t = sn["hype"] * pt + sn["usdc"] - v0 + hedge_pnl(fills, fund, PILOT_START, t, p0, pt)
+            cv[str(t)] = [pt, round(pnl_t, 4)]
+        t += STEP
+    cap_now = cur["hype"] * hlmid + cur["usdc"] + (float(hpos["marginUsed"]) if hpos else 0)
+    curve_pts = [[PILOT_START, 0.0, 0.0]] + [[int(k), round((v[0] / p0 - 1) * 100, 3), round(v[1] / cap_now * 100, 3)] for k, v in sorted(cv.items(), key=lambda x: int(x[0]))]
+    curve_pts.append([now, round((hlmid / p0 - 1) * 100, 3), round(total["total"] / cap_now * 100, 3)])
     out = dict(
+        curve=curve_pts,
         updated=now, block=head,
         pool=dict(price=cur["P"], tick=cur["tick"], fee_bps=30, depth_1pct=round(depth, 0), vol24=round(v24, 0), fees24=round(f24, 2), swaps24=n24,
                   daily=[[d, round(v[0]), round(v[1], 2), v[2]] for d, v in sorted(daily.items())]),
