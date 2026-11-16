@@ -8,6 +8,7 @@
   python -m elysium_keeper sa-status  --config cfg.json            # accounts, ledger, fees; sends nothing
   python -m elysium_keeper sa-onboard --config cfg.json --request req.json   # relayer: deploy account + onboard
   python -m elysium_keeper sa-api     --config cfg.json            # relayer HTTP endpoint: validate + enqueue only
+  python -m elysium_keeper sa-recommend --config cfg.json [--out f.json]  # width recommendation (read only)
 """
 from __future__ import annotations
 
@@ -21,7 +22,9 @@ from .infra import State
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="elysium_keeper")
-    ap.add_argument("cmd", choices=["run", "status", "margin", "sa-run", "sa-status", "sa-onboard", "sa-api"])
+    ap.add_argument("cmd", choices=["run", "status", "margin", "sa-run", "sa-status", "sa-onboard", "sa-api",
+                                       "sa-recommend"])
+    ap.add_argument("--out", default=None, help="sa-recommend: write the JSON here (default: stdout)")
     ap.add_argument("--request", default=None, help="sa-onboard: onboarding request JSON (from the web flow)")
     ap.add_argument("--config", required=True)
     ap.add_argument("--once", action="store_true")
@@ -49,6 +52,26 @@ def main(argv=None):
         from .sa_api import serve
 
         serve(cfg, Log(cfg.log_path, cfg.name + "-api"))
+        return
+
+    if a.cmd == "sa-recommend":  # read only: RPC + HL public info; module Params when sa.module is set
+        from .hl import HLInfo
+        from .recommend import compute, write
+        from .rpc import RPC
+
+        rpc = RPC(cfg.chain.rpc_url)
+        params, pool = None, dict(cfg.sa.pools[0])
+        if cfg.sa.module:
+            from .sa_chain import PARAM_KEYS, ModuleReader
+
+            params = dict(zip(PARAM_KEYS, ModuleReader(rpc, cfg.sa.module).m.call("params")))
+            pool = next((p for p in cfg.sa.pools if (p.get("module") or "").lower() == cfg.sa.module.lower()), pool)
+            pool["module"] = cfg.sa.module
+        doc = compute(cfg, hl_info=HLInfo(cfg.hl.api_url), rpc=rpc, pool=pool, params=params)
+        if a.out:
+            write(a.out, doc)
+        else:
+            print(json.dumps(doc, indent=1))
         return
 
     if a.cmd.startswith("sa-"):

@@ -119,6 +119,28 @@ class SACfg:
     api_delegation_margin_s: int = 3600  # expiry >= now + module MIN_DELEGATION_LIFETIME + this margin
     api_delegation_max_days: int = 400
     api_status_stale_s: int = 600  # keeper status file older than this: reported as stale
+    api_owner_strategy_per_hour: int = 12
+    api_strategy_min_window_s: int = 300  # a Strategy signature must stay valid this long after submission
+    # ---- product: pool whitelist, client strategy preferences, recommendation (docs/PRODUCT_FLOW.md)
+    # One entry per hook-free Uniswap v4 pool; each pool has its own LPManagerModule (PoolKey is immutable), its own
+    # keeper instance (sa.module = that module) and its own API base. Keys: id, name, dex, pool_id, fee, tick_spacing,
+    # module, api (web path), status (live | soon).
+    pools: list = field(default_factory=lambda: [{
+        "id": "uniswap-v4-hype-usdc-30", "name": "HYPE / USDC", "dex": "uniswap-v4", "fee": 3000, "tick_spacing": 60,
+        "pool_id": "0xb3032695ffb0a66e6342876dd2386835471466cb2bb70f341947d98a69e265cc", "module": "",
+        "api": "/elysium-api/sa", "status": "live"}])
+    width_min_bps: int = 200  # manual half-width bounds (bps of the price at centring); see prefs.py
+    width_max_bps: int = 4000
+    strategy_deadline_max_s: int = 2 * 86400
+    default_hedged: bool = True  # accounts without a signed Strategy (onboarded before it existed)
+    edge_frac: float = 0.10  # re-range when the price is within this share of the range from an edge
+    rewidth_tol: float = 0.25  # a changed preference re-ranges when the width differs by more than this
+    auto_rewidth_factor: float = 2.0  # auto: re-range when the vol-based width moved by more than this factor
+    recommend_path: str = ""  # keeper writes GET /recommend here (served by sa-api)
+    recommend_every_s: int = 900
+    recommend_fee_horizon_h: int = 168
+    recommend_reference_usd: float = 25000.0  # capital assumed in the pool for fee dilution (or the live total)
+    api_recommend_stale_s: int = 7200
 
 
 @dataclass
@@ -164,4 +186,11 @@ def from_dict(d: dict) -> Config:
         raise ValueError("strategy.mode must be hedged or growth")
     if c.hl.adapter not in ("dry_run", "live"):
         raise ValueError("hl.adapter must be dry_run or live")
+    if not 0 < c.sa.width_min_bps <= c.sa.width_max_bps <= 9000:
+        raise ValueError("sa.width_min_bps / width_max_bps out of range")
+    if not 0 <= c.sa.edge_frac < 0.5:
+        raise ValueError("sa.edge_frac must be in [0, 0.5)")
+    for p in c.sa.pools:
+        if not isinstance(p, dict) or not str(p.get("pool_id", "")).startswith("0x") or len(p["pool_id"]) != 66:
+            raise ValueError("sa.pools entries need a 32-byte pool_id")
     return c
