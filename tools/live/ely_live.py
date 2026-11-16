@@ -122,6 +122,26 @@ def load_state():
     try: return json.load(open(STATE))
     except Exception: return {"last_block": INIT_BLOCK - 1, "m5": {}, "day_snaps": {}}
 
+def pilot_pct(cur, hpos, hlmid, p, lp_hype, short, total, days, fees_total, days_live):
+    """Public view: percentages only, no dollar amounts or sizes."""
+    margin = float(hpos["marginUsed"]) if hpos else 0
+    cap = cur["hype"] * hlmid + cur["usdc"] + margin
+    pc = lambda v: round(v / cap * 100, 3)
+    lp_usdc = (p["a1"] + p["f1"]) if p else 0
+    lp_val = lp_hype * hlmid + lp_usdc
+    tot = pc(total["total"])
+    return dict(start=PILOT_START, days=round(days_live, 2),
+                range=[tick_price(p["lo"]), tick_price(p["hi"])] if p else None, in_range=bool(p and p["lo"] <= cur["tick"] < p["hi"]),
+                hype_share=round(lp_hype * hlmid / lp_val * 100, 1) if lp_val else None,
+                hedge_ratio=round(short / lp_hype, 3) if lp_hype else None,
+                margin_share=round(margin / cap * 100, 1),
+                liq_px=float(hpos["liquidationPx"]) if hpos and hpos.get("liquidationPx") else None,
+                total_pct=tot, lp_pct=pc(total["lp"]), hedge_pct=pc(total["hedge"]),
+                apr=round(tot / max(days_live, 0.01) * 365, 1),
+                fees_pct=pc(fees_total), unclaimed_pct=pc(cur["fees"]),
+                fee_yield_day=round(fees_total / max(days_live, 0.01) / cap * 100, 3),
+                days_pnl=[dict(t0=d["t0"], lp=pc(d["lp"]), hedge=pc(d["hedge"]), total=pc(d["total"])) for d in days])
+
 def main():
     st = load_state()
     head = int(rpc("eth_blockNumber", []), 16)
@@ -185,17 +205,10 @@ def main():
                   daily=[[d, round(v[0]), round(v[1], 2), v[2]] for d, v in sorted(daily.items())]),
         candles=[[int(k)] + [round(x, 4) for x in m5[k][:4]] + [round(m5[k][4], 2)] for k in keys],
         hl_mid=hlmid,
-        pilot=dict(start=PILOT_START, days=round(days_live, 2), value=round(cur["hype"] * hlmid + cur["usdc"], 2),
-                   hl_margin=round(float(hpos["marginUsed"]), 2) if hpos else 0,
-                   range=[tick_price(p["lo"]), tick_price(p["hi"])] if p else None, in_range=bool(p and p["lo"] <= cur["tick"] < p["hi"]),
-                   lp_hype=round(lp_hype, 4), lp_usdc=round((p["a1"] + p["f1"]) if p else 0, 2), unclaimed=round(cur["fees"], 2),
-                   fees_total=round(fees_total, 2), short=short, hedge_ratio=round(short / lp_hype, 3) if lp_hype else None,
-                   liq_px=float(hpos["liquidationPx"]) if hpos and hpos.get("liquidationPx") else None,
-                   total=total, days_pnl=days,
-                   fee_yield_day=round(fees_total / max(days_live, 0.01) / 245 * 100, 2)))
+        pilot=pilot_pct(cur, hpos, hlmid, p, lp_hype, short, total, days, fees_total, days_live))
     tmp = OUT + ".tmp"; json.dump(out, open(tmp, "w"), separators=(",", ":")); os.replace(tmp, OUT)
     json.dump(st, open(STATE + ".tmp", "w"), separators=(",", ":")); os.replace(STATE + ".tmp", STATE)
-    print(f"ok block {head} price {cur['P']:.3f} candles {len(keys)} total {total['total']}")
+    print(f"ok block {head} price {cur['P']:.3f} candles {len(keys)}")
 
 if __name__ == "__main__":
     main()

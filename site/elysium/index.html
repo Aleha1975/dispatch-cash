@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>DeepYield · Elysium Hedged LP</title>
+<title>Elysium Hedged LP</title>
 <meta name="description" content="Delta-hedged Uniswap v4 liquidity on Elysium. Live pool, live pilot, live pool monitor.">
 <meta name="theme-color" content="#07090d">
 <link rel="icon" href="/favicon.svg">
@@ -128,7 +128,7 @@ footer{border-top:1px solid var(--line);margin-top:50px;padding:24px 0 40px;colo
 </head>
 <body>
 <header><div class="wrap">
-  <div class="brand"><span class="logo"></span>DeepYield <small>· Elysium</small></div>
+  <div class="brand"><span class="logo"></span>Elysium <small>· Hedged LP</small></div>
   <nav class="tabs"><a href="#chart-sec">Pool</a><a href="#pilot">Live pilot</a><a href="#monitor">Pool monitor</a><a href="#how">How it works</a></nav>
   <div class="live"><span class="dot" id="dot"></span><span id="livelbl">connecting…</span></div>
 </div></header>
@@ -152,8 +152,8 @@ footer{border-top:1px solid var(--line);margin-top:50px;padding:24px 0 40px;colo
   </div>
 
   <div class="kpis">
-    <div class="kpi"><div class="k">Pilot P&amp;L</div><div class="v" id="k-pnl">—</div><div class="s" id="k-pnl-s">since start</div></div>
-    <div class="kpi"><div class="k">Fees earned</div><div class="v" id="k-fees">—</div><div class="s" id="k-fees-s">—</div></div>
+    <div class="kpi"><div class="k">Pilot return</div><div class="v" id="k-pnl">—</div><div class="s" id="k-pnl-s">since start</div></div>
+    <div class="kpi"><div class="k">Fees earned, % of capital</div><div class="v" id="k-fees">—</div><div class="s" id="k-fees-s">—</div></div>
     <div class="kpi"><div class="k">Hedge ratio</div><div class="v" id="k-hedge">—</div><div class="s" id="k-hedge-s">short HYPE on Hyperliquid</div></div>
     <div class="kpi"><div class="k">HYPE move, same period</div><div class="v" id="k-hype">—</div><div class="s">what an unhedged holder saw</div></div>
   </div>
@@ -181,16 +181,17 @@ footer{border-top:1px solid var(--line);margin-top:50px;padding:24px 0 40px;colo
       <div class="card">
         <div class="mut" style="font-size:13px;font-weight:600">LP range</div>
         <div class="rangebox" id="rangebox"><div class="track"></div><div class="band" id="band"></div><div class="mark" id="mark" data-p="—"></div><span class="lo" id="rlo"></span><span class="hi" id="rhi"></span></div>
-        <div class="stat"><span>Position value (LP + wallet)</span><b id="s-val">—</b></div>
-        <div class="stat"><span>In the pool</span><b id="s-lp">—</b></div>
-        <div class="stat"><span>Hyperliquid short · margin</span><b id="s-short">—</b></div>
-        <div class="stat"><span>Short liquidation price</span><b id="s-liq">—</b></div>
+        <div class="stat"><span>Pool composition</span><b id="s-lp">—</b></div>
+        <div class="stat"><span>LP leg return</span><b id="s-lpp">—</b></div>
+        <div class="stat"><span>Hedge leg return</span><b id="s-hp">—</b></div>
         <div class="stat"><span>Unclaimed fees</span><b id="s-unc">—</b></div>
         <div class="stat"><span>Average fee yield</span><b id="s-yield">—</b></div>
+        <div class="stat"><span>Hedge margin, share of capital</span><b id="s-short">—</b></div>
+        <div class="stat"><span>Short liquidation price</span><b id="s-liq">—</b></div>
         <div class="stat"><span>Running</span><b id="s-days">—</b></div>
       </div>
       <div class="card">
-        <div class="mut" style="font-size:13px;font-weight:600;margin-bottom:6px">Daily P&amp;L · LP vs hedge</div>
+        <div class="mut" style="font-size:13px;font-weight:600;margin-bottom:6px">Daily return, % of capital · LP vs hedge</div>
         <div id="daily" class="mini" style="height:300px"></div>
         <div class="legend" style="margin-top:8px"><span><i style="background:var(--violet)"></i>LP leg</span><span><i style="background:var(--blue)"></i>hedge leg</span><span><i style="background:var(--gold)"></i>net</span></div>
       </div>
@@ -238,7 +239,7 @@ footer{border-top:1px solid var(--line);margin-top:50px;padding:24px 0 40px;colo
   </section>
 </main>
 
-<footer><div class="wrap">DeepYield · Elysium (chain 99901) · Data straight from chain and Hyperliquid, no third-party indexer. Pilot figures are real results on our own capital; past results do not guarantee future returns. LP positions can lose value; hedging reduces but does not remove risk.</div></footer>
+<footer><div class="wrap">Elysium Hedged LP · chain 99901 · Data straight from chain and Hyperliquid, no third-party indexer. Pilot figures are real results on our own capital; past results do not guarantee future returns. LP positions can lose value; hedging reduces but does not remove risk.</div></footer>
 
 <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
 <script>
@@ -346,9 +347,9 @@ function updRange(px){
 
 // daily pnl chart
 const dch=C.createChart($('daily'),{autoSize:true,layout:{background:{color:'transparent'},textColor:'#7f8da0',fontFamily:'JetBrains Mono'},grid:{vertLines:{visible:false},horzLines:{color:'rgba(255,255,255,.04)'}},rightPriceScale:{borderColor:'#1c2532'},timeScale:{borderColor:'#1c2532'},handleScroll:false,handleScale:false});
-const dLP=dch.addHistogramSeries({lastValueVisible:false,priceLineVisible:false,color:'rgba(157,123,255,.55)',priceFormat:{type:'price',precision:2,minMove:.01}});
-const dH=dch.addHistogramSeries({lastValueVisible:false,priceLineVisible:false,color:'rgba(90,169,255,.55)',priceFormat:{type:'price',precision:2,minMove:.01}});
-const dN=dch.addLineSeries({color:'#FFD24A',lineWidth:3,pointMarkersVisible:true,priceFormat:{type:'price',precision:2,minMove:.01}});
+const dLP=dch.addHistogramSeries({lastValueVisible:false,priceLineVisible:false,color:'rgba(157,123,255,.55)',priceFormat:{type:'percent',precision:2,minMove:.01}});
+const dH=dch.addHistogramSeries({lastValueVisible:false,priceLineVisible:false,color:'rgba(90,169,255,.55)',priceFormat:{type:'percent',precision:2,minMove:.01}});
+const dN=dch.addLineSeries({color:'#FFD24A',lineWidth:3,pointMarkersVisible:true,priceFormat:{type:'percent',precision:2,minMove:.01}});
 const vch=C.createChart($('dvol'),{autoSize:true,layout:{background:{color:'transparent'},textColor:'#7f8da0',fontFamily:'JetBrains Mono'},grid:{vertLines:{visible:false},horzLines:{color:'rgba(255,255,255,.04)'}},rightPriceScale:{borderColor:'#1c2532'},leftPriceScale:{visible:true,borderColor:'#1c2532'},timeScale:{borderColor:'#1c2532'},handleScroll:false,handleScale:false});
 const vV=vch.addHistogramSeries({color:'rgba(90,169,255,.6)',priceScaleId:'left',priceFormat:{type:'volume'}});
 const vF=vch.addLineSeries({color:'#FFD24A',lineWidth:2,pointMarkersVisible:true,priceFormat:{type:'price',precision:0,minMove:1}});
@@ -359,19 +360,21 @@ async function loadLive(first){
     base=live.candles; const P=live.pilot;
     if(first){ draw(true); } else { const keep=chart.timeScale().getVisibleLogicalRange(); draw(false); if(keep) chart.timeScale().setVisibleLogicalRange(keep); }
     setRange(P.range);
-    const t=P.total; $('k-pnl').textContent=sgn(t.total); cls($('k-pnl'),t.total);
-    const cap=P.value+P.hl_margin; $('k-pnl-s').textContent=`${(t.total/cap*100>=0?'+':'')}${(t.total/cap*100).toFixed(2)}% on ${usd(cap,0)} · ${P.days.toFixed(1)} days`;
-    $('k-fees').textContent=usd(P.fees_total); $('k-fees-s').textContent=`${P.fee_yield_day.toFixed(2)}% per day on position`;
+    const pct=(v,d=2)=>v==null?'—':(v>=0?'+':'−')+Math.abs(v).toFixed(d)+'%';
+    $('k-pnl').textContent=pct(P.total_pct); cls($('k-pnl'),P.total_pct);
+    $('k-pnl-s').textContent=`≈${P.apr.toFixed(0)}% annualized pace · ${P.days.toFixed(1)} days`;
+    $('k-fees').textContent=pct(P.fees_pct); $('k-fees-s').textContent=`${P.fee_yield_day.toFixed(2)}% per day`;
     $('k-hedge').textContent=P.hedge_ratio?(P.hedge_ratio*100).toFixed(0)+'%':'—';
-    $('k-hedge-s').textContent=`${fmt(P.short,2)} HYPE short vs ${fmt(P.lp_hype,2)} HYPE in LP`;
-    const c0=base.find(c=>c[0]>=P.start); const h0=c0?c0[1]:null, h1=live.hl_mid;
-    if(h0){const m=(live.pool.price/h0-1)*100; $('k-hype').textContent=(m>=0?'+':'')+m.toFixed(1)+'%'; cls($('k-hype'),m);}
-    $('s-val').textContent=usd(P.value);
-    $('s-lp').textContent=`${fmt(P.lp_hype,3)} HYPE + ${usd(P.lp_usdc)}`;
-    $('s-short').textContent=`${fmt(P.short,2)} HYPE · ${usd(P.hl_margin)}`;
-    $('s-liq').textContent=P.liq_px?'$'+fmt(P.liq_px,2):'—';
-    $('s-unc').textContent=usd(P.unclaimed);
+    $('k-hedge-s').textContent='HYPE short on Hyperliquid vs HYPE in the pool';
+    const c0=base.find(c=>c[0]>=P.start); const h0=c0?c0[1]:null;
+    if(h0){const m=(live.pool.price/h0-1)*100; $('k-hype').textContent=pct(m,1); cls($('k-hype'),m);}
+    $('s-lp').textContent=P.hype_share!=null?`${P.hype_share.toFixed(0)}% HYPE · ${(100-P.hype_share).toFixed(0)}% USDC`:'—';
+    $('s-lpp').textContent=pct(P.lp_pct); cls($('s-lpp'),P.lp_pct);
+    $('s-hp').textContent=pct(P.hedge_pct); cls($('s-hp'),P.hedge_pct);
+    $('s-unc').textContent=pct(P.unclaimed_pct);
     $('s-yield').textContent=P.fee_yield_day.toFixed(2)+'% / day';
+    $('s-short').textContent=P.margin_share.toFixed(0)+'%';
+    $('s-liq').textContent=P.liq_px?'$'+fmt(P.liq_px,2):'—';
     $('s-days').textContent=P.days.toFixed(1)+' days';
     const dd=P.days_pnl.map(d=>({time:d.t0-d.t0%86400,lp:d.lp,h:d.hedge,n:d.total}));
     dLP.setData(dd.map(d=>({time:d.time,value:d.lp}))); dH.setData(dd.map(d=>({time:d.time,value:d.h})));
