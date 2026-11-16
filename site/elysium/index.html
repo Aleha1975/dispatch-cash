@@ -1,0 +1,416 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>DeepYield · Elysium Hedged LP</title>
+<meta name="description" content="Delta-hedged Uniswap v4 liquidity on Elysium. Live pool, live pilot, live pool monitor.">
+<meta name="theme-color" content="#07090d">
+<link rel="icon" href="/favicon.svg">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#07090d; --bg2:#0c1017; --card:#0f141c; --card2:#131a24; --line:#1c2532; --line2:#263142;
+  --tx:#e8edf4; --tx2:#9aa7b8; --tx3:#5f6c7e;
+  --gold:#FFD24A; --gold2:#ffb800; --up:#22d39a; --dn:#ff5c7a; --blue:#5aa9ff; --violet:#9d7bff;
+  --r:16px; --mono:'JetBrains Mono',ui-monospace,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:var(--bg);color:var(--tx);font:15px/1.5 Inter,system-ui,sans-serif;-webkit-font-smoothing:antialiased}
+body{background:radial-gradient(1200px 600px at 80% -10%,rgba(255,210,74,.07),transparent 60%),radial-gradient(900px 500px at -10% 10%,rgba(90,169,255,.06),transparent 60%),var(--bg);min-height:100vh}
+a{color:inherit}
+.wrap{max-width:1200px;margin:0 auto;padding:0 20px}
+.mono{font-family:var(--mono)}
+.up{color:var(--up)} .dn{color:var(--dn)} .mut{color:var(--tx2)} .dim{color:var(--tx3)}
+/* header */
+header{position:sticky;top:0;z-index:20;backdrop-filter:blur(14px);background:rgba(7,9,13,.72);border-bottom:1px solid var(--line)}
+header .wrap{display:flex;align-items:center;justify-content:space-between;height:62px;gap:12px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:800;letter-spacing:-.01em}
+.brand .logo{width:28px;height:28px;border-radius:8px;background:conic-gradient(from 210deg,var(--gold),var(--gold2),#ff7a00,var(--gold));box-shadow:0 0 24px rgba(255,210,74,.35)}
+.brand small{font-weight:600;color:var(--tx2);font-size:13px;margin-left:2px}
+.live{display:flex;align-items:center;gap:8px;font:600 12px var(--mono);color:var(--tx2);background:var(--card);border:1px solid var(--line);padding:6px 10px;border-radius:999px;white-space:nowrap}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--up);box-shadow:0 0 0 0 rgba(34,211,154,.6);animation:pulse 1.8s infinite}
+.dot.stale{background:var(--gold);animation:none}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(34,211,154,.55)}70%{box-shadow:0 0 0 9px rgba(34,211,154,0)}100%{box-shadow:0 0 0 0 rgba(34,211,154,0)}}
+nav.tabs{display:flex;gap:4px}
+nav.tabs a{font-size:13px;font-weight:600;color:var(--tx2);text-decoration:none;padding:7px 12px;border-radius:10px}
+nav.tabs a:hover{background:var(--card);color:var(--tx)}
+/* hero */
+.hero{padding:44px 0 18px;display:grid;grid-template-columns:1.25fr 1fr;gap:28px;align-items:end}
+.eyebrow{display:inline-flex;gap:8px;align-items:center;font:600 12px var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--gold);background:rgba(255,210,74,.08);border:1px solid rgba(255,210,74,.25);padding:5px 10px;border-radius:999px}
+h1{font-size:44px;line-height:1.08;letter-spacing:-.03em;font-weight:800;margin:16px 0 12px}
+h1 em{font-style:normal;background:linear-gradient(90deg,var(--gold),#ff9d00);-webkit-background-clip:text;background-clip:text;color:transparent}
+.lead{color:var(--tx2);font-size:16.5px;max-width:560px}
+.ticker{background:linear-gradient(180deg,var(--card2),var(--card));border:1px solid var(--line);border-radius:var(--r);padding:20px 22px;position:relative;overflow:hidden}
+.ticker:before{content:"";position:absolute;inset:-1px;border-radius:var(--r);padding:1px;background:linear-gradient(135deg,rgba(255,210,74,.5),transparent 40%,transparent 60%,rgba(90,169,255,.4));-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude;pointer-events:none}
+.ticker .lbl{font:600 12px var(--mono);color:var(--tx3);text-transform:uppercase;letter-spacing:.08em}
+.ticker .px{font:700 46px/1.1 var(--mono);letter-spacing:-.02em;margin:6px 0 4px;transition:color .4s}
+.ticker .px.flash-up{color:var(--up)} .ticker .px.flash-dn{color:var(--dn)}
+.ticker .row{display:flex;gap:18px;flex-wrap:wrap;font:500 13px var(--mono);color:var(--tx2)}
+.ticker .row b{color:var(--tx);font-weight:600}
+/* kpis */
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:18px 0 8px}
+.kpi{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+.kpi .k{font-size:12px;color:var(--tx3);font-weight:600;text-transform:uppercase;letter-spacing:.06em}
+.kpi .v{font:700 24px var(--mono);margin-top:4px;letter-spacing:-.02em}
+.kpi .s{font-size:12.5px;color:var(--tx2);margin-top:2px}
+/* sections */
+section{margin:34px 0}
+.sh{display:flex;align-items:end;justify-content:space-between;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+h2{font-size:22px;letter-spacing:-.02em;font-weight:800}
+.sh p{color:var(--tx2);font-size:13.5px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);padding:18px}
+.chartcard{padding:0;overflow:hidden}
+.chartbar{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid var(--line);gap:10px;flex-wrap:wrap}
+.seg{display:inline-flex;background:var(--bg2);border:1px solid var(--line);border-radius:10px;padding:3px}
+.seg button{all:unset;cursor:pointer;font:600 12px var(--mono);color:var(--tx2);padding:6px 11px;border-radius:7px}
+.seg button.on{background:var(--card2);color:var(--tx);box-shadow:inset 0 0 0 1px var(--line2)}
+.legend{display:flex;gap:14px;font:500 12px var(--mono);color:var(--tx2);flex-wrap:wrap}
+.legend i{display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:6px;vertical-align:middle}
+#chart{height:460px;width:100%}
+.grid2{display:grid;grid-template-columns:1.1fr 1fr;gap:14px;align-items:start}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+.stat{display:flex;justify-content:space-between;align-items:baseline;padding:9px 0;border-bottom:1px dashed var(--line)}
+.stat:last-child{border-bottom:0}
+.stat span{color:var(--tx2);font-size:13.5px}
+.stat b{font:600 14px var(--mono)}
+.bar{height:10px;border-radius:6px;background:var(--bg2);border:1px solid var(--line);position:relative;overflow:hidden;margin:8px 0 4px}
+.bar>i{position:absolute;top:0;bottom:0;border-radius:6px}
+.rangebox{position:relative;height:54px;margin:14px 0 6px}
+.rangebox .track{position:absolute;left:0;right:0;top:22px;height:10px;border-radius:6px;background:var(--bg2);border:1px solid var(--line)}
+.rangebox .band{position:absolute;top:22px;height:10px;border-radius:6px;background:linear-gradient(90deg,rgba(255,210,74,.35),rgba(255,210,74,.7),rgba(255,210,74,.35))}
+.rangebox .mark{position:absolute;top:12px;width:2px;height:30px;background:var(--tx);border-radius:2px;transition:left .6s}
+.rangebox .mark:after{content:attr(data-p);position:absolute;top:-18px;left:50%;transform:translateX(-50%);font:600 11px var(--mono);color:var(--tx);white-space:nowrap}
+.rangebox .lo,.rangebox .hi{position:absolute;top:38px;font:500 11px var(--mono);color:var(--tx3)}
+.pill{display:inline-flex;align-items:center;gap:6px;font:600 11.5px var(--mono);padding:3px 8px;border-radius:999px;border:1px solid var(--line2);color:var(--tx2)}
+.pill.ok{color:var(--up);border-color:rgba(34,211,154,.35);background:rgba(34,211,154,.07)}
+.pill.warn{color:var(--gold);border-color:rgba(255,210,74,.35);background:rgba(255,210,74,.07)}
+.pill.bad{color:var(--dn);border-color:rgba(255,92,122,.35);background:rgba(255,92,122,.07)}
+.mini{height:180px}
+/* table */
+.tbl{width:100%;border-collapse:collapse;font-size:13.5px}
+.tbl th{font:600 11.5px var(--mono);text-transform:uppercase;letter-spacing:.06em;color:var(--tx3);text-align:right;padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap;cursor:pointer;user-select:none}
+.tbl th:first-child,.tbl td:first-child,.tbl th:nth-child(2),.tbl td:nth-child(2){text-align:left}
+.tbl td{padding:11px 12px;border-bottom:1px solid var(--line);text-align:right;font-family:var(--mono);white-space:nowrap}
+.tbl tr:hover td{background:rgba(255,255,255,.015)}
+.tbl tr.ours td{background:rgba(255,210,74,.05)}
+.tbl tr.ours td:first-child{box-shadow:inset 3px 0 0 var(--gold)}
+.tbl .pair{font-family:Inter;font-weight:700}
+.tbl .venue{font-family:Inter;color:var(--tx2);font-size:12.5px}
+.vbar{display:inline-block;height:6px;border-radius:4px;background:linear-gradient(90deg,var(--blue),var(--violet));vertical-align:middle;margin-left:8px;opacity:.8}
+.scroll{overflow-x:auto;-webkit-overflow-scrolling:touch}
+/* steps */
+.step{position:relative;padding-top:6px}
+.step .n{font:700 12px var(--mono);color:var(--gold);letter-spacing:.08em}
+.step h3{font-size:17px;margin:6px 0 6px;letter-spacing:-.01em}
+.step p{color:var(--tx2);font-size:14px}
+.fee{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
+.fee .big{font:800 54px/1 var(--mono);background:linear-gradient(90deg,var(--gold),#ff9d00);-webkit-background-clip:text;background-clip:text;color:transparent}
+.audits{display:flex;flex-direction:column;gap:8px}
+.audit{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--line);border-radius:12px;background:var(--bg2);font-size:13.5px}
+.audit a{text-decoration:none}
+.audit a:hover{color:var(--gold)}
+footer{border-top:1px solid var(--line);margin-top:50px;padding:24px 0 40px;color:var(--tx3);font-size:12.5px}
+.note{font-size:12px;color:var(--tx3);margin-top:10px}
+.skel{color:var(--tx3)}
+@media (max-width:900px){
+  .hero{grid-template-columns:1fr;padding-top:28px}
+  h1{font-size:34px}
+  .kpis{grid-template-columns:repeat(2,1fr)}
+  .grid2,.grid3{grid-template-columns:1fr}
+  nav.tabs{display:none}
+  #chart{height:360px}
+}
+@media (max-width:420px){ .wrap{padding:0 16px} .ticker .px{font-size:38px} .kpi .v{font-size:20px} }
+</style>
+</head>
+<body>
+<header><div class="wrap">
+  <div class="brand"><span class="logo"></span>DeepYield <small>· Elysium</small></div>
+  <nav class="tabs"><a href="#chart-sec">Pool</a><a href="#pilot">Live pilot</a><a href="#monitor">Pool monitor</a><a href="#how">How it works</a></nav>
+  <div class="live"><span class="dot" id="dot"></span><span id="livelbl">connecting…</span></div>
+</div></header>
+
+<main class="wrap">
+  <div class="hero">
+    <div>
+      <span class="eyebrow">● Private pilot · Elysium mainnet</span>
+      <h1>Hedged liquidity on <em>Elysium</em>.<br>Earn the fees, not the drawdown.</h1>
+      <p class="lead">We provide concentrated Uniswap v4 liquidity in HYPE/USDC and short the HYPE exposure on Hyperliquid. Your funds stay in your own smart account. You pay 15% of profit — only above your high-water mark.</p>
+    </div>
+    <div class="ticker">
+      <div class="lbl">HYPE/USDC · Uniswap v4 0.30% · live from chain</div>
+      <div class="px" id="px">—</div>
+      <div class="row">
+        <span>Hyperliquid <b id="hlpx">—</b></span>
+        <span>Spread <b id="spread">—</b></span>
+        <span>Block <b id="blk">—</b></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="kpis">
+    <div class="kpi"><div class="k">Pilot P&amp;L</div><div class="v" id="k-pnl">—</div><div class="s" id="k-pnl-s">since start</div></div>
+    <div class="kpi"><div class="k">Fees earned</div><div class="v" id="k-fees">—</div><div class="s" id="k-fees-s">—</div></div>
+    <div class="kpi"><div class="k">Hedge ratio</div><div class="v" id="k-hedge">—</div><div class="s" id="k-hedge-s">short HYPE on Hyperliquid</div></div>
+    <div class="kpi"><div class="k">HYPE move, same period</div><div class="v" id="k-hype">—</div><div class="s">what an unhedged holder saw</div></div>
+  </div>
+
+  <section id="chart-sec">
+    <div class="sh"><div><h2>HYPE/USDC pool price</h2><p>Every swap since pool launch · last candle ticks live from the PoolManager</p></div>
+      <div class="legend"><span><i style="background:var(--gold)"></i>our range</span><span><i style="background:var(--blue)"></i>Hyperliquid mid</span><span><i style="background:#3b4a60"></i>volume</span></div></div>
+    <div class="card chartcard">
+      <div class="chartbar">
+        <div class="seg" id="tf"><button data-tf="5">5m</button><button data-tf="15" class="on">15m</button><button data-tf="60">1h</button><button data-tf="240">4h</button></div>
+        <div class="legend mono" id="ohlc"></div>
+      </div>
+      <div id="chart"></div>
+    </div>
+    <div class="grid3" style="margin-top:14px">
+      <div class="kpi"><div class="k">24h volume</div><div class="v" id="p-vol">—</div><div class="s" id="p-swaps">—</div></div>
+      <div class="kpi"><div class="k">24h LP fees</div><div class="v" id="p-fees">—</div><div class="s">0.30% fee tier</div></div>
+      <div class="kpi"><div class="k">Depth per 1% move</div><div class="v" id="p-depth">—</div><div class="s">active liquidity, USDC</div></div>
+    </div>
+  </section>
+
+  <section id="pilot">
+    <div class="sh"><div><h2>Live pilot position</h2><p>Our own capital, same engine clients will use. Updated every minute.</p></div><span class="pill ok" id="rangepill">—</span></div>
+    <div class="grid2">
+      <div class="card">
+        <div class="mut" style="font-size:13px;font-weight:600">LP range</div>
+        <div class="rangebox" id="rangebox"><div class="track"></div><div class="band" id="band"></div><div class="mark" id="mark" data-p="—"></div><span class="lo" id="rlo"></span><span class="hi" id="rhi"></span></div>
+        <div class="stat"><span>Position value (LP + wallet)</span><b id="s-val">—</b></div>
+        <div class="stat"><span>In the pool</span><b id="s-lp">—</b></div>
+        <div class="stat"><span>Hyperliquid short · margin</span><b id="s-short">—</b></div>
+        <div class="stat"><span>Short liquidation price</span><b id="s-liq">—</b></div>
+        <div class="stat"><span>Unclaimed fees</span><b id="s-unc">—</b></div>
+        <div class="stat"><span>Average fee yield</span><b id="s-yield">—</b></div>
+        <div class="stat"><span>Running</span><b id="s-days">—</b></div>
+      </div>
+      <div class="card">
+        <div class="mut" style="font-size:13px;font-weight:600;margin-bottom:6px">Daily P&amp;L · LP vs hedge</div>
+        <div id="daily" class="mini" style="height:300px"></div>
+        <div class="legend" style="margin-top:8px"><span><i style="background:var(--violet)"></i>LP leg</span><span><i style="background:var(--blue)"></i>hedge leg</span><span><i style="background:var(--gold)"></i>net</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="volume">
+    <div class="sh"><div><h2>Pool activity by day</h2><p>Volume and fees paid to liquidity providers, UTC days</p></div></div>
+    <div class="card"><div id="dvol" class="mini" style="height:220px"></div></div>
+  </section>
+
+  <section id="monitor">
+    <div class="sh"><div><h2>Elysium pool monitor</h2><p id="mon-sub">Busiest pools over the last 24h · refreshed every 10 minutes</p></div>
+      <div class="seg" id="monf"><button data-f="all" class="on">All</button><button data-f="hype">HYPE/USD</button><button data-f="nohook">No hooks</button></div></div>
+    <div class="card" style="padding:4px 4px">
+      <div class="scroll"><table class="tbl" id="mon">
+        <thead><tr><th data-k="pair">Pool</th><th data-k="venue">Venue</th><th data-k="fee_bps">Fee</th><th data-k="price">Price</th><th data-k="vol24">24h volume</th><th data-k="fees24">24h fees</th><th data-k="swaps">Swaps</th><th data-k="depth_1pct">Depth 1%</th><th data-k="hooks">Hooks</th></tr></thead>
+        <tbody><tr><td colspan="9" class="skel">loading…</td></tr></tbody>
+      </table></div>
+    </div>
+    <p class="note">Volume is read directly from on-chain Swap events (Uniswap v4 PoolManager, Aerodrome Slipstream, Ramses). Meme-pool volume often includes wash trading. Pools with hooks can redirect or block LP fees — we only deploy into hook-free pools.</p>
+  </section>
+
+  <section id="how">
+    <div class="sh"><div><h2>How it works</h2><p>Non-custodial by design</p></div></div>
+    <div class="grid3">
+      <div class="card step"><div class="n">01 · CONNECT</div><h3>Your own smart account</h3><p>Two signatures, zero transactions. A personal smart account is deployed for you; funds never leave an address only you own. We get a narrow, audited permission: manage LP in whitelisted pools — nothing else.</p></div>
+      <div class="card step"><div class="n">02 · EARN</div><h3>Range + hedge engine</h3><p>The keeper keeps liquidity concentrated around price (volatility-scaled width) and holds a matching HYPE short on Hyperliquid, re-hedged when delta drifts past 10%. You collect swap fees with little price exposure.</p></div>
+      <div class="card step"><div class="n">03 · WITHDRAW</div><h3>One signature out</h3><p>Exit any time to USDC in your account. Hedge margin is returned by us. Guardian pause, timelocked upgrades and on-chain price anchors protect against a compromised keeper.</p></div>
+    </div>
+    <div class="grid2" style="margin-top:14px">
+      <div class="card">
+        <div class="fee"><div class="big">15%</div><div><div style="font-weight:700;font-size:16px">Performance fee, high-water mark</div><div class="mut" style="font-size:14px;max-width:380px">Charged per account, only on new net profit above your previous peak, at most once every 7 days. No management fee, no deposit fee. Hard cap 20% in the contract.</div></div></div>
+      </div>
+      <div class="card">
+        <div style="font-weight:700;margin-bottom:10px">Security reviews</div>
+        <div class="audits">
+          <div class="audit"><a href="https://onedollaraudit.com/audit/1224" target="_blank" rel="noopener">Round 1 · smart accounts</a><span class="pill">fixed</span></div>
+          <div class="audit"><a href="https://onedollaraudit.com/audit/1225" target="_blank" rel="noopener">Round 2</a><span class="pill">fixed</span></div>
+          <div class="audit"><a href="https://onedollaraudit.com/audit/1226" target="_blank" rel="noopener">Round 3 · two independent passes</a><span class="pill">fixed</span></div>
+          <div class="audit"><a href="https://onedollaraudit.com/audit/1232" target="_blank" rel="noopener">Round 4 · final, principal-loss focus</a><span class="pill warn">in progress</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer><div class="wrap">DeepYield · Elysium (chain 99901) · Data straight from chain and Hyperliquid, no third-party indexer. Pilot figures are real results on our own capital; past results do not guarantee future returns. LP positions can lose value; hedging reduces but does not remove risk.</div></footer>
+
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<script>
+(()=>{
+const RPC='https://rpc.elysium.kinetiq.xyz';
+const SLOT0='0x6416b8545b0447e900aa72985ce6b34fabafd03dbf239bffefb50bf122aa9637';
+const PM='0xE2e105d3F7209A9DA11f83cCf3E7398a753823F1';
+const $=id=>document.getElementById(id);
+const fmt=(v,d=2)=>v==null||isNaN(v)?'—':Number(v).toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
+const usd=(v,d=2)=>v==null?'—':(v<0?'−$':'$')+fmt(Math.abs(v),d);
+const sgn=(v,d=2)=>v==null?'—':(v>=0?'+$':'−$')+fmt(Math.abs(v),d);
+const kfmt=v=>v==null?'—':v>=1e6?'$'+(v/1e6).toFixed(2)+'M':v>=1e3?'$'+(v/1e3).toFixed(1)+'k':'$'+v.toFixed(0);
+const cls=(el,v)=>{el.classList.remove('up','dn'); if(v!=null) el.classList.add(v>=0?'up':'dn')};
+let live=null, base=[], tf=15, lastPx=null, hlPx=null, rangeLines=[];
+
+// chart
+const C=LightweightCharts;
+const chart=C.createChart($('chart'),{autoSize:true,layout:{background:{color:'transparent'},textColor:'#7f8da0',fontFamily:'JetBrains Mono'},
+  grid:{vertLines:{color:'rgba(255,255,255,.03)'},horzLines:{color:'rgba(255,255,255,.04)'}},
+  rightPriceScale:{borderColor:'#1c2532',scaleMargins:{top:.08,bottom:.22}},timeScale:{borderColor:'#1c2532',timeVisible:true,secondsVisible:false},
+  handleScroll:{mouseWheel:false,pressedMouseMove:true,horzTouchDrag:true,vertTouchDrag:false},handleScale:{mouseWheel:false,pinch:true,axisPressedMouseMove:true},crosshair:{mode:0,vertLine:{color:'#3a4658',labelBackgroundColor:'#1c2532'},horzLine:{color:'#3a4658',labelBackgroundColor:'#1c2532'}}});
+const candles=chart.addCandlestickSeries({upColor:'#22d39a',downColor:'#ff5c7a',borderVisible:false,wickUpColor:'#22d39a',wickDownColor:'#ff5c7a',priceFormat:{type:'price',precision:3,minMove:.001}});
+const vol=chart.addHistogramSeries({priceScaleId:'v',priceFormat:{type:'volume'},color:'#2a3546',lastValueVisible:false,priceLineVisible:false});
+chart.priceScale('v').applyOptions({scaleMargins:{top:.82,bottom:0}});
+const hlLine=chart.addLineSeries({color:'rgba(90,169,255,.85)',lineWidth:1,lineStyle:2,priceLineVisible:false,lastValueVisible:true,crosshairMarkerVisible:false});
+const hlPts=[];
+chart.subscribeCrosshairMove(p=>{const d=p&&p.seriesData&&p.seriesData.get(candles); const el=$('ohlc');
+  if(!d){el.textContent='';return} el.innerHTML=`O <b>${fmt(d.open,3)}</b> H <b>${fmt(d.high,3)}</b> L <b>${fmt(d.low,3)}</b> C <b>${fmt(d.close,3)}</b>`});
+
+function agg(mins){
+  const s=mins*60, out=[]; let cur=null;
+  for(const [t,o,h,l,c,v] of base){ const b=t-t%s;
+    if(!cur||cur.time!==b){ if(cur) out.push(cur); cur={time:b,open:cur?cur.close:o,high:h,low:l,close:c,v:v};
+      cur.high=Math.max(cur.open,h); cur.low=Math.min(cur.open,l); }
+    else{ cur.high=Math.max(cur.high,h); cur.low=Math.min(cur.low,l); cur.close=c; cur.v+=v; } }
+  if(cur) out.push(cur);
+  // fill gaps so price is continuous
+  const filled=[]; for(let i=0;i<out.length;i++){ filled.push(out[i]); const nx=out[i+1]; if(!nx) break;
+    for(let t=out[i].time+s;t<nx.time;t+=s){ const c=out[i].close; filled.push({time:t,open:c,high:c,low:c,close:c,v:0}); } }
+  return filled;
+}
+let bars=[];
+function draw(fit){
+  bars=agg(tf);
+  candles.setData(bars.map(b=>({time:b.time,open:b.open,high:b.high,low:b.low,close:b.close})));
+  vol.setData(bars.map(b=>({time:b.time,value:b.v,color:b.close>=b.open?'rgba(34,211,154,.28)':'rgba(255,92,122,.28)'})));
+  if(fit){ const n=bars.length; chart.timeScale().setVisibleLogicalRange({from:Math.max(0,n-(tf<=5?288:tf<=15?192:tf<=60?168:n)),to:n+3}); }
+}
+document.querySelectorAll('#tf button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#tf button').forEach(x=>x.classList.remove('on'));b.classList.add('on');tf=+b.dataset.tf;draw(true)});
+
+function setRange(r){
+  rangeLines.forEach(l=>candles.removePriceLine(l)); rangeLines=[];
+  if(!r) return;
+  rangeLines.push(candles.createPriceLine({price:r[1],color:'rgba(255,210,74,.75)',lineWidth:1,lineStyle:0,axisLabelVisible:true,title:'range high'}));
+  rangeLines.push(candles.createPriceLine({price:r[0],color:'rgba(255,210,74,.75)',lineWidth:1,lineStyle:0,axisLabelVisible:true,title:'range low'}));
+}
+
+function tick(px){
+  if(!bars.length) return;
+  const now=Math.floor(Date.now()/1000), s=tf*60, b=now-now%s;
+  let last=bars[bars.length-1];
+  if(b>last.time){ last={time:b,open:last.close,high:Math.max(last.close,px),low:Math.min(last.close,px),close:px,v:0}; bars.push(last); }
+  else { last.high=Math.max(last.high,px); last.low=Math.min(last.low,px); last.close=px; }
+  candles.update({time:last.time,open:last.open,high:last.high,low:last.low,close:last.close});
+}
+
+// live chain price
+let rpcOk=0;
+async function rpc(method,params){const r=await fetch(RPC,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({jsonrpc:'2.0',id:1,method,params})});const j=await r.json();if(j.error)throw j.error;return j.result}
+async function pollChain(){
+  try{
+    const [slot,bn]=await Promise.all([rpc('eth_call',[{to:PM,data:'0x1e2eaeaf'+SLOT0.slice(2)},'latest']),rpc('eth_blockNumber',[])]);
+    const sp=BigInt(slot)&((1n<<160n)-1n); const px=(Number(sp)/2**96)**2*1e12;
+    const el=$('px'); if(lastPx!=null&&px!==lastPx){el.classList.remove('flash-up','flash-dn');void el.offsetWidth;el.classList.add(px>lastPx?'flash-up':'flash-dn');setTimeout(()=>el.classList.remove('flash-up','flash-dn'),900)}
+    lastPx=px; el.textContent='$'+fmt(px,3); $('blk').textContent=parseInt(bn,16).toLocaleString('en-US');
+    tick(px); updRange(px); spread(); rpcOk=Date.now(); status();
+  }catch(e){status()}
+}
+async function pollHL(){
+  try{const r=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'allMids'})});
+    const j=await r.json(); hlPx=+j.HYPE; $('hlpx').textContent='$'+fmt(hlPx,3); spread();
+    const now=Math.floor(Date.now()/1000); const t=now-now%15;
+    if(!hlPts.length||hlPts[hlPts.length-1].time<t){hlPts.push({time:t,value:hlPx}); if(hlPts.length===1) hlLine.setData(hlPts); else hlLine.update({time:t,value:hlPx});}
+  }catch(e){}
+}
+async function loadHLHistory(){
+  try{const end=Date.now(), start=end-7*86400e3;
+    const r=await fetch('https://api.hyperliquid.xyz/info',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({type:'candleSnapshot',req:{coin:'HYPE',interval:'15m',startTime:start,endTime:end}})});
+    const j=await r.json(); hlPts.splice(0,hlPts.length,...j.map(c=>({time:Math.floor(c.t/1000),value:+c.c}))); hlLine.setData(hlPts);
+  }catch(e){}
+}
+function spread(){ if(lastPx&&hlPx){ const b=(lastPx/hlPx-1)*1e4; $('spread').textContent=(b>=0?'+':'')+b.toFixed(0)+' bps'; } }
+function status(){ const ok=Date.now()-rpcOk<15000; $('dot').classList.toggle('stale',!ok); $('livelbl').textContent=ok?'LIVE · chain 99901':'reconnecting…'; }
+
+function updRange(px){
+  const r=live&&live.pilot.range; if(!r) return;
+  const pad=(r[1]-r[0])*.35, lo=r[0]-pad, hi=r[1]+pad, pos=v=>Math.max(0,Math.min(100,(v-lo)/(hi-lo)*100));
+  $('band').style.left=pos(r[0])+'%'; $('band').style.width=(pos(r[1])-pos(r[0]))+'%';
+  const m=$('mark'); m.style.left=pos(px)+'%'; m.dataset.p='$'+fmt(px,2);
+  $('rlo').style.left=`calc(${pos(r[0])}% - 18px)`; $('rlo').textContent='$'+fmt(r[0],2);
+  $('rhi').style.left=`calc(${pos(r[1])}% - 18px)`; $('rhi').textContent='$'+fmt(r[1],2);
+  const inr=px>=r[0]&&px<r[1], edge=Math.min(px-r[0],r[1]-px)/(r[1]-r[0]);
+  const p=$('rangepill'); p.className='pill '+(!inr?'bad':edge<.12?'warn':'ok'); p.textContent=!inr?'● out of range — rebalancing':edge<.12?'● near range edge':'● in range · earning fees';
+}
+
+// daily pnl chart
+const dch=C.createChart($('daily'),{autoSize:true,layout:{background:{color:'transparent'},textColor:'#7f8da0',fontFamily:'JetBrains Mono'},grid:{vertLines:{visible:false},horzLines:{color:'rgba(255,255,255,.04)'}},rightPriceScale:{borderColor:'#1c2532'},timeScale:{borderColor:'#1c2532'},handleScroll:false,handleScale:false});
+const dLP=dch.addHistogramSeries({lastValueVisible:false,priceLineVisible:false,color:'rgba(157,123,255,.55)',priceFormat:{type:'price',precision:2,minMove:.01}});
+const dH=dch.addHistogramSeries({lastValueVisible:false,priceLineVisible:false,color:'rgba(90,169,255,.55)',priceFormat:{type:'price',precision:2,minMove:.01}});
+const dN=dch.addLineSeries({color:'#FFD24A',lineWidth:3,pointMarkersVisible:true,priceFormat:{type:'price',precision:2,minMove:.01}});
+const vch=C.createChart($('dvol'),{autoSize:true,layout:{background:{color:'transparent'},textColor:'#7f8da0',fontFamily:'JetBrains Mono'},grid:{vertLines:{visible:false},horzLines:{color:'rgba(255,255,255,.04)'}},rightPriceScale:{borderColor:'#1c2532'},leftPriceScale:{visible:true,borderColor:'#1c2532'},timeScale:{borderColor:'#1c2532'},handleScroll:false,handleScale:false});
+const vV=vch.addHistogramSeries({color:'rgba(90,169,255,.6)',priceScaleId:'left',priceFormat:{type:'volume'}});
+const vF=vch.addLineSeries({color:'#FFD24A',lineWidth:2,pointMarkersVisible:true,priceFormat:{type:'price',precision:0,minMove:1}});
+
+async function loadLive(first){
+  try{
+    const r=await fetch('data/live.json?'+Date.now()); live=await r.json();
+    base=live.candles; const P=live.pilot;
+    if(first){ draw(true); } else { const keep=chart.timeScale().getVisibleLogicalRange(); draw(false); if(keep) chart.timeScale().setVisibleLogicalRange(keep); }
+    setRange(P.range);
+    const t=P.total; $('k-pnl').textContent=sgn(t.total); cls($('k-pnl'),t.total);
+    const cap=P.value+P.hl_margin; $('k-pnl-s').textContent=`${(t.total/cap*100>=0?'+':'')}${(t.total/cap*100).toFixed(2)}% on ${usd(cap,0)} · ${P.days.toFixed(1)} days`;
+    $('k-fees').textContent=usd(P.fees_total); $('k-fees-s').textContent=`${P.fee_yield_day.toFixed(2)}% per day on position`;
+    $('k-hedge').textContent=P.hedge_ratio?(P.hedge_ratio*100).toFixed(0)+'%':'—';
+    $('k-hedge-s').textContent=`${fmt(P.short,2)} HYPE short vs ${fmt(P.lp_hype,2)} HYPE in LP`;
+    const c0=base.find(c=>c[0]>=P.start); const h0=c0?c0[1]:null, h1=live.hl_mid;
+    if(h0){const m=(live.pool.price/h0-1)*100; $('k-hype').textContent=(m>=0?'+':'')+m.toFixed(1)+'%'; cls($('k-hype'),m);}
+    $('s-val').textContent=usd(P.value);
+    $('s-lp').textContent=`${fmt(P.lp_hype,3)} HYPE + ${usd(P.lp_usdc)}`;
+    $('s-short').textContent=`${fmt(P.short,2)} HYPE · ${usd(P.hl_margin)}`;
+    $('s-liq').textContent=P.liq_px?'$'+fmt(P.liq_px,2):'—';
+    $('s-unc').textContent=usd(P.unclaimed);
+    $('s-yield').textContent=P.fee_yield_day.toFixed(2)+'% / day';
+    $('s-days').textContent=P.days.toFixed(1)+' days';
+    const dd=P.days_pnl.map(d=>({time:d.t0-d.t0%86400,lp:d.lp,h:d.hedge,n:d.total}));
+    dLP.setData(dd.map(d=>({time:d.time,value:d.lp}))); dH.setData(dd.map(d=>({time:d.time,value:d.h})));
+    let cum=0; dN.setData(dd.map(d=>({time:d.time,value:+(cum+=d.n).toFixed(2)})));
+    dN.applyOptions({title:'cumulative net'}); dch.timeScale().fitContent();
+    const pl=live.pool; $('p-vol').textContent=kfmt(pl.vol24); $('p-swaps').textContent=`${pl.swaps24.toLocaleString('en-US')} swaps`;
+    $('p-fees').textContent=usd(pl.fees24); $('p-depth').textContent=kfmt(pl.depth_1pct);
+    vV.setData(pl.daily.map(d=>({time:d[0],value:d[1]}))); vF.setData(pl.daily.map(d=>({time:d[0],value:d[2]}))); vF.applyOptions({title:'LP fees $'}); vch.timeScale().fitContent();
+    if(lastPx==null){ $('px').textContent='$'+fmt(pl.price,3); updRange(pl.price); }
+  }catch(e){console.warn(e)}
+}
+
+// monitor
+let mon=null, msort='vol24', mdir=-1, mfilt='all';
+async function loadMon(){ try{ const r=await fetch('data/pools.json?'+Date.now()); mon=await r.json(); renderMon(); }catch(e){} }
+function renderMon(){
+  if(!mon) return;
+  let rows=mon.pools.slice();
+  if(mfilt==='hype') rows=rows.filter(r=>/^(W?HYPE)\/(USDC)$/.test(r.pair));
+  if(mfilt==='nohook') rows=rows.filter(r=>!r.hooks);
+  rows.sort((a,b)=>{const x=a[msort],y=b[msort]; if(typeof x==='string') return mdir*x.localeCompare(y); return mdir*((x??-1)-(y??-1))});
+  const mx=Math.max(...mon.pools.map(r=>r.vol24||0));
+  const pfmt=p=>p==null?'—':p>=1000?fmt(p,0):p>=1?fmt(p,3):p.toPrecision(4);
+  $('mon').querySelector('tbody').innerHTML=rows.map(r=>`<tr class="${r.ours?'ours':''}">
+    <td><span class="pair">${r.pair}</span>${r.ours?' <span class="pill warn" style="margin-left:6px">our pool</span>':''}</td>
+    <td class="venue">${r.venue}</td><td>${r.fee_bps!=null?(r.fee_bps/100).toFixed(2)+'%':'dyn'}</td><td>${pfmt(r.price)}</td>
+    <td>${kfmt(r.vol24)}<span class="vbar" style="width:${Math.max(2,(r.vol24||0)/mx*70)}px"></span></td>
+    <td>${r.fees24!=null?usd(r.fees24,0):'—'}</td><td>${r.swaps.toLocaleString('en-US')}</td><td>${kfmt(r.depth_1pct)}</td>
+    <td>${r.hooks?'<span class="pill warn">hook</span>':'<span class="pill ok">none</span>'}</td></tr>`).join('');
+  const ago=Math.round((Date.now()/1000-mon.updated)/60);
+  $('mon-sub').textContent=`${mon.v4_active.toLocaleString('en-US')} Uniswap v4 pools traded in the last 24h (${mon.v4_swaps24.toLocaleString('en-US')} swaps) · busiest shown · updated ${ago<1?'just now':ago+' min ago'}`;
+}
+document.querySelectorAll('#mon th').forEach(th=>th.onclick=()=>{const k=th.dataset.k; if(msort===k) mdir=-mdir; else {msort=k; mdir=-1}; renderMon()});
+document.querySelectorAll('#monf button').forEach(b=>b.onclick=()=>{document.querySelectorAll('#monf button').forEach(x=>x.classList.remove('on'));b.classList.add('on');mfilt=b.dataset.f;renderMon()});
+
+loadLive(true).then(()=>{pollChain(); loadHLHistory();});
+loadMon(); pollHL();
+setInterval(pollChain,2500); setInterval(pollHL,4000); setInterval(()=>loadLive(false),60000); setInterval(loadMon,120000); setInterval(status,3000);
+})();
+</script>
+</body>
+</html>
