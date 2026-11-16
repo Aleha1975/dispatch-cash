@@ -1,14 +1,15 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Elysium Account</title>
-<meta name="description" content="Your own HYPE/USDC liquidity account on Elysium: you keep custody, leave with one transaction.">
-<meta name="theme-color" content="#0d1117" media="(prefers-color-scheme: dark)">
-<meta name="theme-color" content="#f6f7f9" media="(prefers-color-scheme: light)">
+<meta name="description" content="Your own HYPE/USDC liquidity account on Elysium: pick your range and hedge, keep custody, leave with one transaction.">
+<meta name="theme-color" content="#0d1117">
 <link rel="stylesheet" href="style.css">
 <style>
+.txt { color: var(--text); }
+.center { text-align: center; }
 .steps { margin: 12px 0 4px; padding: 0; list-style: none; }
 .steps li { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; }
 .steps .n { flex: none; width: 22px; height: 22px; border-radius: 50%; background: var(--surface-2); color: var(--muted);
@@ -19,6 +20,52 @@
 .check { display: flex; gap: 8px; align-items: flex-start; font-size: 14px; margin: 4px 0 12px; }
 .danger-btn { background: var(--danger-soft); color: var(--danger); }
 .btn + .btn { margin-top: 8px; }
+.fine { font-size: 12px; color: var(--faint); margin: 10px 0 0; line-height: 1.45; }
+
+/* wizard progress */
+.wiz { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; list-style: none; padding: 0; margin: 14px 0 6px; }
+.wiz li { font-size: 11px; font-weight: 600; color: var(--faint); text-align: center; padding-top: 8px; position: relative; }
+.wiz li::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 3px; border-radius: 2px; background: var(--surface-2); }
+.wiz li.done::before, .wiz li.now::before { background: var(--accent); }
+.wiz li.now { color: var(--text); }
+
+/* option cards */
+.card.option { border-width: 1.5px; }
+.card.option.sel { border-color: var(--accent); background: color-mix(in srgb, var(--accent-soft) 35%, var(--surface)); }
+.card.option p { margin: 10px 0 6px; }
+.radio { flex: none; width: 20px; height: 20px; border-radius: 50%; border: 2px solid var(--border); margin-top: 2px; }
+.option.sel .radio { border-color: var(--accent); box-shadow: inset 0 0 0 4px var(--surface), inset 0 0 0 10px var(--accent); }
+.card-name.big { font-size: 22px; letter-spacing: -.01em; margin: 2px 0; }
+.pool-card .stats { margin: 14px 0 6px; }
+.tag.warn { background: var(--warn-soft); color: var(--warn); }
+.tabs .tag { font-size: 10px; padding: 1px 6px; margin-left: 4px; vertical-align: 1px; }
+
+/* slider */
+.slider-wrap { margin: 4px 0 6px; }
+.slider-head, .slider-foot { display: flex; justify-content: space-between; align-items: center; }
+.slider-head b { font-size: 20px; }
+.slider { position: relative; padding: 10px 0; }
+.slider input[type=range] { width: 100%; margin: 0; accent-color: var(--accent); height: 28px; }
+.rec-mark { position: absolute; top: 2px; width: 2px; height: 12px; border-radius: 1px; background: var(--warn); transform: translateX(-1px); pointer-events: none; }
+.rec-mark::after { content: "rec"; position: absolute; top: -12px; left: 50%; transform: translateX(-50%); font-size: 9px; font-weight: 700; color: var(--warn); }
+
+/* price axis */
+svg.axis { width: 100%; height: auto; display: block; margin: 10px 0 2px; overflow: visible; }
+.ax-line { stroke: var(--border); stroke-width: 2; }
+.ax-band { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+.ax-band.out { fill: var(--warn-soft); stroke: var(--warn); }
+.ax-ref { fill: none; stroke: var(--warn); stroke-width: 1.2; stroke-dasharray: 4 3; }
+.ax-price { stroke: var(--text); stroke-width: 2; }
+.ax-t { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.ax-t.strong { fill: var(--text); font-weight: 700; }
+
+/* metric tiles */
+.tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 12px; }
+.tile { background: var(--surface-2); border-radius: 12px; padding: 10px; }
+.tile .k { font-size: 11px; color: var(--muted); }
+.tile .v { font-size: 18px; font-weight: 700; margin-top: 2px; }
+.hero .big-value { font-size: 40px; margin: 6px 0 2px; }
+#edit { margin-top: 10px; }
 </style>
 </head>
 <body>

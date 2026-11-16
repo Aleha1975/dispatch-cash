@@ -31,7 +31,7 @@ export const CONFIG = {
     enforcer: null,
     hedgeTreasury: null,
     feeRecipient: null,
-    relayerUrl: '/elysium-api/sa/onboard', // POST {owner, kind, delegation, permit} -> 202 {ok, state, account} (keeper/elysium_keeper/sa_api.py)
+    relayerUrl: '/elysium-api/sa/onboard', // POST {owner, kind, delegation, permit, strategy} -> 202 {ok, state, account} (keeper/elysium_keeper/sa_api.py)
     statusUrl: '/elysium-api/sa/status', // GET ?owner= -> onboarding state + keeper summary; null disables
     delegationDays: 180,
     // Delegation Framework v1.3.0 (canonical addresses) and ERC-4337 EntryPoint v0.7
@@ -43,6 +43,22 @@ export const CONFIG = {
     entryPoint: '0x0000000071727De22E5E9d8BAf0edAc6f37da032',
     positionManager: '0x1d1C51b9d07fD27d36412A2b66CC23D19Eb3E518',
     accountSalt: 'ELYSIUM-LP-V1',
+    // Pool whitelist (keeper sa.pools): one LPManagerModule per hook-free Uniswap v4 pool (its PoolKey is immutable),
+    // each with its own API base. `module` overrides smartAccount.module for that pool. One entry = the pool step is
+    // a confirmation card instead of a picker.
+    pools: [
+      {
+        id: 'uniswap-v4-hype-usdc-30',
+        name: 'HYPE / USDC',
+        dex: 'Uniswap v4',
+        feeTier: '0.30%',
+        poolId: '0xb3032695ffb0a66e6342876dd2386835471466cb2bb70f341947d98a69e265cc',
+        module: null,
+        api: '/elysium-api/sa',
+      },
+    ],
+    performanceFeeBps: 1500,
+    strategyDeadlineS: 3600, // the Strategy signature must reach the keeper within this window
   },
   strategies: [
     {
