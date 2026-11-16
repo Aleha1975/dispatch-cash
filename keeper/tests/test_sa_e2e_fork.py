@@ -9,6 +9,9 @@ each: delegation + USDC permit; the client sends no transaction) -> keeper ticks
 dry-run short split by the ledger -> third-party volume, one week -> HWM fee -> client 1 exits with ONE EntryPoint
 transaction (revoke + burn to its account) -> keeper closes its hedge share and pays its margin to the owner EOA ->
 a restarted keeper does nothing new.
+Product flow (prefs.py): client 3 onboards with a signed Strategy (manual width, unhedged): no margin, no short, its
+range at its own width; it then re-signs hedged + auto (margin and short follow) and finally unhedged again (its short
+share is closed and the margin comes back into its account).
 """
 from __future__ import annotations
 
@@ -27,6 +30,7 @@ from eth_account import Account  # noqa: E402
 from eth_utils import keccak, to_checksum_address  # noqa: E402
 
 from elysium_keeper import config as C  # noqa: E402
+from elysium_keeper import prefs as P  # noqa: E402
 from elysium_keeper.hl import DryRunAdapter  # noqa: E402
 from elysium_keeper.infra import Log  # noqa: E402
 from elysium_keeper.rpc import ERC20_ABI, Contract  # noqa: E402
@@ -34,7 +38,7 @@ from elysium_keeper.sa_chain import _b  # noqa: E402
 from elysium_keeper.sa_chain import (  # noqa: E402
     DM, ENTRYPOINT, HYBRID_IMPL, SIMPLE_FACTORY, Relayer, delegation_hash, dm_domain, hybrid_address,
     module_delegation, permit_digest, typed_digest, userop_digest)
-from elysium_keeper.sa_keeper import SAKeeper  # noqa: E402
+from elysium_keeper.sa_keeper import SAKeeper, pos_half_width  # noqa: E402
 from forkutil import DEPLOYER, REPO, USDC, Fork, MockHL, Trader, addr  # noqa: E402
 
 pytestmark = pytest.mark.skipif(not os.environ.get("ELYSIUM_FORK"), reason="set ELYSIUM_FORK=1 (needs anvil+forge)")
@@ -130,7 +134,22 @@ def make_keeper(fork, tmp, module, hl, alerts, name="sa"):
     return SAKeeper(cfg, hl_info=hl, adapter=adapter, log=log, alert_sink=lambda lvl, t: alerts.append((lvl, t)))
 
 
-def onboard(fork, k, module_addr, pk: bytes, usd: int, via_dir: str | None = None):
+def sign_strategy(fork, module_addr, pk: bytes, *, mode: int, width: int, hedged: bool, nonce: int) -> dict:
+    owner = Account.from_key(pk).address
+    st = P.Strategy(owner, hybrid_address(owner), module_addr, mode, width, hedged, nonce, fork.now() + 3600)
+    sig = bytes(Account.unsafe_sign_hash(P.digest(st, 99901), pk).signature)
+    return P.Strategy(**{**st.__dict__, "signature": sig}).to_json()
+
+
+def queue_strategy(k, pk: bytes, strategy: dict):
+    owner = Account.from_key(pk).address
+    d = os.path.join(k.sa.requests_dir, "strategy")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, f"{owner}-{strategy['nonce']}.json"), "w") as fh:
+        json.dump({"owner": owner, "kind": "hybrid", "account": hybrid_address(owner), "strategy": strategy}, fh)
+
+
+def onboard(fork, k, module_addr, pk: bytes, usd: int, via_dir: str | None = None, strategy: dict | None = None):
     acct = Account.from_key(pk)
     owner = acct.address
     fork.deal_usdc(owner, usd * E6)
@@ -153,6 +172,8 @@ def onboard(fork, k, module_addr, pk: bytes, usd: int, via_dir: str | None = Non
            "permit": {"amount": usd * E6, "deadline": deadline, "v": sig.v, "r": hex(sig.r), "s": hex(sig.s)}}
     req["permit"]["r"] = "0x" + sig.r.to_bytes(32, "big").hex()
     req["permit"]["s"] = "0x" + sig.s.to_bytes(32, "big").hex()
+    if strategy:
+        req["strategy"] = strategy
     if via_dir:  # the web backend drops the request; the keeper's relayer picks it up on its next tick
         os.makedirs(via_dir, exist_ok=True)
         with open(os.path.join(via_dir, f"{owner}.json"), "w") as fh:
@@ -230,6 +251,9 @@ def test_sa_end_to_end(env):
     pk1, pk2 = keccak(text="sa-e2e-alice"), keccak(text="sa-e2e-bob")
     a1, d1 = onboard(fork, k, module, pk1, 3000)
     a2, d2 = onboard(fork, k, module, pk2, 1500, via_dir=k.sa.requests_dir)
+    pk3 = keccak(text="sa-e2e-carol")
+    s3 = sign_strategy(fork, module, pk3, mode=P.MODE_MANUAL, width=1500, hedged=False, nonce=1)
+    a3, _ = onboard(fork, k, module, pk3, 1000, via_dir=k.sa.requests_dir, strategy=s3)
     assert usdc.call("balanceOf", a1) == 3000 * E6
 
     # first tick: relayer onboards client 2 from the request queue, margin for both; SA-3: swaps and mints wait for a
@@ -238,20 +262,35 @@ def test_sa_end_to_end(env):
     st = k.tick()
     assert not st["errors"], st["errors"]
     st = settle(fork, k, hl)
+    for _ in range(4):  # three clients' swaps push the pool off the anchor's booking band: arbitrage it back
+        if all(st["accounts"].get(a, {}).get("positions") for a in (a1, a2, a3)):
+            break
+        trader.move_to(int(hl.mid() * 1e6))
+        st = settle(fork, k, hl)
     assert os.listdir(os.path.join(k.sa.requests_dir, "done")) and usdc.call("balanceOf", a2) < 1500 * E6
     for a, usd in ((a1, 3000), (a2, 1500)):
         row = st["accounts"][a]
         assert len(row["positions"]) == 1, row
         assert row["net_margin"] == pytest.approx(usd * 0.25, rel=0.02)
         assert abs(row["value"] - usd) < usd * 0.01
+    # client 3: its signed preference was applied at onboarding: manual width, no hedge margin, no short
+    row3 = st["accounts"][a3]
+    assert k.prefs[a3]["nonce"] == 1 and row3["strategy"]["mode"] == "manual" and not row3["strategy"]["hedged"]
+    assert row3["net_margin"] == 0 and len(row3["positions"]) == 1
+    p3 = row3["positions"][0]
+    assert pos_half_width(p3["tl"], p3["tu"]) == pytest.approx(row3["strategy"]["effective_width_bps"] / 1e4,
+                                                               abs=0.006)
+    assert row3["range"]["in_range"] and row3["return_pct"] is not None
     short = -k.adapter.position()
     led = k.ledger.clients()
+    assert led[a3]["short"] == 0 and led[a3]["target"] == 0
     assert short == pytest.approx(led[a1]["short"] + led[a2]["short"], abs=0.02)
     sp = k.r.slot0()[0]
-    for a in (a1, a2):  # each client's share = its own HYPE exposure
+    total = k.ledger.total_target()
+    for a in (a1, a2):  # each client's share = its own HYPE exposure, within the netted rehedge band (10% of total)
         s = k.r.account(a)
         expo = (s.lp_amounts(sp)[0] + s.native) / 1e18
-        assert led[a]["short"] == pytest.approx(expo, rel=0.10), (a, led[a], expo)  # rehedge drift band
+        assert abs(led[a]["short"] - expo) <= 0.10 * total, (a, led[a], expo)
     # leftovers (rounding, the pool moved by the other client's swaps) are deployed within a few ticks; after that
     # a tick is a no-op on chain
     for i in range(4):
@@ -264,6 +303,12 @@ def test_sa_end_to_end(env):
             break
     else:
         raise AssertionError(f"keeper does not converge: {done}")
+
+    # client 3 re-signs: hedged, auto width -> margin goes out, its short share follows its HYPE exposure
+    queue_strategy(k, pk3, sign_strategy(fork, module, pk3, mode=P.MODE_AUTO, width=0, hedged=True, nonce=2))
+    st = settle(fork, k, hl, n=3)
+    assert k.prefs[a3]["nonce"] == 2 and st["accounts"][a3]["strategy"]["hedged"]
+    assert st["accounts"][a3]["net_margin"] > 0 and k.ledger.clients()[a3]["short"] > 0
 
     # volume -> fees; a week later the HWM fee is charged
     trader.volume(3000, 6)
@@ -305,6 +350,18 @@ def test_sa_end_to_end(env):
     assert led["equity"] == pytest.approx(0, abs=1e-6)
     # client 2 untouched and still managed
     assert m.call("isActive", a2) and k.ledger.clients()[a2]["short"] > 0
+
+    # client 3 goes unhedged again: its short share is closed, then the margin comes back INTO its account
+    margin3 = k.r.account(a3).hedge_equity
+    out3 = k.ledger.clients()[a3]["margin_out"]
+    queue_strategy(k, pk3, sign_strategy(fork, module, pk3, mode=P.MODE_AUTO, width=0, hedged=False, nonce=3))
+    st = settle(fork, k, hl, n=3)
+    led3 = k.ledger.clients()[a3]
+    assert led3["short"] == pytest.approx(0, abs=1e-9) and not led3["closed"]
+    # paid back into the account (then deployed into its LP: unhedged keeps no margin aside)
+    assert (led3["margin_out"] - out3) * E6 >= margin3 * 0.95
+    assert any(x["fn"] == "returnHedgeMargin" and x["args"][0] == a3 for x in k.actions)
+    assert k.r.account(a3).hedge_equity < 10 ** 6 and m.call("isActive", a3)
 
     # restarted keeper (same state files) picks up the same accounts and does nothing new
     k2 = make_keeper(fork, tmp, module, hl, alerts, name="sa")

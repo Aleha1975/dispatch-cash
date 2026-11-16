@@ -14,8 +14,14 @@ Tick:
                 the guardian's per-account approval, the keeper alerts).
   3. one netted HL order for all clients, fills split by the ledger; reconcile the ledger with the real off-chain
      capital (treasury + HL equity + in transit).
+Client preferences (prefs.py, docs/PRODUCT_FLOW.md): each account's signed Strategy picks the range width (auto =
+the volatility recommendation, recomputed at every re-range; manual = the client's half-width, re-centred on every
+re-range, widened to the live turnover floor if needed) and hedged / unhedged (unhedged: no margin, no short; margin
+already sent is returned once the short share is closed). Re-range triggers: out of range, within sa.edge_frac of an
+edge, a newer preference whose width differs, or (auto) a vol-based width that moved by more than
+sa.auto_rewidth_factor; the in-range triggers wait while the turnover budget cannot pay the re-deploy.
 Restart safety: every action is recomputed from a fresh read; the state file holds the ledger, the dry-run HL
-simulation, the event-scan cursor and fee records.
+simulation, the event-scan cursor, fee records and the accepted preferences (state `prefs`, with the signatures).
 """
 from __future__ import annotations
 
@@ -27,6 +33,8 @@ import time
 
 from eth_utils import to_checksum_address
 
+from . import prefs as P
+from . import recommend as R
 from . import strategy as S
 from . import v4math as M
 from .config import Config
@@ -34,7 +42,7 @@ from .hl import DryRunAdapter, HLInfo, LiveAdapter
 from .infra import Alerts, Log, State, StatusServer
 from .ledger import HedgeLedger
 from .rpc import RPC, Chain, KeystoreSigner, ReadOnlySigner, TxRevert, UnlockedSigner, is_local
-from .sa_chain import BOOK_BAND_BPS, AccountSnap, GlobalSnap, ModuleReader
+from .sa_chain import BOOK_BAND_BPS, AccountSnap, GlobalSnap, ModuleReader, hybrid_address
 
 BPS = 10_000
 E18 = 10 ** 18
@@ -55,6 +63,44 @@ def hwm_fee(profit: int, hwm: int, fee_bps: int, max_fee: int | None = None) -> 
 def hedge_room(value: int, cap_bps: int, hedge_equity: int, net_margin: int) -> int:
     """sendHedgeMargin: max(hedgeEquity, netMargin) + amount <= cap x accountValue."""
     return max(0, value * cap_bps // BPS - max(hedge_equity, net_margin))
+
+
+def pos_half_width(tl: int, tu: int) -> float:
+    """Half-width of [pl, pu] around its arithmetic centre: (pu - pl) / (pu + pl) (= w for [P(1-w), P(1+w)])."""
+    pl, pu = 1.0001 ** tl, 1.0001 ** tu
+    return (pu - pl) / (pu + pl)
+
+
+def rerange_reason(tick: int, positions: list, target_hw: float, mode: str, edge_frac: float, prefs_nonce: int,
+                   meta: dict | None, rewidth_tol: float = 0.25, auto_factor: float = 2.0) -> str | None:
+    """Why the account's LP should be closed and re-opened centred at `target_hw` now, or None.
+    out_of_range (always acted on), near_edge, prefs_changed (a newer signed preference with another width),
+    width_mismatch (manual width not what the client asked), vol_changed (auto width off by > auto_factor)."""
+    if not positions:
+        return None
+    live = [p for p in positions if S.in_range(tick, p.tl, p.tu)]
+    if not live:
+        return "out_of_range"
+    p = live[0]
+    w = p.tu - p.tl
+    if edge_frac > 0 and (tick - p.tl < edge_frac * w or p.tu - tick <= edge_frac * w):
+        return "near_edge"
+    ratio = pos_half_width(p.tl, p.tu) / target_hw if target_hw > 0 else 1.0
+    if int((meta or {}).get("nonce", 0)) < prefs_nonce and abs(ratio - 1) > rewidth_tol:
+        return "prefs_changed"
+    if mode == "manual" and abs(ratio - 1) > rewidth_tol:
+        return "width_mismatch"
+    if mode == "auto" and auto_factor > 1 and (ratio > auto_factor or ratio < 1 / auto_factor):
+        return "vol_changed"
+    return None
+
+
+def rerange_charge(value_lp: int, tick: int, cur: tuple[int, int], new: tuple[int, int], slip_bps: int,
+                   band_bps: int) -> int:
+    """Turnover a re-range is expected to use: the re-centring swap (change of the HYPE share) + the LP add charge
+    (SABook.lpAdd: paid x slip / (slip + band))."""
+    swap = abs(R.base_frac(tick, *cur) - R.base_frac(tick, *new))
+    return int(value_lp * (swap + slip_bps / (slip_bps + band_bps)))
 
 
 def enforcer_hedge_room(idle_usdc: int, used_wad: int = 0) -> int:
@@ -102,6 +148,9 @@ class SAKeeper:
             self.adapter.sim = self.state.d.setdefault("hl_sim", self.adapter.sim)
         self.sleep = sleep
         self._vol = None
+        self._floor = None
+        self.prefs = self.state.d.setdefault("prefs", {})  # account -> accepted signed Strategy (prefs.Strategy.record)
+        self.ranges = self.state.d.setdefault("ranges", {})  # account -> {nonce, hw, tl, tu} of the last mint
         self.lock = threading.Lock()
         self.status: dict = {"ok": False, "module": self.r.m.address, "name": cfg.name, "accounts": {}}
         self.actions: list[dict] = []
@@ -138,14 +187,112 @@ class SAKeeper:
             return e.reason
 
     def half_width(self, now: int, mid_usd: float) -> float:
+        """Auto (recommended) half-width: k x 72 h realized daily vol, clipped (same as recommend.py)."""
         if self._vol and 0 <= now - self._vol[0] < self.st.vol_refresh_s and abs(mid_usd / self._vol[2] - 1) < 0.01:
             return self._vol[1]
         hrs = self.st.vol_lookback_h + 3
         cs = self.info.candles(self.cfg.hl.coin, "1h", (now - hrs * 3600) * 1000, now * 1000)
         vol = S.realized_daily_vol([float(c["c"]) for c in cs], self.st.vol_lookback_h)
         hw = S.range_half_width(vol, self.st.k_vol, self.st.min_half_width, self.st.max_half_width)
-        self._vol = (now, hw, mid_usd)
+        self._vol = (now, hw, mid_usd, vol)
+        self._floor = None
         return hw
+
+    def turnover_floor(self, g: GlobalSnap, hedged: bool) -> float:
+        """Smallest half-width whose expected re-ranges fit the module's turnover budget (recommend.turnover_floor),
+        for the current vol and the module's Params; cached per vol refresh."""
+        if not self._vol:
+            return 0.0
+        key = (self._vol[0], g.params["swapTurnoverBps"], g.params["maxSlippageBps"], g.params["poolBandBps"])
+        if self._floor is None or self._floor[0] != key:
+            lp_h, lp_u = R.lp_fracs(self.sa.margin_frac, self.sa.buffer_bps)
+            out = {}
+            for k, lp in ((True, lp_h), (False, lp_u)):
+                m = R.Model(sigma_daily=self._vol[3], price=g.pool_price, tick=M.tick_at_price(g.pool_price),
+                            spacing=self.spacing,
+                            fee_tier=0.003, fees_per_l_day=0.0, edge_frac=self.sa.edge_frac,
+                            turnover_bps=g.params["swapTurnoverBps"], slippage_bps=g.params["maxSlippageBps"],
+                            band_bps=g.params["poolBandBps"], lp_frac=lp)
+                out[k] = R.turnover_floor(m)
+            self._floor = (key, out)
+        return self._floor[1][hedged]
+
+    @property
+    def spacing(self) -> int:
+        return int(self.pool_entry().get("tick_spacing", 60))
+
+    def pool_entry(self) -> dict:
+        """This module's entry of the pool whitelist (sa.pools), matched by module, else by the module's pool id."""
+        pid = "0x" + bytes(self.r.pool_id).hex() if isinstance(self.r.pool_id, (bytes, bytearray)) else self.r.pool_id
+        for p in self.sa.pools:
+            if (p.get("module") or "").lower() == self.r.m.address.lower():
+                return p
+        for p in self.sa.pools:
+            if str(p.get("pool_id", "")).lower() == str(pid).lower():
+                return p
+        return {"id": "module", "name": "pool", "pool_id": pid, "tick_spacing": 60, "module": self.r.m.address}
+
+    # ------------------------------------------------------------ client preferences
+    def prefs_of(self, a: str) -> dict:
+        return self.prefs.get(a) or P.default_record(self.sa.default_hedged)
+
+    def width_for(self, a: str, g: GlobalSnap, hw_auto: float) -> tuple[float, bool, float]:
+        """(half-width to use, clamped to the turnover floor, floor) for account `a` under its preference."""
+        pr = self.prefs_of(a)
+        floor = self.turnover_floor(g, bool(pr["hedged"]))
+        hw, clamped = R.effective_half_width(pr["mode"], pr.get("width_bps"), hw_auto, floor, self.st.max_half_width)
+        return hw, clamped, floor
+
+    def apply_strategy(self, raw: dict, owner: str, account: str, now: int) -> dict:
+        """Verify a signed Strategy (the keeper's own check, independent of sa-api) and store it for `account`."""
+        st = P.parse(raw)
+        last = int((self.prefs.get(account) or {}).get("nonce", 0))
+        P.verify(st, owner=owner, account=account, module=self.r.m.address, chain_id=self.cfg.chain.chain_id, now=now,
+                 b=P.Bounds.from_cfg(self.sa), last_nonce=last)
+        rec = st.record(now)
+        self.prefs[account] = rec
+        self.log("strategy_applied", account=account, mode=rec["mode"], width_bps=rec["width_bps"],
+                 hedged=rec["hedged"], nonce=rec["nonce"])
+        return rec
+
+    def process_strategy_requests(self, now: int):
+        """Strategy updates dropped by sa-api into sa.requests_dir/strategy (`<owner>-<nonce>.json`), lowest nonce
+        first; each is verified again and moved to strategy/done or strategy/failed. An update for an account that is
+        not registered yet stays queued (its onboarding may still be in the queue) until its deadline."""
+        d = os.path.join(self.sa.requests_dir, "strategy") if self.sa.requests_dir else ""
+        if not d or not os.path.isdir(d):
+            return
+        items = []
+        for name in os.listdir(d):
+            if name.endswith(".json") and "-" in name and not name.startswith("."):
+                try:
+                    items.append((int(name.rsplit("-", 1)[1][:-5]), name))
+                except ValueError:
+                    continue
+        for _, name in sorted(items):
+            path = os.path.join(d, name)
+            try:
+                with open(path) as fh:
+                    req = json.load(fh)
+                owner = to_checksum_address(req["owner"])
+                account = hybrid_address(owner) if req.get("kind", "hybrid") == "hybrid" else owner
+                try:
+                    acc = self.r.account(account)
+                except ValueError:  # not registered (yet)
+                    if now <= int(req["strategy"]["deadline"]):
+                        continue
+                    raise P.PrefsError("not_registered", "the account was not registered before the deadline")
+                if acc.owner != owner:
+                    raise P.PrefsError("strategy_owner", "the account's pinned owner is another wallet")
+                self.apply_strategy(req["strategy"], owner, account, now)
+                out, res = "done", {"account": account}
+            except Exception as e:
+                out, res, req = "failed", {"error": str(e)}, None
+                self.log("strategy_failed", file=name, error=str(e))
+            os.makedirs(os.path.join(d, out), exist_ok=True)
+            with open(os.path.join(d, out, name), "w") as fh:
+                json.dump({"request": req, "result": res}, fh)
+            os.remove(path)
 
     def offchain_capital(self, g: GlobalSnap) -> float:
         """USD: treasury USDC + HL equity + operator-declared in transit (the whole hedge book of all clients)."""
@@ -216,16 +363,23 @@ class SAKeeper:
         if s.value < self.sa.min_account_usd * 1e6:
             self.log("account_below_floor", account=a, value=s.value / 1e6)  # SA-3 L-20: read only
             return s
+        hedged = bool(self.prefs_of(a)["hedged"])
         if not g.paused:
             g = self.r.global_snap()
             if s.pending and g.trusted(self.now()):
                 self.act("sync", a)  # SA-3 M-5: book a pending client flow at the first trusted moment
-            self.margin(s, g, price)
-            self.manage_lp(a, g, price, hw)
+            if hedged:
+                self.margin(s, g, price)
+            target_hw, _, _ = self.width_for(a, g, hw)
+            self.manage_lp(a, g, price, target_hw, hedged=hedged)
             self.fee(a, g, now)
         s = self.r.account(a)
-        lp_b, _ = s.lp_amounts(self.r.slot0()[0])
-        self.ledger.set_target(a, (lp_b + s.native) / E18 * self.st.hedge_ratio)
+        if hedged:
+            lp_b, _ = s.lp_amounts(self.r.slot0()[0])
+            self.ledger.set_target(a, (lp_b + s.native) / E18 * self.st.hedge_ratio)
+        else:  # unhedged: no short; margin sent while it was hedged goes back into the account
+            self.return_margin(s, self.r.global_snap(), close=False)
+            s = self.r.account(a)
         self.report_equity(s)
         return s
 
@@ -280,15 +434,29 @@ class SAKeeper:
             done += chunk
         return done
 
-    def manage_lp(self, a: str, g: GlobalSnap, price: int, hw: float):
+    def manage_lp(self, a: str, g: GlobalSnap, price: int, hw: float, hedged: bool = True):
+        """Re-range (rerange_reason) and deploy idle funds at half-width `hw` (the account's preference)."""
         s = self.r.account(a)
         sp, tick = self.r.slot0()
-        if s.positions and not any(S.in_range(tick, p.tl, p.tu) for p in s.positions):
+        pr = self.prefs_of(a)
+        why = rerange_reason(tick, s.positions, hw, pr["mode"], self.sa.edge_frac, int(pr.get("nonce", 0)),
+                             self.ranges.get(a), self.sa.rewidth_tol, self.sa.auto_rewidth_factor)
+        if why and why != "out_of_range":
+            # an in-range position keeps earning: close it only if the turnover budget can pay the re-deploy now
+            p0 = next(p for p in s.positions if S.in_range(tick, p.tl, p.tu))
+            x, y = s.lp_amounts(sp)
+            need = rerange_charge(x * price // E18 + y, tick, (p0.tl, p0.tu), S.range_ticks(price, hw, self.spacing),
+                                  g.params["maxSlippageBps"], g.params["poolBandBps"])
+            room = max(0, s.value * g.params["swapTurnoverBps"] // BPS - s.windows["turnoverUsed"])
+            if need > room * 0.9 or not g.trusted(self.now()):
+                self.log("rerange_postponed", account=a, why=why, need=need / 1e6, room=room / 1e6)
+                why = None
+        if why:
             for p in s.positions:
                 x, y = M.amounts_for_liquidity(sp, M.sqrt_price_at_tick(p.tl), M.sqrt_price_at_tick(p.tu), p.liquidity)
                 k = BPS - self.st.burn_slippage_bps
                 self.act("burnPosition", a, p.token_id, x * k // BPS, y * k // BPS)
-                self.log("burned", account=a, token_id=p.token_id, why="out_of_range")
+                self.log("burned", account=a, token_id=p.token_id, why=why)
             s = self.r.account(a)
         # swaps and adds must quote within the band of the anchor, and (SA-3) need a trusted anchor
         if abs(price - g.last_price) * BPS > g.last_price * g.params["poolBandBps"] * self.st.band_safety:
@@ -299,9 +467,9 @@ class SAKeeper:
             self.log("deploy_waits_trusted", account=a)
             return
         pos = s.positions[0] if s.positions else None
-        tl, tu = (pos.tl, pos.tu) if pos else S.range_ticks(price, hw)
+        tl, tu = (pos.tl, pos.tu) if pos else S.range_ticks(price, hw, self.spacing)
         buffer = s.value * self.sa.buffer_bps // BPS
-        margin_left = max(0, int(s.value * self.sa.margin_frac) - max(s.hedge_equity, s.net_margin))
+        margin_left = max(0, int(s.value * self.sa.margin_frac) - max(s.hedge_equity, s.net_margin)) if hedged else 0
         free = max(0, s.usdc - buffer - margin_left)
         hv = s.native * price // E18
         v = free + hv
@@ -336,7 +504,9 @@ class SAKeeper:
             return
         if pos is None:
             self.act("mintPosition", a, tl, tu, liq, a0, a1, price)
-            self.log("minted", account=a, tl=tl, tu=tu, liquidity=liq, value_usd=val / 1e6)
+            self.ranges[a] = {"nonce": int(pr.get("nonce", 0)), "hw": round(hw, 6), "tl": tl, "tu": tu}
+            self.log("minted", account=a, tl=tl, tu=tu, liquidity=liq, value_usd=val / 1e6, half_width=round(hw, 4),
+                     mode=pr["mode"])
         else:
             self.act("increasePosition", a, pos.token_id, liq, a0, a1, price)
             self.log("increased", account=a, token_id=pos.token_id, liquidity=liq)
@@ -424,6 +594,12 @@ class SAKeeper:
         self.act("reportHedgeEquity", s.address, v)
 
     def wind_down(self, s: AccountSnap, g: GlobalSnap):
+        self.return_margin(s, g, close=True)
+
+    def return_margin(self, s: AccountSnap, g: GlobalSnap, close: bool):
+        """Close the account's hedge share, then pay its hedge equity back INTO the account. close=True (exited
+        account): the ledger entry is closed at the end; close=False (a live account that switched to unhedged): the
+        entry stays (it may switch back), on-chain hedge equity follows the ledger through report_equity."""
         a = s.address
         led = self.ledger.clients().get(a)
         if led is None or led["closed"]:
@@ -434,6 +610,8 @@ class SAKeeper:
             return  # the netted order this tick closes it; margin goes back on a later tick
         eq = int(max(0.0, led["equity"]) * 1e6)
         if eq < 10 ** 6:
+            if not close:
+                return
             if s.hedge_equity:  # nothing left off-chain: write the on-chain residue down (a keeper-only decrease)
                 self.act("reportHedgeEquity", a, 0)
             self.ledger.close(a)
@@ -449,7 +627,8 @@ class SAKeeper:
         if eq - amt >= 10 ** 6:
             why = "on-chain hedge equity is lower: the treasury itself calls returnHedgeMargin" \
                 if s.hedge_equity < eq else "withdraw from HL to the treasury first"
-            self.alert("warn", f"exit_margin_{a}", f"MANUAL: {(eq - amt) / 1e6:.2f} USDC of exited client {a} still "
+            self.alert("warn", f"exit_margin_{a}", f"MANUAL: {(eq - amt) / 1e6:.2f} USDC of "
+                                                   f"{'exited' if close else 'unhedged'} client {a} still "
                                                    f"to return into the account ({why})")
 
     # ------------------------------------------------------------ hedge (netted)
@@ -497,6 +676,12 @@ class SAKeeper:
                     req = json.load(fh)
                 acct, _ = rel.onboard(req)
                 out, res = "done", {"account": acct}
+                if req.get("strategy"):
+                    try:
+                        self.apply_strategy(req["strategy"], to_checksum_address(req["owner"]), acct, self.now())
+                    except Exception as e:  # the account is live; it runs on the default until a valid re-sign
+                        res["strategy_error"] = str(e)
+                        self.alert("warn", f"strategy_{name}", f"strategy of {acct} not applied: {e}")
             except Exception as e:  # bad signature, expired permit, already registered...
                 out, res = "failed", {"error": str(e)}
                 self.alert("warn", f"onboard_{name}", f"onboarding request {name} failed: {e}")
@@ -521,18 +706,17 @@ class SAKeeper:
             self.process_requests()
         except Exception as e:
             errors.append(f"relayer: {e}")
+        try:
+            self.process_strategy_requests(now)
+        except Exception as e:
+            errors.append(f"strategy: {e}")
         hw = self.half_width(now, self.info.mid(self.cfg.hl.coin))
         rows = {}
         for a in self.accounts():
             self._sent = 0
             try:
                 s = self.account_tick(a, price, g, now, hw)
-                rows[a] = {"owner": s.owner, "kind": s.kind, "active": s.active, "revoked": s.revoked,
-                           "until": s.until, "value": s.value / 1e6, "usdc": s.usdc / 1e6,
-                           "hype": s.native / 1e18, "positions": [vars(p) for p in s.positions],
-                           "contributed": s.contributed / 1e6, "profit": s.profit / 1e6, "hwm": s.hwm / 1e6,
-                           "fees_paid": s.fees_paid / 1e6, "hedge_equity": s.hedge_equity / 1e6,
-                           "net_margin": s.net_margin / 1e6, "ledger": dict(self.ledger.clients().get(a, {}))}
+                rows[a] = self.status_row(s, g, hw)
             except Exception as e:  # one account never blocks the others
                 errors.append(f"{a}: {e}")
                 self.log("account_failed", account=a, error=str(e))
@@ -561,8 +745,45 @@ class SAKeeper:
             self.write_status_file(rows, g, now)
         except Exception as e:
             self.log("status_file_failed", error=str(e))
+        try:
+            self.write_recommendation(now, g, rows)
+        except Exception as e:
+            self.log("recommend_failed", error=str(e))
         self.log("tick", ok=not errors, accounts=len(rows), errors=errors)
         return self.get_status()
+
+    def status_row(self, s: AccountSnap, g: GlobalSnap, hw_auto: float) -> dict:
+        a = s.address
+        tick = self.r.slot0()[1]
+        hw, clamped, floor = self.width_for(a, g, hw_auto)
+        ps = [vars(p) for p in s.positions]
+        rng = None
+        if s.positions:
+            p = s.positions[0]
+            rng = {"lower": round(M.p_to_usd(R.price_at_tick(p.tl)), 4), "upper": round(M.p_to_usd(R.price_at_tick(p.tu)),
+                                                                                         4),
+                   "in_range": any(S.in_range(tick, q.tl, q.tu) for q in s.positions),
+                   "price": round(M.p_to_usd(g.pool_price), 4)}
+        strategy = dict(P.public(self.prefs_of(a)), effective_width_bps=int(round(hw * 10_000)), clamped=clamped,
+                        turnover_floor_bps=int(round(floor * 10_000)))
+        ret = round(s.profit / s.contributed * 100, 3) if s.contributed > 0 else None
+        return {"owner": s.owner, "kind": s.kind, "active": s.active, "revoked": s.revoked,
+                "until": s.until, "value": s.value / 1e6, "usdc": s.usdc / 1e6,
+                "hype": s.native / 1e18, "positions": ps,
+                "contributed": s.contributed / 1e6, "profit": s.profit / 1e6, "hwm": s.hwm / 1e6,
+                "fees_paid": s.fees_paid / 1e6, "hedge_equity": s.hedge_equity / 1e6,
+                "net_margin": s.net_margin / 1e6, "ledger": dict(self.ledger.clients().get(a, {})),
+                "return_pct": ret, "range": rng, "strategy": strategy}
+
+    def write_recommendation(self, now: int, g: GlobalSnap, rows: dict):
+        """GET /recommend (served by sa-api from sa.recommend_path), at most every sa.recommend_every_s."""
+        if not self.sa.recommend_path or now - int(self.state.d.get("recommend_at", 0)) < self.sa.recommend_every_s:
+            return
+        ours = sum(float(r.get("value") or 0) for r in rows.values() if r.get("active"))
+        doc = R.compute(self.cfg, hl_info=self.info, rpc=self.rpc, pool=dict(self.pool_entry(), module=self.r.m.address),
+                        params=g.params, now=now, our_usd=max(self.sa.recommend_reference_usd, ours))
+        R.write(self.sa.recommend_path, doc)
+        self.state.d["recommend_at"] = now
 
     def write_status_file(self, rows: dict, g: GlobalSnap, now: int):
         """Per-account summary for the relayer API (sa-api serves it at /elysium-api/sa/status). Atomic replace;
