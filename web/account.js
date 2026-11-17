@@ -629,13 +629,13 @@ function hedgeOptions(w, prefix) {
     `We hold a matching HYPE short on Hyperliquid and re-adjust it when it drifts by 10%. About ${Math.round((1 - (REC?.model?.lp_frac_hedged ?? 0.72) - 0.03) * 100)}% of your deposit is kept as hedge margin.`, mh)
     + opt(false, 'Unhedged', 'Full HYPE exposure + fees',
       `No short: your value also moves with about half of the HYPE price. At the edge of the range the position is all HYPE (price falls) or all USDC (price rises)${mu?.ilEdge != null ? `, about ${pct(mu.ilEdge, 1)} behind simply holding` : ''}.`, mu)
-    + riskOffOption(w, prefix);
+    + (w.hedged ? '' : riskOffOption(w, prefix));
 }
-const RISK_OFF_TEXT = 'Protection from market crashes, not extra yield. Recommended without a hedge.';
+const RISK_OFF_TEXT = 'Protection from market crashes, not extra yield.';
 function riskOffOption(w, prefix) {
   return `<div class="section-title">Smart exit to cash</div><button class="card option ${w.riskOff ? 'sel' : ''}" id="${prefix}riskoff" aria-pressed="${!!w.riskOff}">
-      <div class="card-head"><div><div class="card-name">Smart exit ${w.riskOff ? 'on' : 'off'}${w.hedged ? '' : ' · recommended'}</div><div class="small muted">${RISK_OFF_TEXT}</div></div><span class="radio"></span></div>
-      <p class="small">When the market turns dangerous (Bitcoin closes far below its 30-day average), the manager closes your position and holds USDC${w.hedged ? ', and closes your hedge' : ''}. It re-enters once the market is calm again, at least 24 hours later.</p>
+      <div class="card-head"><div><div class="card-name">Smart exit ${w.riskOff ? 'on' : 'off'} · recommended</div><div class="small muted">${RISK_OFF_TEXT}</div></div><span class="radio"></span></div>
+      <p class="small">When the market turns dangerous (Bitcoin closes far below its 30-day average), the manager closes your position and holds USDC. It re-enters once the market is calm again, at least 24 hours later.</p>
       <div class="small muted">About 2–3 times a month. Each exit and re-entry costs swap fees, and no pool fees are earned while out: in calm markets this lowers your return.</div></button>`;
 }
 function strategySummary(st) {
@@ -800,7 +800,7 @@ function bindStrategy(w, prefix) {
   on('auto', () => { w.mode = 'auto'; render(); });
   on('manual', () => { w.mode = 'manual'; w.width = clampW(w.width || roundW(recW() || 1500)); render(); });
   on('userec', () => { w.width = clampW(roundW(recW())); render(); });
-  on('hedged', () => { w.hedged = true; if (!w.riskOffSet) w.riskOff = false; render(); });
+  on('hedged', () => { w.hedged = true; w.riskOff = false; render(); });
   on('unhedged', () => { w.hedged = false; if (!w.riskOffSet) w.riskOff = true; render(); });
   on('riskoff', () => { w.riskOff = !w.riskOff; w.riskOffSet = true; render(); });
   const sl = $(prefix + 'width');

@@ -300,3 +300,11 @@ def test_status_row_shows_risk_off_since(tmp_path):
     assert row["strategy"]["risk_off"] is True
     assert row["risk_off"] == {"enabled": True, "out": True, "since": NOW, "signal_on": True,
                                "signal_since": NOW - 100}
+
+
+def test_smart_exit_is_for_unhedged_only():
+    j = make_v2().to_json()
+    with pytest.raises(P.PrefsError) as e:
+        P.parse(dict(j, hedged=True, riskOff=True))
+    assert e.value.code == "strategy_bounds"
+    assert P.parse(dict(j, hedged=True, riskOff=False)).risk_off is False

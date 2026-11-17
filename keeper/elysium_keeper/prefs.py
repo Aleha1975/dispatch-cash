@@ -185,6 +185,8 @@ def parse(obj) -> Strategy:
         raise PrefsError("strategy_schema", "hedged must be true or false")
     if version == 2 and not isinstance(obj["riskOff"], bool):
         raise PrefsError("strategy_schema", "riskOff must be true or false")
+    if version == 2 and obj["riskOff"] and obj["hedged"]:
+        raise PrefsError("strategy_bounds", "smart exit (riskOff) is for unhedged positions only")
     sig = obj["signature"]
     if not isinstance(sig, str) or not sig.startswith("0x") or len(sig) != 132:
         raise PrefsError("strategy_schema", "signature must be 65 bytes of 0x hex")
