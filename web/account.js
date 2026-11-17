@@ -631,17 +631,17 @@ function hedgeOptions(w, prefix) {
       `No short: your value also moves with about half of the HYPE price. At the edge of the range the position is all HYPE (price falls) or all USDC (price rises)${mu?.ilEdge != null ? `, about ${pct(mu.ilEdge, 1)} behind simply holding` : ''}.`, mu)
     + riskOffOption(w, prefix);
 }
-const RISK_OFF_TEXT = 'Protection from crashes, not extra yield.';
+const RISK_OFF_TEXT = 'Protection from market crashes, not extra yield. Recommended without a hedge.';
 function riskOffOption(w, prefix) {
-  return `<div class="section-title">Crash protection</div><button class="card option ${w.riskOff ? 'sel' : ''}" id="${prefix}riskoff" aria-pressed="${!!w.riskOff}">
-      <div class="card-head"><div><div class="card-name">Risk-off ${w.riskOff ? 'on' : 'off'}</div><div class="small muted">${RISK_OFF_TEXT}</div></div><span class="radio"></span></div>
+  return `<div class="section-title">Smart exit to cash</div><button class="card option ${w.riskOff ? 'sel' : ''}" id="${prefix}riskoff" aria-pressed="${!!w.riskOff}">
+      <div class="card-head"><div><div class="card-name">Smart exit ${w.riskOff ? 'on' : 'off'}${w.hedged ? '' : ' · recommended'}</div><div class="small muted">${RISK_OFF_TEXT}</div></div><span class="radio"></span></div>
       <p class="small">When the market turns dangerous (Bitcoin closes far below its 30-day average), the manager closes your position and holds USDC${w.hedged ? ', and closes your hedge' : ''}. It re-enters once the market is calm again, at least 24 hours later.</p>
       <div class="small muted">About 2–3 times a month. Each exit and re-entry costs swap fees, and no pool fees are earned while out: in calm markets this lowers your return.</div></button>`;
 }
 function strategySummary(st) {
   if (!st) return '—';
   const width = st.mode === 'manual' ? widthLabel(st.width_bps) : `Auto${st.effective_width_bps ? ` (${widthLabel(st.effective_width_bps)} now)` : ''}`;
-  return `${width} · ${st.hedged ? 'Hedged' : 'Unhedged'}${st.risk_off ?? st.riskOff ? ' · Risk-off' : ''}`;
+  return `${width} · ${st.hedged ? 'Hedged' : 'Unhedged'}${st.risk_off ?? st.riskOff ? ' · Smart exit' : ''}`;
 }
 
 // ------------------------------------------------------------------ view
@@ -719,7 +719,7 @@ function wizard(top) {
       <div class="row"><span class="k">Range width</span><span class="v">${w.mode === 'auto' ? `Auto${bps ? ` · ${widthLabel(bps)} now` : ''}` : `Manual · ${widthLabel(w.width)}`}</span></div>
       ${p && bps ? `<div class="row"><span class="k">Range now</span><span class="v num">${money(p * (1 - bps / 1e4))} – ${money(p * (1 + bps / 1e4))}</span></div>` : ''}
       <div class="row"><span class="k">Hedge</span><span class="v">${w.hedged ? 'Hedged on Hyperliquid' : 'Unhedged'}</span></div>
-      <div class="row"><span class="k">Crash protection</span><span class="v">${w.riskOff ? `On: to USDC when the market is dangerous. ${RISK_OFF_TEXT}` : 'Off'}</span></div>
+      <div class="row"><span class="k">Smart exit to cash</span><span class="v">${w.riskOff ? `On: to USDC when the market is dangerous. ${RISK_OFF_TEXT}` : 'Off'}</span></div>
       <div class="row"><span class="k">Deposit</span><span class="v num">${use7702 ? 'Funds stay in this wallet' : `${esc(S.amount || '0')} USDC`}</span></div>
       <div class="row"><span class="k">Fees</span><span class="v">${PERF_FEE}% of profit above your high-water mark</span></div>
       <div class="row"><span class="k">Other fees</span><span class="v">None (no deposit, withdrawal or management fee)</span></div>
@@ -791,7 +791,7 @@ function editSheet() {
     <h2>Change strategy <button class="x" id="e-close" aria-label="Close">×</button></h2>
     <div class="section-title" style="margin-top:0">Range width</div><div class="card">${strategyControls(w, 'e-')}</div>
     <div class="section-title">Hedge</div>${hedgeOptions(w, 'e-')}
-    <p class="fine">One signature, no transaction. A new width re-centres your position on the manager's next pass; switching off the hedge closes your short and returns the margin into your account; turning on crash protection takes effect the next time the market turns dangerous (or at once if it already is).</p>
+    <p class="fine">One signature, no transaction. A new width re-centres your position on the manager's next pass; switching off the hedge closes your short and returns the margin into your account; turning on the smart exit takes effect the next time the market turns dangerous (or at once if it already is).</p>
     <button class="btn" id="e-save" ${S.busy ? 'disabled' : ''}>${S.busy === 'strategy' ? '<span class="spinner"></span>' : ''}Sign and update</button></div></div>`;
 }
 
@@ -800,9 +800,9 @@ function bindStrategy(w, prefix) {
   on('auto', () => { w.mode = 'auto'; render(); });
   on('manual', () => { w.mode = 'manual'; w.width = clampW(w.width || roundW(recW() || 1500)); render(); });
   on('userec', () => { w.width = clampW(roundW(recW())); render(); });
-  on('hedged', () => { w.hedged = true; render(); });
-  on('unhedged', () => { w.hedged = false; render(); });
-  on('riskoff', () => { w.riskOff = !w.riskOff; render(); });
+  on('hedged', () => { w.hedged = true; if (!w.riskOffSet) w.riskOff = false; render(); });
+  on('unhedged', () => { w.hedged = false; if (!w.riskOffSet) w.riskOff = true; render(); });
+  on('riskoff', () => { w.riskOff = !w.riskOff; w.riskOffSet = true; render(); });
   const sl = $(prefix + 'width');
   if (sl) {
     sl.oninput = (e) => {
