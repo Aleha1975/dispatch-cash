@@ -267,7 +267,7 @@ own checks, so they are a fair proxy for the module.
 
 | Contract | Bytes | Role |
 |---|---|---|
-| `LPManagerModule` | 23,672 (904 under EIP-170) | The keeper's only delegate. Ownable2Step (owner = `VaultTimelock`), transient reentrancy guard. |
+| `LPManagerModule` | 23,996 (580 under EIP-170; R4 exit window, branch `sa-r4-riskoff`) | The keeper's only delegate. Ownable2Step (owner = `VaultTimelock`), transient reentrancy guard. |
 | `SALib` (external, linked) | 17,113 | Delegation shape check, account identity (CREATE2 derivation / 7702 designator), registration, permit pull (each signature once, SA-3), HWM fee, fee gate, budgets (`movePrice` on the trailing range, `moveHedge`, turnover), execution builders with approval resets, verified transfers out. |
 | `SABook` (external, linked) | 6,993 | The books (SA-2): `sync` (SA-3: fees paid out of a tracked position since its checkpoint are yield; then live − snapshot booked at the anchor), `value`, `book` (the computed effect of LP adds / removals from PoolManager state, checkpoint rewritten). |
 | `SAWindow` (internal) | — | Sliding 24 h budget: nine 3 h buckets; any 24 h window admits at most 1x the cap. |
@@ -332,7 +332,9 @@ Consequence for the keeper: hedge margin is limited by the account's **idle** US
   designator, hybrid `owner()` == pinned owner): an owner change or a re-delegation is a revocation (L-14).
 - **Account value** at a price: idle USDC + idle HYPE × price + each position's principal at sqrt(price) + its uncollected fees +
   reported hedge equity. No pool-spot term (M-4); fee and margin sends need an anchor that is fresh, unclipped and within the pool band.
-- **Budgets** (`SAWindow`, sliding 24 h, 1x): per account turnover (swaps + LP adds) and keeper-only hedge decreases. Anchor (SA-3,
+- **Budgets** (`SAWindow`, sliding 24 h, 1x): per account turnover (swaps + LP adds) and keeper-only hedge decreases.
+  R4 (`sa-r4-riskoff`): a sell of base while the account holds no tracked position is charged to a separate exit window
+  (`exitTurnoverBps`, ≤ 1x, 0 = off) so a risk-off exit to USDC fits one day (docs/ARCHITECTURE.md). Anchor (SA-3,
   `SARange`): the keeper alone moves it at most `refDriftBps` from every value it held in the trailing 24 h; an oscillation that comes
   back costs nothing; a guardian range applies one report the budget would clip and resets the window. Guardian price ranges and hedge approvals are one-shot, TTL ≤ 1 day, cleared by a pause
   / guardian change; a hedge approval binds (account, epoch, stored value, value, guardian era) and every margin move bumps the epoch (M-3).

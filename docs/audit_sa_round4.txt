@@ -21,14 +21,16 @@ SCOPE
 - src/sa/SARange.sol (NEW, internal library): trailing 24 h (min, max) in nine 3 h buckets.
 - src/sa/SwapExecutor.sol: CHANGED: the transient record also holds keccak256(calldata) of the executed swap.
 - src/VaultTimelock.sol: CHANGED: per-operation delay cap, isExpired, no proposer renounce, rotation NatSpec.
-- script/DeploySA.s.sol: CHANGED: fixture code hashes, POSM wiring, read-back of roles / wiring.
+- script/DeploySA.s.sol: CHANGED: fixture code hashes, POSM wiring, read-back of roles / wiring; exitTurnoverBps 10000.
+- NEW IN THIS SUBMISSION (risk-off product, branch sa-r4-riskoff): the EXIT WINDOW, see "R4 EXIT WINDOW" below. Touches
+  LPManagerModule.swap / _useTurnover / _setParams / windows and SALib.Budgets / useTurnover / used only.
 - Unchanged since round 3: src/sa/SAWindow.sol, src/sa/ElysiumCustodyEnforcer.sol, src/sa/vendor/DelegationFramework.sol,
   src/V4PositionMath.sol. The pooled vault is shelved and OUT of scope.
 solc 0.8.26, via-IR, optimizer runs 1, evm cancun. OpenZeppelin 5.4.0, v4-core/periphery from lib/. NOT deployed.
-Runtime: module 23,672 B (904 under EIP-170), SALib 17,113 B, SABook 6,993 B, enforcer 7,802 B, SwapExecutor 3,774 B,
+Runtime: module 23,996 B (580 under EIP-170), SALib 17,173 B, SABook 6,993 B, enforcer 7,802 B, SwapExecutor 3,774 B,
 VaultTimelock 6,126 B.
-Foundry: test/sa/SARound3.t.sol (19, new), SARound2.t.sol (25), SARegressions.t.sol (33), LPManagerModule.t.sol (31),
-CustodyEnforcer.t.sol (27), test/fork/SmartAccount.fork.t.sol (3, ELYSIUM_FORK=true). 221 offline tests pass. Keeper
+Foundry: test/sa/SARiskOff.t.sol (7, new: exit window), test/sa/SARound3.t.sol (19), SARound2.t.sol (25), SARegressions.t.sol (33), LPManagerModule.t.sol (31),
+CustodyEnforcer.t.sol (27), test/fork/SmartAccount.fork.t.sol (3, ELYSIUM_FORK=true). 228 offline tests pass. Keeper
 (Python) unit + anvil-fork e2e.
 
 SOURCE
@@ -61,6 +63,31 @@ WHAT CHANGED (details in the response file)
 - Lows: permit (owner, nonce) once; onboard needs a live account; revoke before registration; transferOwnership(0);
   setPaused repeat refused; isActive includes the DelegationManager pause; hedge cap-0 no-op; timelock delay cap.
 
+R4 EXIT WINDOW (new, please review with the same principal-loss lens)
+Product: "LP + risk-off" leaves the pool for USDC when the market is dangerous (keeper signal, off-chain) and re-enters
+later. At the pilot swapTurnoverBps 5000 a full exit did not fit one day: after burning (free), the HYPE to sell is
+0.45-0.97 of the account value (HYPE share of a +-16% range is 0.46 at the centre, 0.61 / 0.77 / 1.0 after -5% / -10% /
+below the range), and the 24 h turnover window is often already spent by a re-range during the same fall.
+Change: Params.exitTurnoverBps (uint16, <= MAX_EXIT_TURNOVER_BPS = 10000, 0 = off). In swap(), a sell of base
+(sellBase) while the account holds NO tracked position (after the swap's own _sync) is charged to a separate sliding
+24 h window (Budgets.exit, SAWindow, cap exitTurnoverBps x account value at the anchor) instead of the turnover window.
+Buys, sells while any position is held, and every LP add stay on the turnover window. windows(a) returns exitUsed 4th.
+Nothing else changes: same trusted anchor, same keeperPrice band checks, same min-out floor (fair x (1 - maxSlippage))
+and sqrtPrice limit at the anchor band edge, same executor hash binding; proceeds stay in the account.
+Safety argument: (1) the exit window only ever moves value from base to the asset inside the account; (2) its loss per
+unit is the same as any keeper swap (at most about poolBand + maxSlippage); (3) it is usable only after every position is
+burned, and selling base again needs base, which can only be re-bought on the turnover window. So the stolen-keeper
+oscillation bound becomes about (poolBand + maxSlippage) x (swapTurnoverBps + exitTurnoverBps) x value per 24 h (pilot:
+3% x 1.5 = 4.5% of value per day, was 1.5%); in practice the exit part is limited to the base held plus what the
+turnover window re-bought. Please check: (a) no path charges a risk-adding swap or an add to the exit window; (b) a
+client-held or untracked position cannot make the module think the account holds none in a way that matters (the
+module's own sync drops positions the account no longer owns; the client could also burn its own positions, which only
+lets the keeper sell base to USDC within the exit window); (c) the stated bound.
+Tests: test/sa/SARiskOff.t.sol (exit at pilot Params after the turnover window is full, sell with a position stays on
+turnover, cap and off, buys stay on turnover, sliding + per account, Params bound, full exit / hold / two-day re-entry).
+Unchanged by this product: hedge margin goes only to the immutable hedgeTreasury (bridging from there to Hyperliquid is
+operator custody, out of scope).
+
 TASK 1: VERIFY THE ROUND-3 FIXES
 For every round-3 Medium (1226 M-1..M-4, 1227 M-1..M-7) state fixed / partly fixed / not fixed / regressed, with a trace
 or a Foundry test. In particular:
@@ -80,7 +107,7 @@ Any path, by anyone (client's own code excepted for its own account, keeper with
 party, guardian, timelock), that moves client principal out of the account other than: into the pool (LP / swaps within
 the stated bounds), to hedgeTreasury (<= hedgeCapBps), to feeRecipient (<= feeBps of profit above the HWM). Check the
 stated stolen-keeper bound (response, accepted residual 7: about (band + slippage) x turnover per day) and the fee-after-push
-bound (residual 5). Check that the client can always exit (revoke, withdraw, burn) with the module and the
+bound (residual 5) and the R4 exit-window bound above. Check that the client can always exit (revoke, withdraw, burn) with the module and the
 DelegationManager paused.
 
 TASK 3: ACCEPTED RESIDUALS
@@ -101,4 +128,4 @@ interaction with our contracts is in scope); the shelved pooled vault.
 DELIVERABLE
 Findings with severity, a concrete trace or a Foundry test, and the smallest fix; for every round-3 Medium the status.
 A clear statement whether you see any principal-loss path for a pilot of about USD 250 at the script parameters with
-swapTurnoverBps lowered to 5000.
+swapTurnoverBps lowered to 5000 and exitTurnoverBps 10000.

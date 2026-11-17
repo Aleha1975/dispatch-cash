@@ -37,6 +37,10 @@ Strategy(address owner,address account,address module,uint8 widthMode,uint32 wid
 | `nonce` | Strictly above the stored one (the web uses `Date.now()` ms): an old signature can never undo a newer choice. |
 | `deadline` | Submission window only: the keeper must receive it before then (API: ≥ now + 5 min, ≤ now + 2 days). An accepted Strategy stays until a newer one. |
 
+**v2 (branch `sa-r4-riskoff`, risk-off product, docs/ARCHITECTURE.md):** domain version `"2"` and one more field after
+`hedged`: `Strategy(address owner,address account,address module,uint8 widthMode,uint32 widthBps,bool hedged,bool riskOff,uint64 nonce,uint64 deadline)`.
+The web signs v2; v1 messages (no `riskOff` key on the wire) stay valid and mean `riskOff = false`.
+
 Wire format (onboarding body field `strategy`, and `POST /strategy {owner, kind, strategy}`): the message fields plus
 `signature` (65-byte hex); uints as numbers or decimal strings. `strategy` is optional at onboarding: an account
 without one is managed as **auto, hedged** (`sa.default_hedged`), exactly as before this branch.
