@@ -401,7 +401,8 @@ def test_status_states(env):
     assert out["state"] == "active" and out["summary"]["value"] == 1000.0
     assert out["summary"]["hedge"] == {"short": 1.2, "equity": 250.0, "margin_in": 250.0, "margin_out": 0.0,
                                        "closed": False}
-    assert out["keeper"] == {"last_tick": NOW, "age_s": 5, "fresh": True, "paused": False, "price": 40.1}
+    assert out["keeper"] == {"last_tick": NOW, "age_s": 5, "fresh": True, "paused": False, "price": 40.1,
+                             "risk_off": None}
     row["active"] = False
     (tmp / "status.json").write_text(json.dumps({"written_at": NOW, "accounts": {a: row}}))
     assert api.get_status(f"owner={OWNER}", "1.1.1.1")[1]["state"] == "revoked"

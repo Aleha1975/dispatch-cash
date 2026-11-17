@@ -9,8 +9,8 @@
 //   1. the delegation (EIP-712, DelegationManager domain) that lets LPManagerModule act on the account, limited by
 //      ElysiumCustodyEnforcer (pool, router, hedge account, fee account, %-limits) and an expiry;
 //   2. a USDC permit (EIP-2612) so the relayer can move the deposit from the wallet into the new account.
-//   3. the Strategy (EIP-712, domain "Elysium LP Strategy" / module; keeper/elysium_keeper/prefs.py): width mode and
-//      half-width, hedged or not, nonce, deadline. Enforced by the keeper, not by the contract (the module's limits
+//   3. the Strategy (EIP-712, domain "Elysium LP Strategy" / version "2" / module; keeper/elysium_keeper/prefs.py):
+//      width mode and half-width, hedged or not, risk-off (crash protection) or not, nonce, deadline. Enforced by the keeper, not by the contract (the module's limits
 //      still bound whatever the keeper does).
 // The relayer deploys the HybridDeleGator (owner = the wallet) and registers it in one transaction.
 // A wallet that is already a MetaMask smart account (EIP-7702, EIP7702StatelessDeleGator) can use itself as the
@@ -155,15 +155,16 @@ const batch = (xs) => encodeAbiParameters([{ type: 'tuple[]', components: [{ nam
 const STRATEGY_TYPES = { EIP712Domain: EIP712_DOMAIN, Strategy: [
   { name: 'owner', type: 'address' }, { name: 'account', type: 'address' }, { name: 'module', type: 'address' },
   { name: 'widthMode', type: 'uint8' }, { name: 'widthBps', type: 'uint32' }, { name: 'hedged', type: 'bool' },
-  { name: 'nonce', type: 'uint64' }, { name: 'deadline', type: 'uint64' }] };
+  { name: 'riskOff', type: 'bool' }, { name: 'nonce', type: 'uint64' }, { name: 'deadline', type: 'uint64' }] };
+const STRATEGY_VERSION = '2'; // v2 = + riskOff; the keeper still accepts v1 messages (no riskOff field)
 const PERF_FEE = (SA.performanceFeeBps ?? 1500) / 100;
 /** Sign the client's Strategy (free, no transaction). Returns the wire object (message + signature). */
 async function signStrategy(account, w) {
   const message = { owner: S.account, account, module: SA.module, widthMode: w.mode === 'manual' ? 1 : 0,
-    widthBps: w.mode === 'manual' ? w.width : 0, hedged: !!w.hedged,
+    widthBps: w.mode === 'manual' ? w.width : 0, hedged: !!w.hedged, riskOff: !!w.riskOff,
     nonce: String(Date.now()), deadline: String(Math.floor(Date.now() / 1000) + (SA.strategyDeadlineS || 3600)) };
   if (MOCK) return { ...message, signature: '0x' + '11'.repeat(65) };
-  const typed = { types: STRATEGY_TYPES, primaryType: 'Strategy', domain: { name: 'Elysium LP Strategy', version: '1', chainId: CHAIN.id, verifyingContract: SA.module }, message };
+  const typed = { types: STRATEGY_TYPES, primaryType: 'Strategy', domain: { name: 'Elysium LP Strategy', version: STRATEGY_VERSION, chainId: CHAIN.id, verifyingContract: SA.module }, message };
   const raw = parseSignature(await signTyped(typed));
   const v = raw.v != null ? (Number(raw.v) < 27 ? Number(raw.v) + 27 : Number(raw.v)) : 27 + raw.yParity;
   const signature = concat([raw.r, raw.s, toHex(v, { size: 1 })]);
@@ -208,7 +209,7 @@ const widthLabel = (bps) => `±${(bps / 100).toFixed(bps % 100 ? 1 : 0)}%`;
 // ------------------------------------------------------------------ state
 const STEPS = ['pool', 'strategy', 'hedge', 'amount', 'review'];
 const S = { provider: null, account: null, chainId: null, kind: null, is7702: false, sa: null, info: null, busy: null, msg: '', err: '', steps: null, amount: '', use7702: false, mock: 'disconnected',
-  w: { step: 'pool', mode: 'auto', width: null, hedged: true }, rs: null, edit: null };
+  w: { step: 'pool', mode: 'auto', width: null, hedged: true, riskOff: false }, rs: null, edit: null };
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const usd = (raw) => (raw < 0n ? '−$' : '$') + Number(formatUnits(raw < 0n ? -raw : raw, UD)).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -540,7 +541,8 @@ function mockStatus() {
   const m = S.mockStrategy || { mode: 'auto', width: null, hedged: true };
   const pend = S.mockPending ? { mode: S.mockPending.mode, width_bps: S.mockPending.mode === 'manual' ? S.mockPending.width : null, hedged: S.mockPending.hedged, nonce: 3, source: 'queued' } : null;
   return { state: 'active', strategy_pending: pend,
-    summary: { return_pct: 2.913, strategy: { mode: m.mode, width_bps: m.mode === 'manual' ? m.width : null, hedged: m.hedged, nonce: 2, source: 'signed', effective_width_bps: m.mode === 'manual' ? m.width : (recW() || 1600), clamped: false },
+    summary: { return_pct: 2.913, strategy: { mode: m.mode, width_bps: m.mode === 'manual' ? m.width : null, hedged: m.hedged, risk_off: !!m.riskOff, nonce: 2, source: 'signed', effective_width_bps: m.mode === 'manual' ? m.width : (recW() || 1600), clamped: false },
+      risk_off: m.riskOff ? { enabled: true, out: S.mock === 'live-out', since: Math.floor(Date.now() / 1000) - 7200, signal_on: S.mock === 'live-out' } : null,
       hedge: { short: m.hedged ? 22.41 : 0, equity: m.hedged ? 752.1 : 0, closed: false } },
     keeper: { fresh: true, paused: false } };
 }
@@ -626,12 +628,20 @@ function hedgeOptions(w, prefix) {
   return opt(true, 'Hedged', 'Earn fees, minimal HYPE exposure',
     `We hold a matching HYPE short on Hyperliquid and re-adjust it when it drifts by 10%. About ${Math.round((1 - (REC?.model?.lp_frac_hedged ?? 0.72) - 0.03) * 100)}% of your deposit is kept as hedge margin.`, mh)
     + opt(false, 'Unhedged', 'Full HYPE exposure + fees',
-      `No short: your value also moves with about half of the HYPE price. At the edge of the range the position is all HYPE (price falls) or all USDC (price rises)${mu?.ilEdge != null ? `, about ${pct(mu.ilEdge, 1)} behind simply holding` : ''}.`, mu);
+      `No short: your value also moves with about half of the HYPE price. At the edge of the range the position is all HYPE (price falls) or all USDC (price rises)${mu?.ilEdge != null ? `, about ${pct(mu.ilEdge, 1)} behind simply holding` : ''}.`, mu)
+    + riskOffOption(w, prefix);
+}
+const RISK_OFF_TEXT = 'Protection from crashes, not extra yield.';
+function riskOffOption(w, prefix) {
+  return `<div class="section-title">Crash protection</div><button class="card option ${w.riskOff ? 'sel' : ''}" id="${prefix}riskoff" aria-pressed="${!!w.riskOff}">
+      <div class="card-head"><div><div class="card-name">Risk-off ${w.riskOff ? 'on' : 'off'}</div><div class="small muted">${RISK_OFF_TEXT}</div></div><span class="radio"></span></div>
+      <p class="small">When the market turns dangerous (Bitcoin closes far below its 30-day average), the manager closes your position and holds USDC${w.hedged ? ', and closes your hedge' : ''}. It re-enters once the market is calm again, at least 24 hours later.</p>
+      <div class="small muted">About 2–3 times a month. Each exit and re-entry costs swap fees, and no pool fees are earned while out: in calm markets this lowers your return.</div></button>`;
 }
 function strategySummary(st) {
   if (!st) return '—';
   const width = st.mode === 'manual' ? widthLabel(st.width_bps) : `Auto${st.effective_width_bps ? ` (${widthLabel(st.effective_width_bps)} now)` : ''}`;
-  return `${width} · ${st.hedged ? 'Hedged' : 'Unhedged'}`;
+  return `${width} · ${st.hedged ? 'Hedged' : 'Unhedged'}${st.risk_off ?? st.riskOff ? ' · Risk-off' : ''}`;
 }
 
 // ------------------------------------------------------------------ view
@@ -709,6 +719,7 @@ function wizard(top) {
       <div class="row"><span class="k">Range width</span><span class="v">${w.mode === 'auto' ? `Auto${bps ? ` · ${widthLabel(bps)} now` : ''}` : `Manual · ${widthLabel(w.width)}`}</span></div>
       ${p && bps ? `<div class="row"><span class="k">Range now</span><span class="v num">${money(p * (1 - bps / 1e4))} – ${money(p * (1 + bps / 1e4))}</span></div>` : ''}
       <div class="row"><span class="k">Hedge</span><span class="v">${w.hedged ? 'Hedged on Hyperliquid' : 'Unhedged'}</span></div>
+      <div class="row"><span class="k">Crash protection</span><span class="v">${w.riskOff ? `On: to USDC when the market is dangerous. ${RISK_OFF_TEXT}` : 'Off'}</span></div>
       <div class="row"><span class="k">Deposit</span><span class="v num">${use7702 ? 'Funds stay in this wallet' : `${esc(S.amount || '0')} USDC`}</span></div>
       <div class="row"><span class="k">Fees</span><span class="v">${PERF_FEE}% of profit above your high-water mark</span></div>
       <div class="row"><span class="k">Other fees</span><span class="v">None (no deposit, withdrawal or management fee)</span></div>
@@ -750,6 +761,7 @@ function statusView(top) {
         <div class="row"><span class="k">Strategy</span><span class="v">${esc(strategySummary(st))}${st?.clamped ? ' <span class="tag warn">widened</span>' : ''}</span></div>
         ${pend ? `<div class="row"><span class="k">Change pending</span><span class="v">${esc(strategySummary(pend))}</span></div>` : ''}
         <div class="row"><span class="k">Hedge</span><span class="v">${hedged ? `Hedged · margin ${pct(marginPct, 0)} of account` : 'Unhedged · full HYPE exposure'}</span></div>
+        ${sum.risk_off ? `<div class="row"><span class="k">Risk-off</span><span class="v">${sum.risk_off.out ? `Out of the pool, holding USDC since ${sum.risk_off.since ? new Date(sum.risk_off.since * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : '…'}` : 'On · watching the market'}</span></div>` : ''}
         ${hedged && sum.hedge?.short != null ? `<div class="row"><span class="k">HYPE short (Hyperliquid)</span><span class="v num">${Number(sum.hedge.short).toFixed(2)} HYPE</span></div>` : ''}
       </div>
       ${st?.clamped ? `<p class="fine">Your manual width is below today's minimum (${widthLabel(st.turnover_floor_bps)}): the manager uses the minimum until volatility drops.</p>` : ''}
@@ -779,7 +791,7 @@ function editSheet() {
     <h2>Change strategy <button class="x" id="e-close" aria-label="Close">×</button></h2>
     <div class="section-title" style="margin-top:0">Range width</div><div class="card">${strategyControls(w, 'e-')}</div>
     <div class="section-title">Hedge</div>${hedgeOptions(w, 'e-')}
-    <p class="fine">One signature, no transaction. A new width re-centres your position on the manager's next pass; switching off the hedge closes your short and returns the margin into your account.</p>
+    <p class="fine">One signature, no transaction. A new width re-centres your position on the manager's next pass; switching off the hedge closes your short and returns the margin into your account; turning on crash protection takes effect the next time the market turns dangerous (or at once if it already is).</p>
     <button class="btn" id="e-save" ${S.busy ? 'disabled' : ''}>${S.busy === 'strategy' ? '<span class="spinner"></span>' : ''}Sign and update</button></div></div>`;
 }
 
@@ -790,6 +802,7 @@ function bindStrategy(w, prefix) {
   on('userec', () => { w.width = clampW(roundW(recW())); render(); });
   on('hedged', () => { w.hedged = true; render(); });
   on('unhedged', () => { w.hedged = false; render(); });
+  on('riskoff', () => { w.riskOff = !w.riskOff; render(); });
   const sl = $(prefix + 'width');
   if (sl) {
     sl.oninput = (e) => {
@@ -817,7 +830,7 @@ function bind() {
   }
   on('edit', () => {
     const st = S.rs?.summary?.strategy || S.rs?.strategy || {};
-    S.edit = { mode: st.mode || 'auto', width: clampW(st.width_bps || st.effective_width_bps || roundW(recW() || 1500)), hedged: st.hedged ?? true };
+    S.edit = { mode: st.mode || 'auto', width: clampW(st.width_bps || st.effective_width_bps || roundW(recW() || 1500)), hedged: st.hedged ?? true, riskOff: !!st.risk_off };
     render();
   });
   const amt = $('amt'); if (amt) amt.oninput = (e) => { S.amount = e.target.value; const b = $('w-next'); if (b) b.disabled = !(Number(S.amount) > 0); };

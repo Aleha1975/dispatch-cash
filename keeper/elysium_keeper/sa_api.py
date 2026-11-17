@@ -567,7 +567,7 @@ class StatusFile:
 
 
 SUMMARY_KEYS = ("value", "usdc", "hype", "contributed", "profit", "hwm", "fees_paid", "hedge_equity", "net_margin",
-                "until", "positions", "stale", "return_pct", "range", "strategy")
+                "until", "positions", "stale", "return_pct", "range", "strategy", "risk_off")
 LEDGER_KEYS = ("short", "equity", "margin_in", "margin_out", "closed")
 URL_RE = re.compile(r"https?://\S+")
 
@@ -781,7 +781,8 @@ class SAApi:
         try:
             manual = int(m.get("widthMode", 0)) == P.MODE_MANUAL
             return {"mode": "manual" if manual else "auto", "width_bps": int(m["widthBps"]) if manual else None,
-                    "hedged": bool(m.get("hedged")), "nonce": int(m.get("nonce", 0)), "source": source}
+                    "hedged": bool(m.get("hedged")), "risk_off": bool(m.get("riskOff", False)),
+                    "nonce": int(m.get("nonce", 0)), "source": source}
         except (KeyError, ValueError, TypeError):
             return None
 
@@ -789,7 +790,8 @@ class SAApi:
         w = st.get("written_at")
         age = int(self.wall() - w) if isinstance(w, (int, float)) else None
         return {"last_tick": st.get("last_tick"), "age_s": age, "fresh": age is not None and age <= self.stale_s,
-                "paused": st.get("paused"), "price": (st.get("price") or {}).get("anchor")}
+                "paused": st.get("paused"), "price": (st.get("price") or {}).get("anchor"),
+                "risk_off": st.get("risk_off")}
 
     # ---------------------------------------------------------------- GET /health
     def health(self) -> tuple[int, dict]:

@@ -20,6 +20,10 @@ re-range, widened to the live turnover floor if needed) and hedged / unhedged (u
 already sent is returned once the short share is closed). Re-range triggers: out of range, within sa.edge_frac of an
 edge, a newer preference whose width differs, or (auto) a vol-based width that moved by more than
 sa.auto_rewidth_factor; the in-range triggers wait while the turnover budget cannot pay the re-deploy.
+Risk-off (Strategy v2 riskOff, riskoff.py): while the global signal is on, a risk-off account leaves the pool: burn
+every position, sell its HYPE into USDC (on-chain: the module's exit window, exitTurnoverBps), and, if hedged, close
+its short share once the HYPE is sold and take the margin back into the account; it re-enters through the normal
+deploy path once the signal is off and it has been out at least sa.riskoff_min_out_s.
 Restart safety: every action is recomputed from a fresh read; the state file holds the ledger, the dry-run HL
 simulation, the event-scan cursor, fee records and the accepted preferences (state `prefs`, with the signatures).
 """
@@ -35,6 +39,7 @@ from eth_utils import to_checksum_address
 
 from . import prefs as P
 from . import recommend as R
+from . import riskoff as RO
 from . import strategy as S
 from . import v4math as M
 from .config import Config
@@ -151,6 +156,10 @@ class SAKeeper:
         self._floor = None
         self.prefs = self.state.d.setdefault("prefs", {})  # account -> accepted signed Strategy (prefs.Strategy.record)
         self.ranges = self.state.d.setdefault("ranges", {})  # account -> {nonce, hw, tl, tu} of the last mint
+        self.riskoff = RO.RiskOff(self.info, self.state.d.setdefault("riskoff", {}), coin_btc=self.sa.riskoff_btc_coin,
+                                  coin_base=cfg.hl.coin, use_rv=self.sa.riskoff_use_rv,
+                                  refresh_s=self.sa.riskoff_refresh_s, log=self.log)
+        self.riskout = self.state.d.setdefault("riskoff_out", {})  # account -> time it left the pool (risk-off)
         self.lock = threading.Lock()
         self.status: dict = {"ok": False, "module": self.r.m.address, "name": cfg.name, "accounts": {}}
         self.actions: list[dict] = []
@@ -344,12 +353,62 @@ class SAKeeper:
         return price, g
 
     # ------------------------------------------------------------ per account
+    # ------------------------------------------------------------ risk-off
+    def risk_out(self, a: str, now: int) -> bool:
+        """Is account `a` (Strategy riskOff) to be out of the pool now? Tracks when it left (min time out)."""
+        pr = self.prefs_of(a)
+        if not pr.get("risk_off"):
+            if self.riskout.pop(a, None) is not None:
+                self.log("riskoff_disabled", account=a)
+            return False
+        since = self.riskout.get(a)
+        out = RO.account_out(bool(self.riskoff.st.get("on")), since, now, self.sa.riskoff_min_out_s)
+        if out and since is None:
+            self.riskout[a] = now
+            self.log("riskoff_exit", account=a, signal=dict(self.riskoff.st))
+        elif not out and since is not None:
+            self.riskout.pop(a)
+            self.log("riskoff_reenter", account=a, out_s=now - since)
+        return out
+
+    def exit_lp(self, a: str, g: GlobalSnap, price: int | None) -> AccountSnap:
+        """Risk-off: burn every position (allowed in every state), then sell the HYPE into USDC within the module's
+        exit window (exitTurnoverBps: a sell with no position held). Swaps need a price and a trusted anchor; until
+        then the account waits with idle HYPE (still hedged if it was)."""
+        s = self.r.account(a)
+        if s.positions:
+            sp, _ = self.r.slot0()
+            k = BPS - self.st.burn_slippage_bps
+            for p in s.positions:
+                x, y = M.amounts_for_liquidity(sp, M.sqrt_price_at_tick(p.tl), M.sqrt_price_at_tick(p.tu), p.liquidity)
+                self.act("burnPosition", a, p.token_id, x * k // BPS, y * k // BPS)
+                self.log("burned", account=a, token_id=p.token_id, why="risk_off")
+            s = self.r.account(a)
+        if price is None or s.positions or g.paused:
+            return s
+        min_amt = int(self.st.min_swap_usd / M.p_to_usd(price) * E18)
+        if s.native <= min_amt:
+            return s
+        if not self.r.global_snap().trusted(self.now()):
+            self.log("riskoff_sell_waits_trusted", account=a)
+            return s
+        room = max(0, s.value * int(g.params.get("exitTurnoverBps", 0)) // BPS - int(s.windows.get("exitUsed", 0)))
+        amt = min(s.native, int(room * 98 // 100) * E18 // price)
+        if amt <= min_amt:
+            self.log("riskoff_sell_no_room", account=a, room=room / 1e6, hype=s.native / E18)
+            return s
+        sold = self.swap(a, True, amt, price)
+        self.log("riskoff_sold", account=a, hype=sold / E18, left=(s.native - sold) / E18)
+        return self.r.account(a)
+
     def account_tick(self, a: str, price: int | None, g: GlobalSnap, now: int, hw: float):
         s = self.r.account(a)
         if not s.active:
             self.wind_down(s, g)
             return s
         led = self.ledger.client(a)
+        if self.risk_out(a, now) and s.value >= self.sa.min_account_usd * 1e6:
+            return self.account_tick_out(a, s, price, g, now)
         if price is None:
             led["target"] = led["short"]  # keep the hedge as is while prices disagree
             return s
@@ -378,6 +437,26 @@ class SAKeeper:
             lp_b, _ = s.lp_amounts(self.r.slot0()[0])
             self.ledger.set_target(a, (lp_b + s.native) / E18 * self.st.hedge_ratio)
         else:  # unhedged: no short; margin sent while it was hedged goes back into the account
+            self.return_margin(s, self.r.global_snap(), close=False)
+            s = self.r.account(a)
+        self.report_equity(s)
+        return s
+
+    def account_tick_out(self, a: str, s: AccountSnap, price: int | None, g: GlobalSnap, now: int) -> AccountSnap:
+        """Risk-off account while out: no margin, no LP; exit to USDC; fee as usual; hedge follows the idle HYPE
+        (hedged) and, once it is sold, the short share is closed and the margin goes back INTO the account."""
+        if not g.paused and price is not None:
+            if s.pending and g.trusted(self.now()):
+                self.act("sync", a)
+        s = self.exit_lp(a, g, price)
+        if not g.paused and price is not None:
+            self.fee(a, g, now)
+        s = self.r.account(a)
+        hedged = bool(self.prefs_of(a)["hedged"])
+        dust = int(self.st.min_swap_usd / M.p_to_usd(price) * E18) if price else 0
+        if hedged and s.native > dust:
+            self.ledger.set_target(a, s.native / E18 * self.st.hedge_ratio)  # still holding HYPE: keep it hedged
+        else:
             self.return_margin(s, self.r.global_snap(), close=False)
             s = self.r.account(a)
         self.report_equity(s)
@@ -711,8 +790,14 @@ class SAKeeper:
         except Exception as e:
             errors.append(f"strategy: {e}")
         hw = self.half_width(now, self.info.mid(self.cfg.hl.coin))
+        accts = self.accounts()
+        if any(self.prefs_of(a).get("risk_off") for a in accts):
+            ro = self.riskoff.update(now)
+            if ro.get("error") and now - int(ro.get("bar_close", 0)) > self.sa.riskoff_stale_alert_s:
+                self.alert("warn", "riskoff_stale", f"risk-off signal not refreshed since bar {ro.get('bar_close')}: "
+                                                    f"{ro.get('error')}")
         rows = {}
-        for a in self.accounts():
+        for a in accts:
             self._sent = 0
             try:
                 s = self.account_tick(a, price, g, now, hw)
@@ -766,6 +851,11 @@ class SAKeeper:
                    "price": round(M.p_to_usd(g.pool_price), 4)}
         strategy = dict(P.public(self.prefs_of(a)), effective_width_bps=int(round(hw * 10_000)), clamped=clamped,
                         turnover_floor_bps=int(round(floor * 10_000)))
+        risk = None
+        if strategy.get("risk_off"):
+            since = self.riskout.get(a)
+            risk = {"enabled": True, "out": since is not None, "since": since,
+                    "signal_on": bool(self.riskoff.st.get("on")), "signal_since": self.riskoff.st.get("since")}
         ret = round(s.profit / s.contributed * 100, 3) if s.contributed > 0 else None
         return {"owner": s.owner, "kind": s.kind, "active": s.active, "revoked": s.revoked,
                 "until": s.until, "value": s.value / 1e6, "usdc": s.usdc / 1e6,
@@ -773,7 +863,7 @@ class SAKeeper:
                 "contributed": s.contributed / 1e6, "profit": s.profit / 1e6, "hwm": s.hwm / 1e6,
                 "fees_paid": s.fees_paid / 1e6, "hedge_equity": s.hedge_equity / 1e6,
                 "net_margin": s.net_margin / 1e6, "ledger": dict(self.ledger.clients().get(a, {})),
-                "return_pct": ret, "range": rng, "strategy": strategy}
+                "return_pct": ret, "range": rng, "strategy": strategy, "risk_off": risk}
 
     def write_recommendation(self, now: int, g: GlobalSnap, rows: dict):
         """GET /recommend (served by sa-api from sa.recommend_path), at most every sa.recommend_every_s."""
@@ -808,6 +898,8 @@ class SAKeeper:
         doc = {"version": 1, "module": self.r.m.address, "written_at": int(time.time()), "last_tick": now,
                "paused": g.paused, "price": {"anchor": g.last_price / 1e6, "pool": price.get("pool"),
                                              "status": price.get("status")},
+               "risk_off": {k: self.riskoff.st.get(k) for k in ("on", "since", "off_since", "bar_close",
+                                                                  "btc_below_ema_pct", "threshold_pct", "reason")},
                "accounts": out_rows}
         if os.path.dirname(path):
             os.makedirs(os.path.dirname(path), exist_ok=True)

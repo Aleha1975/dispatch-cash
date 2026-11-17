@@ -5,6 +5,11 @@ may re-sign later to change it.
              uint64 deadline)
     domain: {name: "Elysium LP Strategy", version: "1", chainId: 99901, verifyingContract: module}
 
+  v2 (risk-off, docs/ARCHITECTURE.md): domain version "2" and one more field after `hedged`:
+    Strategy(address owner,address account,address module,uint8 widthMode,uint32 widthBps,bool hedged,bool riskOff,
+             uint64 nonce,uint64 deadline)
+  v1 signatures stay valid (read as riskOff = false); the wire format tells them apart by the `riskOff` key.
+
 - owner: the client EOA that signs (for a HybridDeleGator: its owner; for 7702: the account itself).
 - account: the managed account (HybridDeleGator CREATE2 address, or the 7702 EOA).
 - module: the LPManagerModule = the pool (one module per whitelisted hook-free Uniswap v4 pool).
@@ -15,6 +20,9 @@ may re-sign later to change it.
   and tickSpacing 60).
 - hedged: true = margin to the hedge treasury and a HYPE short on Hyperliquid (10% delta band); false = no margin, no
   short (full HYPE exposure + fees).
+- riskOff (v2): true = the keeper leaves the pool for USDC while the risk-off signal is on (riskoff.py: BTC 4 h
+  close far below its 30 d EMA) and re-enters when it clears (at least 24 h out). Protection from crashes, not extra
+  yield. A hedged account also closes its short share while out (margin back into the account, as when unhedging).
 - nonce: strictly increasing per account (the web uses the time in milliseconds); a message with a nonce not above
   the stored one is refused, so an old signature can never be replayed to undo a change.
 - deadline: the signature must reach the keeper before it (a short submission window, not a validity period: an
@@ -44,6 +52,12 @@ STRATEGY_TYPE = ("Strategy(address owner,address account,address module,uint8 wi
 STRATEGY_TYPEHASH = keccak(text=STRATEGY_TYPE)
 STRATEGY_FIELDS = [("owner", "address"), ("account", "address"), ("module", "address"), ("widthMode", "uint8"),
                    ("widthBps", "uint32"), ("hedged", "bool"), ("nonce", "uint64"), ("deadline", "uint64")]
+# v2: + riskOff (after hedged), domain version "2"
+DOMAIN_VERSION_V2 = "2"
+STRATEGY_TYPE_V2 = ("Strategy(address owner,address account,address module,uint8 widthMode,uint32 widthBps,bool hedged,"
+                    "bool riskOff,uint64 nonce,uint64 deadline)")
+STRATEGY_TYPEHASH_V2 = keccak(text=STRATEGY_TYPE_V2)
+STRATEGY_FIELDS_V2 = STRATEGY_FIELDS[:6] + [("riskOff", "bool")] + STRATEGY_FIELDS[6:]
 
 
 class PrefsError(ValueError):
@@ -63,15 +77,24 @@ class Strategy:
     nonce: int
     deadline: int
     signature: bytes = b""
+    risk_off: bool = False
+    version: int = 1  # 1: no riskOff field (risk_off is False); 2: riskOff signed
 
     @property
     def mode(self) -> str:
         return MODES[self.width_mode]
 
+    @property
+    def fields(self) -> list:
+        return STRATEGY_FIELDS_V2 if self.version == 2 else STRATEGY_FIELDS
+
     def message(self) -> dict:
-        return {"owner": self.owner, "account": self.account, "module": self.module, "widthMode": self.width_mode,
-                "widthBps": self.width_bps, "hedged": self.hedged, "nonce": str(self.nonce),
-                "deadline": str(self.deadline)}
+        m = {"owner": self.owner, "account": self.account, "module": self.module, "widthMode": self.width_mode,
+             "widthBps": self.width_bps, "hedged": self.hedged, "nonce": str(self.nonce),
+             "deadline": str(self.deadline)}
+        if self.version == 2:
+            m["riskOff"] = self.risk_off
+        return m
 
     def to_json(self) -> dict:
         """Wire format (web -> API -> queue -> keeper): the message plus the 65-byte signature."""
@@ -81,22 +104,26 @@ class Strategy:
         """What the keeper persists per account (state `prefs`) and publishes in the status file."""
         return {"owner": self.owner, "account": self.account, "module": self.module, "mode": self.mode,
                 "width_bps": self.width_bps if self.width_mode == MODE_MANUAL else None, "hedged": self.hedged,
-                "nonce": self.nonce, "deadline": self.deadline, "signature": "0x" + self.signature.hex(),
+                "risk_off": self.risk_off, "version": self.version, "nonce": self.nonce, "deadline": self.deadline, "signature": "0x" + self.signature.hex(),
                 "accepted_at": accepted_at, "source": "signed"}
 
 
 def struct_hash(s: Strategy) -> bytes:
+    if s.version == 2:
+        return keccak(abi_encode(["bytes32"] + [t for _, t in STRATEGY_FIELDS_V2],
+                                 [STRATEGY_TYPEHASH_V2, s.owner, s.account, s.module, s.width_mode, s.width_bps,
+                                  s.hedged, s.risk_off, s.nonce, s.deadline]))
     return keccak(abi_encode(["bytes32"] + [t for _, t in STRATEGY_FIELDS],
                              [STRATEGY_TYPEHASH, s.owner, s.account, s.module, s.width_mode, s.width_bps, s.hedged,
                               s.nonce, s.deadline]))
 
 
-def strategy_domain(chain_id: int, module: str) -> bytes:
-    return domain_separator(DOMAIN_NAME, DOMAIN_VERSION, chain_id, module)
+def strategy_domain(chain_id: int, module: str, version: int = 1) -> bytes:
+    return domain_separator(DOMAIN_NAME, DOMAIN_VERSION_V2 if version == 2 else DOMAIN_VERSION, chain_id, module)
 
 
 def digest(s: Strategy, chain_id: int) -> bytes:
-    return typed_digest(strategy_domain(chain_id, s.module), struct_hash(s))
+    return typed_digest(strategy_domain(chain_id, s.module, s.version), struct_hash(s))
 
 
 def typed_data(s: Strategy, chain_id: int) -> dict:
@@ -105,10 +132,11 @@ def typed_data(s: Strategy, chain_id: int) -> dict:
         "types": {
             "EIP712Domain": [{"name": "name", "type": "string"}, {"name": "version", "type": "string"},
                              {"name": "chainId", "type": "uint256"}, {"name": "verifyingContract", "type": "address"}],
-            "Strategy": [{"name": n, "type": t} for n, t in STRATEGY_FIELDS],
+            "Strategy": [{"name": n, "type": t} for n, t in s.fields],
         },
         "primaryType": "Strategy",
-        "domain": {"name": DOMAIN_NAME, "version": DOMAIN_VERSION, "chainId": chain_id, "verifyingContract": s.module},
+        "domain": {"name": DOMAIN_NAME, "version": DOMAIN_VERSION_V2 if s.version == 2 else DOMAIN_VERSION,
+                   "chainId": chain_id, "verifyingContract": s.module},
         "message": s.message(),
     }
 
@@ -143,10 +171,11 @@ def _addr(v, field: str) -> str:
 
 
 def parse(obj) -> Strategy:
-    """Strict: exactly the message keys plus `signature` (65 bytes hex)."""
-    keys = {n for n, _ in STRATEGY_FIELDS} | {"signature"}
+    """Strict: exactly the message keys plus `signature` (65 bytes hex). With a `riskOff` key it is a v2 message."""
     if not isinstance(obj, dict):
         raise PrefsError("strategy_schema", "strategy must be an object")
+    version = 2 if "riskOff" in obj else 1
+    keys = {n for n, _ in (STRATEGY_FIELDS_V2 if version == 2 else STRATEGY_FIELDS)} | {"signature"}
     missing, extra = keys - set(obj), set(obj) - keys
     if missing:
         raise PrefsError("strategy_schema", f"strategy: missing {sorted(missing)}")
@@ -154,6 +183,8 @@ def parse(obj) -> Strategy:
         raise PrefsError("strategy_schema", f"strategy: unknown {sorted(extra)}")
     if not isinstance(obj["hedged"], bool):
         raise PrefsError("strategy_schema", "hedged must be true or false")
+    if version == 2 and not isinstance(obj["riskOff"], bool):
+        raise PrefsError("strategy_schema", "riskOff must be true or false")
     sig = obj["signature"]
     if not isinstance(sig, str) or not sig.startswith("0x") or len(sig) != 132:
         raise PrefsError("strategy_schema", "signature must be 65 bytes of 0x hex")
@@ -163,7 +194,8 @@ def parse(obj) -> Strategy:
         raise PrefsError("strategy_schema", "signature must be 65 bytes of 0x hex")
     return Strategy(_addr(obj["owner"], "owner"), _addr(obj["account"], "account"), _addr(obj["module"], "module"),
                     _uint(obj["widthMode"], "widthMode", 8), _uint(obj["widthBps"], "widthBps", 32), obj["hedged"],
-                    _uint(obj["nonce"], "nonce", 64), _uint(obj["deadline"], "deadline", 64), sigb)
+                    _uint(obj["nonce"], "nonce", 64), _uint(obj["deadline"], "deadline", 64), sigb,
+                    risk_off=bool(obj["riskOff"]) if version == 2 else False, version=version)
 
 
 # ------------------------------------------------------------------------------------------------ validation
@@ -216,9 +248,11 @@ def verify(s: Strategy, *, owner: str, account: str, module: str, chain_id: int,
 
 def default_record(hedged: bool = True) -> dict:
     """Preference of an account that never signed one (onboarded before this flow): auto width, hedged."""
-    return {"mode": "auto", "width_bps": None, "hedged": hedged, "nonce": 0, "source": "default"}
+    return {"mode": "auto", "width_bps": None, "hedged": hedged, "risk_off": False, "nonce": 0, "source": "default"}
 
 
 def public(rec: dict) -> dict:
     """The part of a stored preference served to the web (no signature)."""
-    return {k: rec.get(k) for k in ("mode", "width_bps", "hedged", "nonce", "accepted_at", "source")}
+    out = {k: rec.get(k) for k in ("mode", "width_bps", "hedged", "nonce", "accepted_at", "source")}
+    out["risk_off"] = bool(rec.get("risk_off", False))
+    return out

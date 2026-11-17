@@ -60,7 +60,7 @@ def test_strategy_roundtrip_and_record():
     rec = st.record(NOW)
     assert rec["mode"] == "manual" and rec["width_bps"] == 800 and rec["hedged"] and rec["source"] == "signed"
     assert P.public(rec) == {"mode": "manual", "width_bps": 800, "hedged": True, "nonce": 1, "accepted_at": NOW,
-                             "source": "signed"}
+                             "source": "signed", "risk_off": False}
     assert make_strategy().record(NOW)["width_bps"] is None
 
 
@@ -156,7 +156,7 @@ def test_onboard_with_strategy_is_queued_for_the_keeper(env):
     assert (st.mode, st.width_bps, st.hedged, st.nonce) == ("manual", 1200, False, 7)
     _, out = api.get_status(f"owner={OWNER}", "1.1.1.1")
     assert out["state"] == "queued" and out["strategy"] == {"mode": "manual", "width_bps": 1200, "hedged": False,
-                                                            "nonce": 7, "source": "queued"}
+                                                            "nonce": 7, "source": "queued", "risk_off": False}
 
 
 def test_onboard_without_strategy_still_accepted(env):
@@ -205,7 +205,7 @@ def test_strategy_update_flow(env):
     _, out = api.get_status(f"owner={OWNER}", "1.1.1.1")
     assert out["strategy"]["nonce"] == 3 and out["summary"]["strategy"]["mode"] == "auto"
     assert out["strategy_pending"] == {"mode": "auto", "width_bps": None, "hedged": False, "nonce": 11,
-                                       "source": "queued"}
+                                       "source": "queued", "risk_off": False}
     assert ("sa_api_strategy_queued", {"owner": OWNER, "account": ACCOUNT, "mode": "manual", "width_bps": 900,
                                        "hedged": True, "nonce": 10}) in rec
 
@@ -409,6 +409,8 @@ def bare_keeper(tmp_path, reader, prefs=None):
     k.st, k.sa, k.r = k.cfg.strategy, k.cfg.sa, reader
     k.state = types.SimpleNamespace(d={"prefs": prefs or {}, "ranges": {}})
     k.prefs, k.ranges = k.state.d["prefs"], k.state.d["ranges"]
+    k.riskoff = types.SimpleNamespace(st={})
+    k.riskout = k.state.d.setdefault("riskoff_out", {})
     k.ledger = HedgeLedger({})
     k.logs, k.calls = [], []
     k.log = lambda ev, **kw: k.logs.append((ev, kw))

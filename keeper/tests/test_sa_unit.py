@@ -163,7 +163,7 @@ def test_config_sa_section():
 # ---------------------------------------------------------------- SA-3 price-trust mirrors (LPManagerModule._trusted)
 def _g(**kw):
     from elysium_keeper.sa_chain import GlobalSnap, PARAM_KEYS
-    params = dict(zip(PARAM_KEYS, [1500, 3500, 150, 150, 500, 1000, 20000, 7 * 86400, 3600, 300]))
+    params = dict(zip(PARAM_KEYS, [1500, 3500, 150, 150, 500, 1000, 20000, 7 * 86400, 3600, 300, 10000]))
     base = dict(last_price=40_000_000, last_price_time=1_000, clipped=False, paused=False, pool_price=40_000_000,
                 sqrt_price=0, tick=0, params=params, price_budget={}, treasury=TREAS, fee_recipient=FEE,
                 last_price_moved=700)

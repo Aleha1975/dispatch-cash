@@ -141,6 +141,12 @@ class SACfg:
     recommend_fee_horizon_h: int = 168
     recommend_reference_usd: float = 25000.0  # capital assumed in the pool for fee dilution (or the live total)
     api_recommend_stale_s: int = 7200
+    # ---- risk-off product (riskoff.py, docs/ARCHITECTURE.md): accounts whose Strategy has riskOff = true
+    riskoff_min_out_s: int = 86400  # once out, stay out at least this long
+    riskoff_use_rv: bool = False  # also go out when HYPE 7 d Parkinson vol > its monthly q80
+    riskoff_refresh_s: int = 900  # re-fetch the 4 h candles at most this often (and when a new bar has closed)
+    riskoff_btc_coin: str = "BTC"
+    riskoff_stale_alert_s: int = 6 * 3600  # alert when the signal could not be refreshed for this long
 
 
 @dataclass
