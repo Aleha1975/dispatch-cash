@@ -175,7 +175,8 @@ contract DeploySA is Script {
                     swapTurnoverBps: 20000,
                     feeInterval: 7 days,
                     maxPriceAge: 3600,
-                    minPriceStable: 300
+                    minPriceStable: 300,
+                    exitTurnoverBps: 10000
                 })
             })
         );

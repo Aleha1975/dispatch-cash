@@ -97,6 +97,7 @@ library SALib {
         uint64 hedgeApprovedEpoch; // hedgeEpoch + 1 at approval (0 = none)
         uint64 hedgeApprovedUntil;
         uint64 hedgeApprovedEra; // guardian era at approval (a guardian change voids it)
+        SAWindow.W exit; // R4: sells of base into the asset while the account holds no tracked position (risk-off)
     }
 
     struct PriceBudget {
@@ -428,14 +429,14 @@ library SALib {
         return (old - d, clipped);
     }
 
-    /// @notice Charge `notional` to the account's turnover window `cap`; reverts beyond it.
-    function useTurnover(Budgets storage b, uint256 notional, uint256 cap) external {
-        SAWindow.charge(b.turnover, notional, cap);
+    /// @notice Charge `notional` to the account's turnover window (or, R4, its exit window) `cap`; reverts beyond it.
+    function useTurnover(Budgets storage b, uint256 notional, uint256 cap, bool exit) external {
+        SAWindow.charge(exit ? b.exit : b.turnover, notional, cap);
     }
 
-    /// @notice (turnover used, hedge-decrease used) in the current 24 h windows.
-    function used(Budgets storage b) external view returns (uint256, uint256) {
-        return (SAWindow.used(b.turnover), SAWindow.used(b.hedge));
+    /// @notice (turnover used, hedge-decrease used, exit used) in the current 24 h windows.
+    function used(Budgets storage b) external view returns (uint256, uint256, uint256) {
+        return (SAWindow.used(b.turnover), SAWindow.used(b.hedge), SAWindow.used(b.exit));
     }
 
     /// @notice SA-3: the anchor's trailing 24 h range (max / min - 1, WAD) given the current anchor `ref`.

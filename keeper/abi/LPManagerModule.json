@@ -178,6 +178,11 @@
         "name": "minPriceStable",
         "type": "uint32",
         "internalType": "uint32"
+       },
+       {
+        "name": "exitTurnoverBps",
+        "type": "uint16",
+        "internalType": "uint16"
        }
       ]
      }
@@ -558,6 +563,18 @@
     "name": "hedgeApprovedEra",
     "type": "uint64",
     "internalType": "uint64"
+   },
+   {
+    "name": "exit",
+    "type": "tuple",
+    "internalType": "struct SAWindow.W",
+    "components": [
+     {
+      "name": "b",
+      "type": "uint128[9]",
+      "internalType": "uint128[9]"
+     }
+    ]
    }
   ],
   "stateMutability": "view"
@@ -1152,6 +1169,11 @@
     "name": "minPriceStable",
     "type": "uint32",
     "internalType": "uint32"
+   },
+   {
+    "name": "exitTurnoverBps",
+    "type": "uint16",
+    "internalType": "uint16"
    }
   ],
   "stateMutability": "view"
@@ -1610,6 +1632,11 @@
       "name": "minPriceStable",
       "type": "uint32",
       "internalType": "uint32"
+     },
+     {
+      "name": "exitTurnoverBps",
+      "type": "uint16",
+      "internalType": "uint16"
      }
     ]
    }
@@ -1773,6 +1800,11 @@
    },
    {
     "name": "priceUsed",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "exitUsed",
     "type": "uint256",
     "internalType": "uint256"
    }
@@ -2069,6 +2101,11 @@
       "name": "minPriceStable",
       "type": "uint32",
       "internalType": "uint32"
+     },
+     {
+      "name": "exitTurnoverBps",
+      "type": "uint16",
+      "internalType": "uint16"
      }
     ]
    }

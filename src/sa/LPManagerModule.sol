@@ -79,6 +79,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     uint256 internal constant MAX_HEDGE_STEP_BPS = 2_000;
     uint256 internal constant MAX_REF_DRIFT_BPS = 2_000;
     uint256 internal constant MAX_TURNOVER_BPS = 50_000;
+    uint256 internal constant MAX_EXIT_TURNOVER_BPS = 10_000; // R4: at most 1x the account value per 24 h
     uint256 public constant MIN_FEE_INTERVAL = 7 days; // == ElysiumCustodyEnforcer.FEE_INTERVAL
     uint256 internal constant FEE_MAX_BPS = 2_000; // == ElysiumCustodyEnforcer.FEE_MAX_BPS (fee <= 20% of idle USDC)
     uint256 public constant MAX_POSITIONS = 4;
@@ -124,6 +125,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         uint32 feeInterval;
         uint32 maxPriceAge; // the anchor (and the hedge report) must be this recent for a fee or a margin send
         uint32 minPriceStable; // booking and fees need the anchor unchanged for this long (SA-2 L-16 / H-1)
+        uint16 exitTurnoverBps; // R4: own 24 h budget for selling base into the asset with no position held (0 = off)
     }
 
     Params public params;
@@ -319,10 +321,14 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         return accounts[a];
     }
 
-    /// @notice (turnover used, hedge-decrease used) of `a` in their 24 h windows, and the anchor's trailing 24 h range
-    ///         (max / min - 1, WAD; SA-3).
-    function windows(address a) external view returns (uint256 turnoverUsed, uint256 hedgeUsed, uint256 priceUsed) {
-        (turnoverUsed, hedgeUsed) = SALib.used(budgets[a]);
+    /// @notice (turnover used, hedge-decrease used) of `a` in their 24 h windows, the anchor's trailing 24 h range
+    ///         (max / min - 1, WAD; SA-3) and (R4) the exit window used.
+    function windows(address a)
+        external
+        view
+        returns (uint256 turnoverUsed, uint256 hedgeUsed, uint256 priceUsed, uint256 exitUsed)
+    {
+        (turnoverUsed, hedgeUsed, exitUsed) = SALib.used(budgets[a]);
         priceUsed = SALib.priceUsed(priceBudget, lastPrice);
     }
 
@@ -462,6 +468,9 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     ///         beyond the anchor band (sqrtPrice limit). The effect on the account is booked from the executor's
     ///         record of this swap (SA-2 L-14), never from the account's balances; SA-3 M-2: the record must be of
     ///         exactly the call the module built (calldata hash), so account code cannot substitute its own swap.
+    ///         R4 (risk-off): a sell of base while the account holds no tracked position (everything burned first) is
+    ///         charged to the separate exit window (exitTurnoverBps x value per 24 h) instead of the turnover window;
+    ///         every other swap, and every LP add, stays on the turnover window.
     function swap(address a, bool sellBase, uint256 amountIn, uint256 keeperPrice, uint256 minOut)
         external
         nonReentrant
@@ -475,7 +484,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         _sync(a);
         uint256 ref = lastPrice;
         uint256 fair = sellBase ? Math.mulDiv(amountIn, keeperPrice, WAD) : Math.mulDiv(amountIn, WAD, keeperPrice);
-        _useTurnover(a, sellBase ? fair : amountIn, accountValue(a, ref));
+        _useTurnover(a, sellBase ? fair : amountIn, accountValue(a, ref), sellBase && _positions[a].length == 0);
         uint256 floor = Math.mulDiv(fair, BPS - params.maxSlippageBps, BPS);
         if (minOut < floor) minOut = floor;
         if (minOut == 0) revert ZeroAmount();
@@ -713,7 +722,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
             p.feeBps > MAX_FEE_BPS || p.hedgeCapBps > MAX_HEDGE_CAP_BPS || p.poolBandBps == 0
                 || p.poolBandBps > MAX_POOL_BAND_BPS || p.maxSlippageBps == 0 || p.maxSlippageBps > MAX_SLIPPAGE_BPS
                 || p.hedgeStepBps > MAX_HEDGE_STEP_BPS || p.refDriftBps > MAX_REF_DRIFT_BPS
-                || p.swapTurnoverBps > MAX_TURNOVER_BPS || p.feeInterval < MIN_FEE_INTERVAL || p.feeInterval > 365 days
+                || p.swapTurnoverBps > MAX_TURNOVER_BPS || p.exitTurnoverBps > MAX_EXIT_TURNOVER_BPS || p.feeInterval < MIN_FEE_INTERVAL || p.feeInterval > 365 days
                 || p.maxPriceAge < 60 || p.maxPriceAge > 1 days || p.minPriceStable < 60 || p.minPriceStable > 1 days
         ) revert BadParam();
         params = p;
@@ -784,7 +793,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         uint256 nav = accountValue(a, ref);
         (int256 dA, int256 dB, uint256 charge) =
             SABook.lpAdd(venue, p, liq, ref, params.maxSlippageBps, params.poolBandBps);
-        _useTurnover(a, charge, nav);
+        _useTurnover(a, charge, nav, false);
         _modify(a, data, m0, m1);
         SABook.book(accounts[a], snapPos, venue, p, dA, dB, int256(uint256(liq)));
     }
@@ -871,7 +880,8 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         if (_off(price, ref)) revert BadPrice();
     }
 
-    function _useTurnover(address a, uint256 notional, uint256 nav) internal {
-        SALib.useTurnover(budgets[a], notional, Math.mulDiv(nav, params.swapTurnoverBps, BPS));
+    function _useTurnover(address a, uint256 notional, uint256 nav, bool exit) internal {
+        uint256 bps = exit ? params.exitTurnoverBps : params.swapTurnoverBps;
+        SALib.useTurnover(budgets[a], notional, Math.mulDiv(nav, bps, BPS), exit);
     }
 }

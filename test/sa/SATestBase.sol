@@ -234,7 +234,8 @@ abstract contract SATestBase is Test {
             swapTurnoverBps: 20000,
             feeInterval: 7 days,
             maxPriceAge: 3600,
-            minPriceStable: 300
+            minPriceStable: 300,
+            exitTurnoverBps: 10000
         });
     }
 
@@ -528,13 +529,27 @@ abstract contract SATestBase is Test {
         module.swap(a, false, usd, p, 0);
     }
 
+    /// R4: a tiny USDC-only position below the price, so the account "holds a position" and its sells of base are
+    ///     charged to the turnover window (not the exit window).
+    function _holdTiny(address a) internal {
+        _stable();
+        int24 tu = (_tick() / 60) * 60 - 600;
+        int24 tl = tu - 60;
+        uint128 liq = LiquidityAmounts.getLiquidityForAmount1(
+            TickMath.getSqrtPriceAtTick(tl), TickMath.getSqrtPriceAtTick(tu), 10e6
+        );
+        uint256 p = poolPrice();
+        vm.prank(keeper);
+        module.mintPosition(a, tl, tu, liq, 0, 11e6, p);
+    }
+
     // ------------------------------------------------------------------ test helpers
     function _acct(address a) internal view returns (SALib.Account memory) {
         return module.account(a);
     }
 
     function _turnoverUsed(address a) internal view returns (uint256 u) {
-        (u,,) = module.windows(a);
+        (u,,,) = module.windows(a);
     }
 
     function _profit(address a) internal view returns (int256) {
@@ -551,7 +566,7 @@ abstract contract SATestBase is Test {
     /// Wait until the anchor has been unchanged for minPriceStable (booking and fees need it; SA-2 H-1 / L-16), and
     /// re-confirm it with a report of the stored value if the last report is older than that (SA-3 L-5).
     function _stable() internal {
-        (,,,,,,,, , uint32 st) = module.params();
+        (,,,,,,,,, uint32 st,) = module.params();
         uint256 t = module.lastPriceMoved() + st;
         if (block.timestamp < t) vm.warp(t);
         if (block.timestamp > module.lastPriceTime() + st) {

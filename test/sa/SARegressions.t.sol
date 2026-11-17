@@ -499,6 +499,7 @@ contract SARegressionsTest is SATestBase {
     /// PoC: the linear-decay budget admitted ~2x in 24 h (turnover, anchor drift, hedge step).
     function test_M7_PoC_TurnoverOncePerSlidingDay() public {
         (address a,) = _onboardHybrid(ALICE_PK, 10_000e6);
+        _holdTiny(a); // R4: with a position held, sells are charged to turnover (not the exit window)
         _stable();
         uint256 p = poolPrice();
         uint256 cap = module.accountValue(a, module.lastPrice()) * 2;
@@ -513,7 +514,7 @@ contract SARegressionsTest is SATestBase {
         vm.prank(keeper);
         module.swap(a, false, 3_000e6, p, 0);
         _moveTo(p);
-        (uint256 used,,) = module.windows(a);
+        (uint256 used,,,) = module.windows(a);
         assertGt(used, cap * 9 / 10);
         vm.warp(vm.getBlockTimestamp() + 23 hours);
         _report();
@@ -592,7 +593,7 @@ contract SARegressionsTest is SATestBase {
         assertFalse(module.lastPriceClipped());
         (,, uint256 until,) = module.priceBudget();
         assertGt(until, 0, "a routine report does not burn the approval");
-        (,, uint256 pu) = module.windows(address(0));
+        (,, uint256 pu,) = module.windows(address(0));
         assertGt(pu, 0.07e18, "the trailing range");
         _moveTo(p0 * 125 / 100);
         _report(); // beyond the room: the range applies it unclipped and is consumed
@@ -600,7 +601,7 @@ contract SARegressionsTest is SATestBase {
         assertFalse(module.lastPriceClipped());
         (,, until,) = module.priceBudget();
         assertEq(until, 0, "one-shot");
-        (,, pu) = module.windows(address(0));
+        (,, pu,) = module.windows(address(0));
         assertEq(pu, 0, "SA-3: an approved level starts a new window, it does not consume the keeper's room");
         _moveTo(p0 * 130 / 100);
         _report(); // +4% from the approved level: inside the new window

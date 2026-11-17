@@ -388,6 +388,7 @@ contract LPManagerModuleTest is SATestBase {
     function test_SwapTurnoverIsPerAccount() public {
         (address a,) = _onboardHybrid(ALICE_PK, 10_000e6);
         (address b,) = _onboardHybrid(BOB_PK, 10_000e6);
+        _holdTiny(a); // R4: with a position held, sells are charged to turnover (not the exit window)
         _stable();
         uint256 p = poolPrice();
         // 2x account value per 24 h window: 10k account -> ~20k notional

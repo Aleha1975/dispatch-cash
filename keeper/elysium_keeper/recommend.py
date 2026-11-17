@@ -40,7 +40,7 @@ POOLS_SLOT = 6
 # script/DeploySA.s.sol defaults (used when no module is configured yet, e.g. the page before deployment)
 DEFAULT_PARAMS = {"feeBps": 1500, "hedgeCapBps": 3500, "poolBandBps": 150, "maxSlippageBps": 150, "hedgeStepBps": 500,
                   "refDriftBps": 1000, "swapTurnoverBps": 20000, "feeInterval": 7 * 86400, "maxPriceAge": 3600,
-                  "minPriceStable": 300}
+                  "minPriceStable": 300, "exitTurnoverBps": 10000}
 GRID_BPS = (200, 300, 400, 500, 600, 800, 1000, 1200, 1500, 2000, 2500, 3000, 4000)
 
 

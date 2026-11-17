@@ -382,7 +382,7 @@ contract SARound2Test is SATestBase {
         module.approvePrice(p0, p0 * 2, block.timestamp + 1 hours);
         _moveTo(p0 * 125 / 100);
         _report();
-        (,, uint256 pu) = module.windows(address(0));
+        (,, uint256 pu,) = module.windows(address(0));
         assertEq(pu, 0, "a new window, not a full one");
         uint256 anchor = module.lastPrice();
         vm.prank(keeper);

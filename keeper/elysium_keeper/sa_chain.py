@@ -271,14 +271,14 @@ BOOK_BAND_BPS = 50  # LPManagerModule.BOOK_BAND_BPS (read from the module when a
 # hedgeApprovedEra); the windows are read through windows(a)
 ZERO_ADDRESS = "0x" + "00" * 20
 BUDGET_KEYS = ["hedgeApproved", "hedgeApprovedEpoch", "hedgeApprovedUntil", "hedgeApprovedEra"]
-WINDOW_KEYS = ["turnoverUsed", "hedgeUsed", "priceUsed"]
+WINDOW_KEYS = ["turnoverUsed", "hedgeUsed", "priceUsed", "exitUsed"]
 PRICE_BUDGET_KEYS = ["priceApprovedLo", "priceApprovedHi", "priceApprovedUntil"]
 # SALib.Account field order (LPManagerModule.account(a))
 ACCOUNT_KEYS = ["delegationHash", "owner", "kind", "until", "revoked", "hedgeClipped", "contributed", "hwm",
                 "hedgeEquity", "netMargin", "hedgeEpoch", "snapAsset", "snapBase", "lastFeeTime", "feesPaid",
                 "hedgeTime"]
 PARAM_KEYS = ["feeBps", "hedgeCapBps", "poolBandBps", "maxSlippageBps", "hedgeStepBps", "refDriftBps",
-              "swapTurnoverBps", "feeInterval", "maxPriceAge", "minPriceStable"]
+              "swapTurnoverBps", "feeInterval", "maxPriceAge", "minPriceStable", "exitTurnoverBps"]
 
 
 class ModuleReader:
