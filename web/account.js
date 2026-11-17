@@ -761,7 +761,7 @@ function statusView(top) {
         <div class="row"><span class="k">Strategy</span><span class="v">${esc(strategySummary(st))}${st?.clamped ? ' <span class="tag warn">widened</span>' : ''}</span></div>
         ${pend ? `<div class="row"><span class="k">Change pending</span><span class="v">${esc(strategySummary(pend))}</span></div>` : ''}
         <div class="row"><span class="k">Hedge</span><span class="v">${hedged ? `Hedged · margin ${pct(marginPct, 0)} of account` : 'Unhedged · full HYPE exposure'}</span></div>
-        ${sum.risk_off ? `<div class="row"><span class="k">Risk-off</span><span class="v">${sum.risk_off.out ? `Out of the pool, holding USDC since ${sum.risk_off.since ? new Date(sum.risk_off.since * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : '…'}` : 'On · watching the market'}</span></div>` : ''}
+        ${sum.risk_off ? `<div class="row"><span class="k">Smart exit</span><span class="v">${sum.risk_off.out ? `Out of the pool, holding USDC since ${sum.risk_off.since ? new Date(sum.risk_off.since * 1000).toISOString().slice(0, 16).replace('T', ' ') + ' UTC' : '…'}` : 'On · watching the market'}</span></div>` : ''}
         ${hedged && sum.hedge?.short != null ? `<div class="row"><span class="k">HYPE short (Hyperliquid)</span><span class="v num">${Number(sum.hedge.short).toFixed(2)} HYPE</span></div>` : ''}
       </div>
       ${st?.clamped ? `<p class="fine">Your manual width is below today's minimum (${widthLabel(st.turnover_floor_bps)}): the manager uses the minimum until volatility drops.</p>` : ''}
