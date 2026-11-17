@@ -4,8 +4,9 @@
 Each run (systemd timer, every 2 min):
   target short = HYPE in the LP positions (principal a0 + unclaimed fee HYPE f0 -- exactly what ely_live
   counts as lp_hype for hedge_ratio), times TARGET_RATIO.
-  Rebalance only if |short/target - 1| > BAND and |diff| >= MIN_DIFF; size = |diff| rounded to 0.01.
-Guards: one order per COOLDOWN; > BIG_ORDER executes but is flagged; RPC/HL failure or inconsistent data
+  Rebalance only if |short/target - 1| > BAND (30%) and |diff| >= MIN_DIFF, back to ratio 1 +- BAND/2 (hysteresis);
+  size rounded to 0.01. Gap between orders 4 h, 15 min when the hedge is off by > 0.5 HYPE.
+Guards: order gap (above); > BIG_ORDER executes but is flagged; RPC/HL failure or inconsistent data
 (LP amount jumps > 50% with price still, stale block, pool vs HL price apart, short vanished, long) -> no order,
 alert once; a sell that would bring liquidation within LIQ_BUFFER of mark -> no order, alert; never long
 (buys are reduce-only and <= short); never short more than MAX_SHORT_X * LP HYPE.
@@ -26,9 +27,12 @@ OWNER = E.HL
 VENUE = {"asset_id": 159, "sz_decimals": 2, "coin": "HYPE"}
 
 TARGET_RATIO = 1.00
-BAND = 0.10            # |short/target - 1| must exceed this
+BAND = 0.30            # |short/target - 1| must exceed this (sweep 17.11, see auto_hedge_sweep.py)
+REBAL_TO = 0.5         # 0 = rebalance to target; 0.5 = only back to ratio 1 +- BAND/2 (hysteresis)
 MIN_DIFF = 0.05        # HYPE
-COOLDOWN = 15 * 60     # s between orders (attempts count)
+COOLDOWN = 4 * 3600    # s between orders (attempts count)
+URGENT_HYPE = 0.5      # if |short - target| exceeds this (HYPE), the gap is URGENT_GAP instead (0 = off)
+URGENT_GAP = 15 * 60
 BIG_ORDER = 0.6        # HYPE: bigger is executed but flagged in the message
 LIQ_BUFFER = 0.20      # liquidation must stay >= 20% above mark after a sell
 MAX_SHORT_X = 1.5      # never short more than 1.5x LP HYPE
@@ -138,7 +142,13 @@ def read_hl():
     mid = float(E.hl({"type": "allMids"})["HYPE"])
     pos = next((p["position"] for p in chs["assetPositions"] if p["position"]["coin"] == "HYPE"), None)
     szi = float(pos["szi"]) if pos else 0.0
-    out = dict(mark=mid, szi=szi, short=-szi if szi < 0 else 0.0, withdrawable=float(chs.get("withdrawable") or 0),
+    free = float(chs.get("withdrawable") or 0)
+    try:  # unified account: perp margin comes from spot USDC; perp 'withdrawable' then reads 0
+        sp = E.hl({"type": "spotClearinghouseState", "user": OWNER})
+        free = max(free, float(dict(sp.get("tokenToAvailableAfterMaintenance") or []).get(0, 0)))
+    except Exception:
+        pass
+    out = dict(mark=mid, szi=szi, short=-szi if szi < 0 else 0.0, withdrawable=free,
                liq=float(pos["liquidationPx"]) if pos and pos.get("liquidationPx") else None,
                lev=float(pos["leverage"]["value"]) if pos else 3.0,
                raw=float(pos["leverage"].get("rawUsd") or 0) if pos else 0.0,
@@ -158,14 +168,25 @@ def est_liq_after_sell(h, add):
 
 
 # ---------------- decision ----------------
+def gap_for(info):
+    """Minimum time since the last order: COOLDOWN normally, URGENT_GAP when the hedge is off by more than
+    URGENT_HYPE (a fast move through the narrow range must not wait hours)."""
+    if URGENT_HYPE and abs(info["target"] - info["short"]) > URGENT_HYPE:
+        return min(COOLDOWN, URGENT_GAP)
+    return COOLDOWN
+
+
 def decide(lp, h, st):
     """Return (action, info). action in {None, 'sell', 'buy'}; info has size/reason/problem."""
     target = max(lp["hype"] * TARGET_RATIO, 0.0)
     short = h["short"]
     ratio = short / target if target > 0 else (math.inf if short > 0 else 1.0)
     info = dict(target=round(target, 4), short=short, ratio=None if math.isinf(ratio) else round(ratio, 4))
-    diff = target - short
     off = (target == 0 and short > 0) or (target > 0 and abs(ratio - 1) > BAND)
+    goal = target
+    if REBAL_TO > 0 and target > 0:  # hysteresis: stop at ratio 1 +- BAND*REBAL_TO on the side we came from
+        goal = target * (1 + math.copysign(BAND * REBAL_TO, ratio - 1))
+    diff = goal - short
     if not off or abs(diff) < MIN_DIFF:
         info["reason"] = "в полосе (|ratio-1|<=%.0f%% или |diff|<%.2f)" % (BAND * 100, MIN_DIFF)
         return None, info
@@ -182,6 +203,11 @@ def decide(lp, h, st):
                 return None, info
         if size <= 0:
             info["reason"] = "потолок 1.5x LP"; return None, info
+        im = size * h["mark"] / h["lev"]
+        if im > h["withdrawable"] + 0.5:
+            info["problem"] = "margin"
+            info["reason"] = "на HL свободно $%.2f, а для продажи %.2f HYPE нужно ~$%.2f маржи" % (h["withdrawable"], size, im)
+            return None, info
         liq2 = est_liq_after_sell(h, size)
         info["liq_after"] = round(liq2, 2)
         if liq2 < h["mark"] * (1 + LIQ_BUFFER):
@@ -242,7 +268,7 @@ def execute(act, info, lp, h, st, dry):
         filled = None
     if not r.get("ok") or r.get("skipped"):
         log("ORDER FAIL %s %.2f: %s" % (act, size, r.get("error") or r.get("skipped")))
-        alert(st, "order_fail", "Хедж Elysium: ордер %s %.2f HYPE не прошёл: %s. Повтор через 15 мин." %
+        alert(st, "order_fail", "Хедж Elysium: ордер %s %.2f HYPE не прошёл: %s. Повтор не раньше чем через 15 мин." %
               ("продажа" if act == "sell" else "откуп", size, str(r.get("error") or r.get("skipped"))[:200]), dry)
         return
     clear_alert(st, "order_fail")
@@ -308,7 +334,7 @@ def run(dry):
         log("hold: %s | %s" % (info["reason"], msg), dry)
     else:
         clear_alert(st, "margin")
-        wait = COOLDOWN - (time.time() - st.get("last_order_ts", 0))
+        wait = gap_for(info) - (time.time() - st.get("last_order_ts", 0))
         plan = "%s %.2f -> ratio %s%s%s" % (act, info["size"], info.get("new_ratio"),
                                             (" liq~%.2f" % info["liq_after"]) if "liq_after" in info else "",
                                             (" (%s)" % info["note"]) if info.get("note") else "")
