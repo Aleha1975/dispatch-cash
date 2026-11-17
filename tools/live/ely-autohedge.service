@@ -1,0 +1,9 @@
+[Unit]
+Description=Elysium LP pilot: auto delta-hedge (HL HYPE short = HYPE in the LP)
+After=network-online.target
+[Service]
+Type=oneshot
+WorkingDirectory=/root/tools/ely_lp
+Environment=MPRH_DATA=/opt/mprhedged/data
+ExecStart=/opt/hypersentinel-staging/current/backend/.venv/bin/python /root/tools/ely_lp/auto_hedge.py
+TimeoutStartSec=300

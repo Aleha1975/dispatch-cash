@@ -1,0 +1,8 @@
+[Unit]
+Description=Elysium LP pilot auto delta-hedge every 2 minutes
+[Timer]
+OnBootSec=120
+OnUnitInactiveSec=120
+AccuracySec=10
+[Install]
+WantedBy=timers.target
