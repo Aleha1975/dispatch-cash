@@ -13,7 +13,6 @@ import {SqrtPriceMath} from "@uniswap/v4-core/src/libraries/SqrtPriceMath.sol";
 import {V4PositionMath} from "../V4PositionMath.sol";
 import {IPositionManagerMin} from "../interfaces/IExternal.sol";
 import {SALib} from "./SALib.sol";
-import {SARange} from "./SARange.sol";
 
 /// @title SABook
 /// @notice Linked (external) library of the LPManagerModule: the per-account books (audit SA-2 root-cause class B',
@@ -63,29 +62,32 @@ library SABook {
     ///         become a contribution: our fee lower). SA-6 L-1: nothing at all in a sync where ANY tracked position
     ///         is pending (not owned, or PoolManager's liquidity differs from the books'): its pending principal sits
     ///         in idle too and must not serve as room for another position's credit.
-    ///         Then, `price` = 0 (anchor not trusted): nothing else is booked or moved; the flow stays pending.
+    ///         Then, `price` = 0 (anchor not trusted): nothing else is booked or moved; the flow stays pending. SA-7
+    ///         M-1: if idle base or a tracked position differs from the books, `flowSeen` is set.
     ///         Positions the account no longer owns are dropped (their snapshot liquidity is an outflow).
-    ///         SA-4 M-2 / SA-5 L-1: a booked flow whose price-dependent part (idle base, position liquidity) is at least
-    ///         1% of the net contributions stamps `pricedFlowTime`; the fee waits a day after it (dust sent by a third
-    ///         party does not). SA-6 M-1 (replaces SA-5 M-4): a pending flow happened at some market price between the
-    ///         account's last priced sync (bookTime, at the anchor bookPrice) and now, not necessarily at either
-    ///         anchor. Every priced booking raises the high-water mark by priced x d / lo, where [lo, hi] spans
-    ///         bookPrice, this anchor and every keeper report recorded since bookTime's 3 h bucket (PriceBudget.seen,
-    ///         each report within poolBandBps of the pool) and d is the larger distance of this anchor from lo or hi.
-    ///         A base or liquidity value V(P) is concave with V(0) >= 0, so |V(P') - V(P)| <= V(P) x |P' - P| / P
-    ///         <= priced x d / lo for any P' in [lo, hi]: the raise covers the flow at any recorded price, in both
-    ///         directions. If bookTime is older than the 24 h ring, the raise is the whole priced value (it covers
-    ///         any outflow, whose value at the flow cannot be below 0). Only the high-water mark rises: a late
-    ///         booking can only lower the fee (the keeper refreshes bookTime with a sync while nothing is pending).
+    ///
+    ///         SA-7 (replaces SA-4 M-2, SA-5 L-1 / M-4 and SA-6 M-1): a client flow with a price-dependent part (idle
+    ///         base, a tracked position's liquidity) happened at some market price that the books cannot know. The
+    ///         booking values it at this anchor, so profit may differ from the truth by an unknown phantom e. Therefore
+    ///         a booking in which idle base or a tracked position's liquidity changed at all (in units, so 1 wei counts),
+    ///         or that follows a `flowSeen` mark, sets (`priced` = the sum of |change| of each component at this anchor)
+    ///             hwm = max(profit after the booking, hwm + priced).
+    ///         Fee is charged only above hwm. (1) profit after the booking >= true profit + e: if the account was at
+    ///         or above its mark, no part of e is ever charged (the uncharged gain up to now is forgone). (2) hwm +
+    ///         priced >= hwm + e for every outflow (a value at the flow is >= 0, so e <= the booked value) and for an
+    ///         inflow booked at no less than half its arrival price: this holds below the mark too. No price record,
+    ///         no time window, no dust threshold. The opening sync (in the first registration's transaction, `hwm` =
+    ///         SALib.OPEN) books what the account holds at the moment it comes under management: no raise. Only hwm rises: the fee can only be lower.
     function sync(
         SALib.Account storage s,
         V4PositionMath.Position[] storage ps,
         mapping(uint256 => Pos) storage pos,
         address a,
         SALib.Venue storage v,
-        uint256 price,
-        SALib.PriceBudget storage pb
+        uint256 price
     ) external {
+        bool open = s.hwm == SALib.OPEN; // the first registration's own sync: no lateness, no raise
+        if (open) s.hwm = 0;
         int256 f;
         uint256 priced;
         uint256 i = ps.length;
@@ -104,6 +106,7 @@ library SABook {
                 priced += lv > ov ? lv - ov : ov - lv;
                 // forge-lint: disable-next-line(unsafe-typecast)
                 f += int256(lv) - int256(ov);
+                s.flowSeen = true; // SA-7: a liquidity change counts even if its value rounds to 0
             }
             if (owned) {
                 q.liq = liq;
@@ -114,11 +117,30 @@ library SABook {
                 ps.pop();
             }
         }
-        if (price != 0) _bookIdle(s, v, a, price, f, priced, pb);
+        if (price == 0) {
+            if (dirty || int256(_bal(v.base, a)) != s.snapBase) s.flowSeen = true; // SA-7 M-1
+        } else if (_bookIdle(s, v, a, price, f, priced, open)) {
+            _raise(s, v, ps, a, price);
+        }
     }
 
-    /// @dev `sync` at a trusted anchor, after the positions: book idle - snapshot and the positions' flow `f`
-    ///      (`priced` = its price-dependent part so far), stamp pricedFlowTime, raise the high-water mark (SA-6 M-1).
+    /// @dev SA-7: hwm = max(profit after the booking, hwm + priced) (`s.hwm` already holds hwm + priced).
+    function _raise(
+        SALib.Account storage s,
+        SALib.Venue storage v,
+        V4PositionMath.Position[] storage ps,
+        address a,
+        uint256 price
+    ) private {
+        // forge-lint: disable-next-line(unsafe-typecast)
+        int256 p = int256(_nav(v, s, ps, a, price)) - s.contributed;
+        if (p > s.hwm) s.hwm = p;
+    }
+
+    /// @dev `sync` at a trusted anchor, after the positions: book idle - snapshot and the positions' flow `f`. The
+    ///      price-dependent part is `priced` so far plus |idle base change| at `price`; if it changed at all (in units) or
+    ///      `flowSeen` is set (and this is not the `open` booking), clear the mark, add it to hwm (the floor of SA-7's raise) and
+    ///      return true.
     function _bookIdle(
         SALib.Account storage s,
         SALib.Venue storage v,
@@ -126,26 +148,25 @@ library SABook {
         uint256 price,
         int256 f,
         uint256 priced,
-        SALib.PriceBudget storage pb
-    ) private {
+        bool open
+    ) private returns (bool) {
         int256 x = int256(IERC20(v.asset).balanceOf(a));
         int256 b = int256(_bal(v.base, a));
         int256 fb = _mul(b - s.snapBase, price);
         // forge-lint: disable-next-line(unsafe-typecast)
         priced += uint256(fb < 0 ? -fb : fb);
         f += x - s.snapAsset + fb;
-        int256 c = s.contributed;
-        // forge-lint: disable-next-line(unsafe-typecast)
-        if (priced != 0 && priced * 100 >= uint256(c < 0 ? -c : c)) s.pricedFlowTime = block.timestamp; // SA-5 L-1
-        if (priced != 0) s.hwm += SafeCast.toInt256(_late(s, pb, priced, price)); // SA-6 M-1, I-9
-        s.bookPrice = price;
-        s.bookTime = block.timestamp;
+        bool moved = s.flowSeen || b != s.snapBase; // SA-7: any price-dependent change, even 1 wei
+        s.flowSeen = false;
         s.snapAsset = x;
         s.snapBase = b;
         if (f != 0) {
-            s.contributed = c + f;
+            s.contributed += f;
             emit Flow(a, f);
         }
+        if (open || !moved) return false;
+        s.hwm += SafeCast.toInt256(priced);
+        return true;
     }
 
     /// @dev SA-6 L-1: some tracked position is pending (not owned, or PoolManager's liquidity differs from the books').
@@ -161,20 +182,6 @@ library SABook {
             if (!o || l != pos[id].liq) return true;
         }
         return false;
-    }
-
-    /// @dev SA-6 M-1: the high-water-mark raise of a priced booking of `priced` at `price` (see `sync`).
-    function _late(SALib.Account storage s, SALib.PriceBudget storage pb, uint256 priced, uint256 price)
-        private
-        view
-        returns (uint256)
-    {
-        (uint256 lo, uint256 hi, bool ok) = SARange.since(pb.seen, price, s.bookTime);
-        if (!ok) return priced;
-        uint256 p0 = s.bookPrice;
-        if (p0 != 0 && p0 < lo) lo = p0;
-        if (p0 > hi) hi = p0;
-        return Math.mulDiv(priced, Math.max(hi - price, price - lo), lo, Math.Rounding.Ceil);
     }
 
     /// @dev SA-3 M-1: fees paid out of position `p` since the books' last look, for liquidity `n` (the snapshot when
@@ -280,7 +287,17 @@ library SABook {
         V4PositionMath.Position[] storage ps,
         address a,
         uint256 price
-    ) external view returns (uint256 val) {
+    ) external view returns (uint256) {
+        return _nav(v, s, ps, a, price);
+    }
+
+    function _nav(
+        SALib.Venue storage v,
+        SALib.Account storage s,
+        V4PositionMath.Position[] storage ps,
+        address a,
+        uint256 price
+    ) private view returns (uint256 val) {
         val = _value(v, s, ps, a, price);
         uint256 h = s.hedgeEquity;
         uint256 m = s.netMargin;

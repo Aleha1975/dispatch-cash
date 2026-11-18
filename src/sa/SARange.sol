@@ -41,27 +41,6 @@ library SARange {
         }
     }
 
-    /// @notice SA-6 M-1: (min, max) of `cur` and every value recorded in a live bucket from the bucket of time `t` on
-    ///         (a superset of the values recorded since `t`); `ok` = false when that bucket has left the ring (`t` is
-    ///         more than 24 h back): the result then does not cover the whole interval.
-    function since(R storage r, uint256 cur, uint256 t) internal view returns (uint256 lo, uint256 hi, bool ok) {
-        lo = cur;
-        hi = cur;
-        uint256 i = _now();
-        uint256 s = t / SPAN + 1;
-        ok = s + N > i;
-        for (uint256 k; k < N; ++k) {
-            uint256 e = r.b[k];
-            uint256 idx = e >> 224;
-            if (idx >= s && idx + N > i) {
-                uint256 mn = (e >> 112) & M112;
-                uint256 mx = e & M112;
-                if (mn < lo) lo = mn;
-                if (mx > hi) hi = mx;
-            }
-        }
-    }
-
     /// @notice Record `x` in the current bucket.
     function record(R storage r, uint256 x) internal {
         if (x > M112) revert RangeOverflow();

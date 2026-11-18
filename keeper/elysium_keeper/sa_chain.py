@@ -201,10 +201,8 @@ class AccountSnap:
     hedge_time: int = 0
     pending: int = 0  # live state - snapshot at the anchor: a client flow not booked yet (SA-2: booked at a trusted sync)
     value_pool: int = 0  # accountValue at the pool price (margin sends cap on min(value, value_pool))
-    priced_flow_time: int = 0  # SA-4 M-2: last booking of a price-dependent client flow; the fee waits a day after it
-    book_price: int = 0  # SA-5 M-4: anchor of the last priced sync (or of the registration, SA-6 L-2)
-    book_time: int = 0  # SA-6 M-1: time of the last priced sync; a flow booked later raises the hwm by its largest
-    #                     gain at any price reported since (the whole priced value beyond 24 h: refresh it, BOOK_REFRESH_S)
+    flow_seen: bool = False  # SA-7 M-1: a sync at an untrusted anchor saw idle base / a tracked position differ from
+    #                          the books; the next booking resets the fee baseline even if the flow netted back to zero
 
     @property
     def excess_equity(self) -> int:
@@ -272,10 +270,11 @@ class GlobalSnap:
 
     def trusted(self, now: int) -> bool:
         """LPManagerModule._trusted() (SA-3): fresh; unchanged for minPriceStable and confirmed by a report within the
-        last minPriceStable; the pool within BOOK_BAND_BPS of the anchor. Booking, swaps, LP adds and fees need it."""
+        last minPriceStable; the pool within BOOK_BAND_BPS of the anchor; SA-7 I-3: not paused. Booking, swaps, LP
+        adds and fees need it."""
         st = self.params["minPriceStable"]
         lp = self.last_price
-        return (self.fresh(now) and now >= self.last_price_moved + st and now <= self.last_price_time + st
+        return (not self.paused and self.fresh(now) and self.last_price_moved + st <= now <= self.last_price_time + st
                 and abs(self.pool_price - lp) * 10_000 <= self.pool_price * BOOK_BAND_BPS)
 
     @property
@@ -325,9 +324,9 @@ WINDOW_KEYS = ["turnoverUsed", "hedgeUsed", "priceUsed", "exitUsed"]
 PRICE_BUDGET_KEYS = ["priceApprovedLo", "priceApprovedHi", "priceApprovedUntil", "priceBase", "priceBaseTime"]
 CONFIRM_TTL_S = 86400  # SA-6 L-3: SALib.CONFIRM_TTL, chargeFee needs a guardian confirmation at most this old
 # SALib.Account field order (LPManagerModule.account(a))
-ACCOUNT_KEYS = ["delegationHash", "owner", "kind", "until", "revoked", "hedgeClipped", "contributed", "hwm",
+ACCOUNT_KEYS = ["delegationHash", "owner", "kind", "until", "revoked", "hedgeClipped", "flowSeen", "contributed", "hwm",
                 "hedgeEquity", "netMargin", "hedgeEpoch", "snapAsset", "snapBase", "lastFeeTime", "feesPaid",
-                "hedgeTime", "pricedFlowTime", "bookPrice", "bookTime"]
+                "hedgeTime"]
 PARAM_KEYS = ["feeBps", "hedgeCapBps", "poolBandBps", "maxSlippageBps", "hedgeStepBps", "refDriftBps",
               "swapTurnoverBps", "feeInterval", "maxPriceAge", "minPriceStable", "exitTurnoverBps"]
 
@@ -397,8 +396,7 @@ class ModuleReader:
             value=c("accountValue", a, price), budgets=dict(zip(BUDGET_KEYS, c("budgets", a)[2:])),
             windows=dict(zip(WINDOW_KEYS, c("windows", a))), owner=to_checksum_address(s["owner"]),
             revoked=s["revoked"], hedge_clipped=s["hedgeClipped"], hedge_time=s["hedgeTime"],
-            value_pool=c("accountValue", a, c("poolPrice")), priced_flow_time=s.get("pricedFlowTime", 0),
-            book_price=s.get("bookPrice", 0), book_time=s.get("bookTime", 0))
+            value_pool=c("accountValue", a, c("poolPrice")), flow_seen=bool(s.get("flowSeen", False)))
         snap.pending = self.pending(snap, s, price)
         return snap
 

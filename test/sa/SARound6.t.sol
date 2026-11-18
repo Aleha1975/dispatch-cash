@@ -82,8 +82,8 @@ contract SARound6Test is SATestBase {
     /// all its HYPE out at the bottom. The market comes back and the withdrawal is booked at about P0: contributed
     /// falls by the HYPE's value at P0, not at the price it left at. A later real gain (here a hedge profit the
     /// treasury pays in) then only makes up the hidden loss, but the books show it as profit and the fee took a share
-    /// of principal. Now the booking raises the high-water mark by the flow's largest gain at any price reported
-    /// since the last priced sync. Fails on 0fe4d85 (fee about 540 USDC).
+    /// of principal. SA-7: the booking raises the high-water mark to at least hwm + the flow's value at the
+    /// anchor (an outflow is worth >= 0 at any price). Fails on 0fe4d85 (fee about 540 USDC).
     function test_M1_PoC_WickRoundTripNoFeeOnPrincipal() public {
         (address a,) = _onboardHybrid(ALICE_PK, 30_000e6);
         _buyBase(a, 12_000e6);
@@ -135,34 +135,6 @@ contract SARound6Test is SATestBase {
         assertLe(_fee(a), 1e6, "no fee on a round trip of the deposited HYPE");
     }
 
-    /// The raise is sized by the market actually reported: a priced flow booked while every report since the last
-    /// priced sync was at the booking anchor raises nothing (a flat market costs the operator no fee).
-    function test_M1_FlatMarketPricedFlowRaisesNothing() public {
-        (address a,) = _onboardHybrid(ALICE_PK, 30_000e6);
-        _stable();
-        _keeperSync(a);
-        int256 h0 = _acct(a).hwm;
-        vm.deal(a, a.balance + 10 ether);
-        _stable();
-        _keeperSync(a);
-        assertEq(_acct(a).hwm, h0, "no move reported: no raise");
-        assertGt(_acct(a).contributed, int256(30_000e6), "the deposit is booked");
-    }
-
-    /// Beyond the 24 h ring without a priced sync, the raise is the whole priced value (the keeper refreshes every
-    /// account's booking at least every few hours, so this is the outage case). Fails on 0fe4d85 (raise 0).
-    function test_M1_LongGapRaisesWholePricedValue() public {
-        (address a,) = _onboardHybrid(ALICE_PK, 30_000e6);
-        _stable();
-        _keeperSync(a);
-        int256 h0 = _acct(a).hwm;
-        _hold(30); // reports continue, no priced sync of this account
-        vm.deal(a, a.balance + 10 ether);
-        _stable();
-        _keeperSync(a);
-        assertGe(_acct(a).hwm - h0, int256(10 * module.lastPrice()), "the whole priced value");
-    }
-
     // ================================================================== Lows
     /// L-1 (report trace): two tracked positions. The client lowers A to a sliver, the range trades, restores A
     /// exactly and halves B directly. B's pending principal sits in idle and was room for A's credit of growth x L
@@ -202,7 +174,8 @@ contract SARound6Test is SATestBase {
 
     /// L-2 (report trace): an account registered holding HYPE, first booked after the market fell 8%: the first
     /// priced sync had no reference price, so the return to the registration price was profit. Now registration
-    /// stores the anchor and its time. Fails on 0fe4d85 (fee about 48 USDC).
+    /// stores the anchor and its time; SA-7: the registration opens the books at a trusted anchor, else the late first
+    /// booking raises the mark by the holdings' value. Fails on 0fe4d85 (fee about 48 USDC).
     function test_L2_PoC_FirstBookingAfterRegistrationAdjusted() public {
         address o = vm.addr(ALICE_PK);
         address a = _deployHybrid(o);

@@ -1,0 +1,170 @@
+Elysium LP smart accounts: per-client MetaMask Delegation Framework accounts managed through one module, with a custom custody caveat enforcer - audit round 8 (PRINCIPAL LOSS ONLY: verify that the new fee rule can never charge a fee on principal through any client flow)
+
+CONTEXT FOR THIS ROUND
+Round 7 (job 1255) found no Critical or High, one Medium, two Lows and five Informationals. As in every round before
+it, the report agrees that no one can move funds outside {client, pool, hedgeTreasury, feeRecipient} and that no one
+can block a client exit.
+
+Rounds 4, 5, 6 and 7 each found a gap in the same family: a fee on principal when a client flow with a price-dependent
+part is booked later than it happened.
+- Round 4 added a day of waiting.
+- Round 5 added a dust threshold and a raise measured from the last booking's anchor.
+- Round 6 added a 24 h ring of keeper reports and a raise sized by its range.
+- Round 7 showed that opposite flows net out (M-1) and that the reports are not the market (L-1).
+
+THIS ROUND THE LATE-BOOKING FEE MACHINERY HAS BEEN REMOVED AND REPLACED BY ONE SIMPLER RULE. The following are gone:
+- the 1-day wait (Account.pricedFlowTime);
+- the 1% dust threshold;
+- Account.bookPrice and Account.bookTime;
+- the report ring PriceBudget.seen, SARange.since and SABook._late.
+The rule, in SABook.sync: a booking at a trusted anchor in which idle base or any tracked position's liquidity changed
+at all (in units), or which follows a flowSeen mark, sets
+    hwm = max(profit after the booking, hwm + priced)
+where priced = the sum of |change| of each price-dependent component valued at the booking anchor. Our argument:
+- Let e be the phantom (booked profit minus profit at each flow's own price). Profit after the booking = true profit +
+  e. So at or above the mark, no part of e is ever charged, for any number, sign or timing of flows, netting included.
+- The floor hwm + priced covers e below the mark for any outflow (its value at the flow is >= 0) and for an inflow booked
+  at no less than half its arrival price.
+- flowSeen: a sync at an untrusted anchor (keeper, client, owner or any module action) that sees idle base or a tracked
+  position differ from the books marks the account, so a later round trip back to the same amount is still a priced
+  booking.
+- A first registration at a trusted anchor opens the books in the same transaction, with no raise: that is the moment
+  the holdings come under management.
+The operator gives up fee: the uncharged gain at every priced booking, and up to the flow's value below the mark.
+That is a deliberate, accepted trade (see docs/audit/sa_round7_response.md, "Product cost").
+
+The pilot is still about USD 250 of the operator's own funds in one or two accounts on Elysium mainnet.
+
+For this round, please:
+- VERIFY THAT THE FEE CAN NEVER BE CHARGED ON PRINCIPAL THROUGH ANY CLIENT FLOW. Cover any number, sign, size and
+  timing of flows; idle base, idle USDC and tracked positions; opposite flows; flows while the anchor is untrusted,
+  paused or walked by a stolen keeper; the opening booking; a re-registration after a revoke. Either break the
+  argument above with a trace or a Foundry test, or confirm it.
+- Check the two residuals we state, and tell us if anything else is left:
+  (a) an exact round trip to the wei that no sync sees inside one booking interval: the books are identical to an
+      account that made neither flow, and only the client can start it;
+  (b) below the mark, opposite flows or an inflow booked below half its arrival price.
+- HUNT only for other principal-loss paths (destinations, exit liveness, stolen-keeper bound).
+- Fee-accuracy residuals that only LOWER the operator's fee are ACCEPTED, including the new one: anyone can wipe the
+  uncharged gain with 1 wei of HYPE. Please do not spend effort on them, except to say if one is in fact a
+  principal-loss path.
+
+SCOPE
+- src/sa/SABook.sol (external linked library): CHANGED.
+  - sync(s, ps, pos, a, v, price): the PriceBudget argument is gone. An opening sync is detected by
+    s.hwm == SALib.OPEN.
+  - At price 0: after the fee credit, set flowSeen if any tracked position is pending (_dirty) or idle base differs
+    from snapBase.
+  - In the loop: flowSeen is set on any liquidity change (so a change that rounds to 0 in value still counts).
+  - _bookIdle books as before; a change of idle base in units, or flowSeen, makes it a priced booking: clear flowSeen;
+    hwm += priced. Then _raise: hwm = max(hwm, nav - contributed).
+  - _late and the 1% rule are removed. nav moved into a private _nav, which nav and _raise both use.
+- src/sa/SALib.sol (external linked library): CHANGED.
+  - Account: pricedFlowTime, bookPrice and bookTime removed; NEW bool flowSeen (after hedgeClipped).
+  - PriceBudget: seen removed; NEW approvedAt (last).
+  - register(accts, ctxs, d, e): no price argument. It returns true only for a first registration, which sets
+    hwm = OPEN.
+  - movePrice: no report recording; a consumed guardian range sets baseTime = approvedAt (round-7 L-2).
+  - approvePrice stamps approvedAt.
+- src/sa/SARange.sol: CHANGED. since() removed. bounds / record / reset (the anchor drift budget) are unchanged.
+- src/sa/LPManagerModule.sol: CHANGED.
+  - _register: if SALib.register returns true, _sync(a) (the opening).
+  - sync(a) no longer reverts StalePrice: it books only at a trusted anchor, otherwise it only marks.
+  - _trusted() is false while paused (round-7 I-3).
+  - chargeFee: no pricedFlowTime wait.
+  - _setParams clears an open guardian range when poolBandBps decreases (round-7 I-1).
+- Unchanged since round 7: src/sa/SAWindow.sol, src/sa/SwapExecutor.sol, src/sa/ElysiumCustodyEnforcer.sol,
+  src/sa/vendor/DelegationFramework.sol, src/V4PositionMath.sol, src/VaultTimelock.sol, script/DeploySA.s.sol. The
+  pooled vault is shelved and OUT of scope.
+Build: solc 0.8.26, via-IR, optimizer runs 1, evm cancun. OpenZeppelin 5.4.0, v4-core/periphery from lib/. NOT deployed.
+Runtime sizes: module 24,155 B (421 under EIP-170), SALib 19,278 B, SABook 8,339 B, enforcer 7,802 B, SwapExecutor
+3,774 B, VaultTimelock 6,155 B, V4PositionMath 6,059 B.
+Foundry suites:
+- test/sa/SARound7.t.sol: 12 tests, new. 9 fail on the round-7 commit e6a2de5 (run there with the new SATestBase.sol;
+  the file compiles there). The other 3 are sanity (floor, USDC flow) and the documented exact-round-trip residual.
+- Older suites: two SARound6 tests of the removed ring were removed; SARound4 M-2 and SARound3 M-4 were adapted. All
+  others are unchanged and pass. Total 275 passed, 2 skipped.
+- test/fork/SmartAccount.fork.t.sol (3, ELYSIUM_FORK=true).
+Keeper (Python): unit tests and anvil-fork e2e. The keeper marks a pending flow it cannot book (sync at an untrusted
+anchor); there is no 3 h re-booking and no day of waiting before a fee.
+
+SOURCE
+{{REPO_URL}} at commit {{COMMIT}} (branch sa-r8, one commit on top of e6a2de5; `git diff e6a2de5 {{COMMIT}}` is the whole
+change). Part of the submission:
+- docs/audit/sa_round7_report_1255.md: the round-7 report.
+- docs/audit/sa_round7_response.md: the rule and its argument, what was removed, the product cost, per-finding status,
+  regression tests, restated residuals (4 replaced, 6 restated).
+- docs/SMART_ACCOUNT_DESIGN.md section 6: as-built design.
+- Earlier rounds: docs/audit/sa_round1_*.md .. sa_round6_*.md.
+
+CHAIN CONTEXT (unchanged)
+- Elysium mainnet, chain id 99901, Arbitrum Orbit (Nitro) L2, native gas token HYPE, Prague/7702.
+- Pool: PoolKey(native HYPE, USDC 0xb47c4C8F73F009CC0C0d3f92B388d13E293F0B65, fee 3000, tickSpacing 60, hooks 0).
+- PoolManager 0xE2e105d3F7209A9DA11f83cCf3E7398a753823F1, PositionManager 0x1d1C51b9d07fD27d36412A2b66CC23D19Eb3E518,
+  Permit2 0x000000000022D473030F116dDEE9F6B43aC78BA3.
+- Delegation Framework v1.3.0 (DelegationManager 0xdb9B1e94B5b69Df7e401DDbedE43491141047dB3).
+- The pool is thin (about USD 700 moves it 1.5%).
+
+TASK 1: THE FEE RULE (principal first)
+1. Is profit after a booking >= true profit + e for every booking path? The paths are: keeper sync, client / owner
+   sync, the sync inside every module action, chargeFee's own sync, the opening at registration, and the first booking
+   after an untrusted registration or a re-registration.
+   Is there a price-dependent client flow that a booking does not treat as priced? Consider:
+   - a position dropped (not owned) or burned but still tracked;
+   - a liquidity change whose value rounds to 0;
+   - fees credited by _feesOut in the same sync;
+   - the module's own effect being inexact, so that a later booking mis-attributes it.
+2. The floor: is hwm + priced >= hwm + e for every outflow, and for every inflow booked at >= half its arrival price,
+   for base and for liquidity, whatever the account's distance from its mark? Retry round-7 M-1 and its variants
+   (partial netting, deposit first, in-account round trip, liquidity round trip), the round-6 wick, the round-6
+   deposit-in-a-spike and the round-6 first booking after registration, each with the account above and below its
+   mark.
+3. flowSeen: can anything clear it without a priced booking? Can a client flow be pending, seen by a sync, and still
+   be booked as unpriced? Is our residual (a) exactly what is left?
+4. The opening: can anyone make the opening booking happen at a price far from the market? (It needs the trusted
+   anchor: fresh, stable, the pool within 50 bps, and not paused.) Can hwm stay at OPEN after the registration
+   transaction? Can a non-first registration take the opening path?
+5. Can the rule revert a sync, a removal, a margin return or an exit? (_raise reads nav; SafeCast on priced.)
+
+TASK 2: ROUND-7 FIXES
+- L-2: the confirmation day counts from approvePrice (baseTime = approvedAt). Can anything else write approvedAt or
+  baseTime?
+- I-1: the open range is cleared when poolBandBps decreases.
+- I-3: nothing is booked while paused (_trusted is false). Can this block anything other than booking, swaps, adds
+  and fees?
+- L-1 is closed by removal (no recorded range is used). Is a stolen keeper's walked anchor now covered for flows as we
+  state (outflows at any anchor, inflows within 2x)?
+
+TASK 3: PRINCIPAL-LOSS HUNT (only this)
+Look for any path, by anyone, that moves client principal out of the account other than:
+- into the pool (LP and swaps within the stated bounds);
+- to hedgeTreasury (<= hedgeCapBps);
+- to feeRecipient (<= feeBps of profit above the HWM).
+"Anyone" means: the client's own code (excepted for its own account), the keeper within or beyond its bounds, the
+relayer, a third party, the guardian, the timelock. Check that the client can always exit (revoke, withdraw, burn) with
+the module and the DelegationManager paused, including the hybrid path through handleOps.
+
+TRUST MODEL AND ROLES (unchanged)
+- client: owns the account, every token and position NFT; acts directly at any time; revoke() stops management.
+- module owner: VaultTimelock (>= 24 h, a Safe as proposer / canceller).
+- keeper (hot key): every module action within on-chain budgets; reports the price at least every 120 s; batches one
+  account per multicall; marks pending flows it cannot book.
+- guardian: pause, one-shot price ranges (<= 2 x poolBandBps wide; a confirmation within a day of approval is needed
+  before every fee) and hedge approvals.
+- relayer: deploys accounts, first registration and onboard (permissionless).
+- hedgeTreasury / feeRecipient: immutable operator addresses.
+
+OUT OF SCOPE (INTENTIONAL)
+- Fee-accuracy residuals that only lower the operator's fee (including fee avoidance with dust).
+- Keeper honesty within the bounds.
+- Hyperliquid, the bridge, the treasury's custody, the off-chain ledger.
+- Uniswap v4, Permit2, USDC and the Delegation Framework themselves (their interaction with our contracts is in scope).
+- The shelved pooled vault.
+
+DELIVERABLE
+- Findings with severity, a concrete trace or a Foundry test, and the smallest fix.
+- For the fee rule: a clear statement whether a fee can be charged on principal through any client flow, beyond the two
+  residuals we state.
+- For every round-7 Medium and Low, the status.
+- A clear statement whether you see any principal-loss path for a pilot of about USD 250 at the script parameters
+  (DeploySA.pilotParams).

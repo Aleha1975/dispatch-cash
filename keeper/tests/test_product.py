@@ -529,19 +529,14 @@ def test_status_row_has_strategy_range_and_return(tmp_path):
 
 
 # ---------------------------------------------------------------- SA-4 (round-4 audit) keeper mirrors
-def test_sa4_fee_waits_a_day_after_priced_flow(tmp_path):
-    """SA-4 M-2: chargeFee waits a day after a booked price-dependent client flow; the keeper books a pending flow
-    with sync(a) first and then waits (no reverting chargeFee)."""
-    acct = snap(last_fee_time=NOW - 8 * 86400, pending=5 * E6, priced_flow_time=NOW - 3600, value=1200 * E6)
+def test_sa7_fee_books_pending_flow_then_charges(tmp_path):
+    """SA-7 (replaces SA-4 M-2): no day of waiting after a priced flow. The keeper books a pending flow with sync(a)
+    first (a price-dependent one resets the fee baseline on chain) and goes on to the fee."""
+    acct = snap(last_fee_time=NOW - 8 * 86400, pending=5 * E6, value=1200 * E6)
     k = bare_keeper(tmp_path, FakeReader({ACCOUNT: acct}))
-    g = k.r.global_snap()
-    k.fee(ACCOUNT, g, NOW)
-    assert [fn for fn, _ in k.calls] == ["sync"]
-    assert any(ev == "fee_waits_flow" for ev, _ in k.logs)
-    acct.pending, acct.priced_flow_time = 0, NOW - 86400 - 1
-    k.calls.clear()
-    k.fee(ACCOUNT, g, NOW)
-    assert "chargeFee" in [fn for fn, _ in k.calls]
+    k.fee(ACCOUNT, k.r.global_snap(), NOW)
+    assert [fn for fn, _ in k.calls][:1] == ["sync"]
+    assert not any(ev == "fee_waits_flow" for ev, _ in k.logs)
 
 
 def test_sa4_return_and_fee_profit_use_net_margin():
@@ -570,16 +565,20 @@ def test_sa6_fee_waits_for_recent_confirmation(tmp_path):
     assert "chargeFee" in [fn for fn, _ in k.calls]
 
 
-def test_sa6_account_tick_refreshes_booking(tmp_path):
-    """SA-6 M-1: a zero-flow sync re-books an account whose last priced sync is older than BOOK_REFRESH_S, so a later
-    client flow is raised by the prices reported since (not by its whole value beyond the module's 24 h ring)."""
-    from elysium_keeper.sa_keeper import BOOK_REFRESH_S
-    for age, want in ((BOOK_REFRESH_S, True), (60, False)):
-        k = bare_keeper(tmp_path, FakeReader({ACCOUNT: snap(book_time=NOW - age)}),
+def test_sa7_account_tick_marks_flow_it_cannot_book(tmp_path):
+    """SA-7 M-1: a pending flow seen while the anchor is not trusted is marked with sync(a) (books nothing, sets
+    flowSeen), once; at a trusted anchor it is booked; no zero-flow re-booking any more (SA-6's BOOK_REFRESH_S)."""
+    from test_sa_unit import _g
+    cases = ((dict(pending=5 * E6), False, True), (dict(pending=5 * E6, flow_seen=True), False, False),
+             (dict(pending=0), False, False), (dict(pending=0), True, False), (dict(pending=5 * E6), True, True))
+    for kw, trusted, want in cases:
+        k = bare_keeper(tmp_path, FakeReader({ACCOUNT: snap(**kw)}),
                         {ACCOUNT: make_strategy(hedged=False, nonce=5).record(NOW)})
         k.manage_lp = lambda *a, **kw: None
         k.fee = lambda *a: None
         k.return_margin = lambda *a, **kw: None
         k.report_equity = lambda *a, **kw: None
-        k.account_tick(ACCOUNT, 40_000_000, k.r.global_snap(), NOW, 0.12)
-        assert ("sync" in [fn for fn, _ in k.calls]) is want
+        g = k.r.global_snap() if trusted else _g(last_price_time=NOW, last_price_moved=NOW - 400, paused=True)
+        k.r.global_snap = lambda g=g: g
+        k.account_tick(ACCOUNT, 40_000_000, g, NOW, 0.12)
+        assert ("sync" in [fn for fn, _ in k.calls]) is want, (kw, trusted)

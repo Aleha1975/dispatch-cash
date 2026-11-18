@@ -212,9 +212,10 @@ contract SARound4Test is SATestBase {
     }
 
     // ================================================================== M-2 (1240): fee a day after a priced flow
-    /// PoC (trace B): the client sends HYPE out; the flow is booked at the anchor of that moment. The fee now waits a
-    /// day after the last booking of a price-dependent flow (keeper and UI book with sync(a) at once).
-    function test_M2_PoC_FeeWaitsADayAfterPricedFlow() public {
+    /// PoC (trace B): the client sends HYPE out; the flow is booked at the anchor of that moment. SA-7 (replaces the
+    /// day of waiting): the booking sets the high-water mark to at least the profit after it, so a fee right after
+    /// it has nothing to charge, whatever price the flow really had.
+    function test_M2_PoC_NoFeeOnGainBeforePricedFlow() public {
         (address a,) = _onboardHybrid(ALICE_PK, 30_000e6);
         _buyBase(a, 12_000e6);
         _report();
@@ -231,13 +232,7 @@ contract SARound4Test is SATestBase {
         module.sync(a);
         _fresh(); // SA-6 L-3
         vm.prank(keeper);
-        vm.expectRevert(abi.encodeWithSelector(LPManagerModule.FeeTooEarly.selector, block.timestamp + 1 days));
-        module.chargeFee(a);
-        vm.warp(vm.getBlockTimestamp() + 1 days);
-        _feeReady();
-        _fresh(); // SA-6 L-3
-        vm.prank(keeper);
-        module.chargeFee(a);
+        assertEq(module.chargeFee(a), 0, "no fee on anything before the priced booking");
     }
 
     /// Sibling: a USDC-only flow is price-free and does not delay the fee.

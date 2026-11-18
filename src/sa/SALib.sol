@@ -83,6 +83,9 @@ library SALib {
         uint64 until; // delegation expiry (TimestampEnforcer)
         bool revoked; // set by the client with LPManagerModule.revoke; cleared only by the client re-registering
         bool hedgeClipped; // the last keeper decrease was clipped: stored equity may be above the real one
+        /// SA-7 M-1: a sync that could not book (anchor not trusted) saw idle base or a tracked position differ from
+        /// the books; the next booking treats the interval as priced even if the difference netted back to zero.
+        bool flowSeen;
         int256 contributed; // net client contributions
         int256 hwm; // profit level already charged
         uint256 hedgeEquity; // off-chain hedge equity attributed to this account
@@ -93,9 +96,6 @@ library SALib {
         uint256 lastFeeTime;
         uint256 feesPaid;
         uint256 hedgeTime; // last hedge report
-        uint256 pricedFlowTime; // SA-4 M-2: last booking of a material client flow with a price term (fee waits 1 day)
-        uint256 bookPrice; // SA-5 M-4: the anchor of the account's last priced sync (SA-6 L-2: or of its registration)
-        uint256 bookTime; // SA-6 M-1: the time of the account's last priced sync (or of its first registration)
     }
 
     struct Budgets {
@@ -116,15 +116,18 @@ library SALib {
         /// range. It is part of every range bound (`_bounds`): a keeper-only walk stays within refDriftBps of it over
         /// any number of days, and a fee is measured at most poolBandBps above it.
         uint256 base;
-        uint256 baseTime; // SA-6 L-3: when `base` was set (a fee needs a confirmation within CONFIRM_TTL)
+        /// SA-6 L-3 / SA-7 L-2: when the guardian judged `base`: the approvePrice call whose range the report consumed
+        /// (the first report: its own time). A fee needs this within CONFIRM_TTL.
+        uint256 baseTime;
         SARange.R range; // SA-3: trailing 24 h (min, max) of the anchor: the drift budget is net displacement
-        /// SA-6 M-1: trailing 24 h (min, max) of every keeper report (each within poolBandBps of the pool when made):
-        /// the market prices a pending client flow can have happened at, for SABook.sync's high-water-mark raise.
-        SARange.R seen;
+        uint256 approvedAt; // SA-7 L-2: time of the open guardian range's approvePrice
     }
 
     /// SA-6 L-3: a fee needs the guardian-confirmed level to be at most this old.
     uint256 internal constant CONFIRM_TTL = 1 days;
+
+    /// SA-7: `hwm` of an account between its first registration and the opening sync in the same transaction.
+    int256 internal constant OPEN = type(int256).min;
 
     /// keccak256("elysium.SALib.usedPermit"): (owner, nonce) of every permit the module pulled on (SA-3 L-5 / L-7)
     bytes32 internal constant USED_PERMIT = 0x6abd87adb26a402fe713f1d3f200068eae79f0e9a26a829d328b8969c2899fff;
@@ -247,25 +250,22 @@ library SALib {
         return ownerOf(a) == s.owner;
     }
 
-    /// @notice Register `d` for its delegator (module storage passed in). Returns false (no-op) for the stored,
-    ///         non-revoked delegation, before any other check (SA-2 L-11: top-ups keep working in the delegation's
+    /// @notice Register `d` for its delegator (module storage passed in); returns true for a first registration
+    ///         only. A no-op for the stored, non-revoked delegation, before any other check (SA-2 L-11: top-ups keep working in the delegation's
     ///         last day). Replacing it, or registering after a revoke: only the account or its pinned owner (M-1).
-    ///         Registration books nothing (SA-2 L-9 / H-1): what the account holds is a pending flow until the next
-    ///         keeper sync at a trusted anchor (SABook). SA-4 M-3: a first registration starts the books from zero
-    ///         (LPManagerModule.sync refuses an unregistered address; this is defence in depth). SA-6 L-2: and at the
-    ///         anchor `price` of the registration (bookPrice, bookTime), so the first priced sync, which books what the
-    ///         account held, gets the late-booking raise of SABook.sync like every later one.
+    ///         SA-4 M-3: a first registration starts the books from zero (LPManagerModule.sync refuses an unregistered
+    ///         address; this is defence in depth). SA-7: the module then opens the books at a trusted anchor in the
+    ///         same transaction (SABook.sync: `hwm` = OPEN marks the opening); otherwise what the account holds stays a pending flow.
     function register(
         mapping(address => Account) storage accts,
         mapping(address => bytes) storage ctxs,
         Delegation calldata d,
-        Expect memory e,
-        uint256 price
+        Expect memory e
     ) external returns (bool) {
         address a = d.delegator;
         Account storage s = accts[a];
         bytes32 old = s.delegationHash;
-        if (old != 0 && old == e.dm.getDelegationHash(d) && !s.revoked) return false;
+        if (old != 0 && old == e.dm.getDelegationHash(d) && !s.revoked) return false; // SA-2 L-11
         (bytes32 h, uint8 kind, uint256 until, address o) = checkDelegation(d, e);
         // M-1 / SA-3 L-14: replacing, resuming after a revoke, or a first registration of a slot the account revoked
         // in advance: only the account or its (pinned / derived) owner
@@ -286,12 +286,11 @@ library SALib {
             s.snapAsset = 0;
             s.snapBase = 0;
             s.contributed = 0;
-            s.hwm = 0;
-            s.bookPrice = price;
-            s.bookTime = block.timestamp;
+            s.hwm = OPEN; // SA-7: SABook.sync in the same transaction opens the books (and sets hwm to 0)
+            s.flowSeen = false;
         }
         emit Registered(a, h, kind, until, old == 0);
-        return true;
+        return old == 0;
     }
 
     /// @notice After a mint: the token is owned by the account, in the fixed pool, with exactly the requested ticks
@@ -399,13 +398,12 @@ library SALib {
     ///         the window is applied, never a clamp against the report. A report inside an open guardian range
     ///         (one-shot) consumes it (SA-4 L-4) and becomes the new `base`; if the report did not fit the keeper's
     ///         budget it is applied unclipped and starts a new window (history forgotten: an approval never leaves the
-    ///         keeper without room, SA-3 M-7 / L-2). SA-6 M-1: every report is recorded in `seen`; SA-6 L-3: every
-    ///         write of `base` stamps `baseTime`.
+    ///         keeper without room, SA-3 M-7 / L-2). SA-6 L-3: every write of `base` stamps `baseTime`; SA-7 L-2:
+    ///         a consumed guardian range stamps the time of its approval, not of its consumption.
     function movePrice(PriceBudget storage b, uint256 ref, uint256 p, uint256 capWad, uint256 stepBps, bool stable)
         external
         returns (uint256, bool)
     {
-        SARange.record(b.seen, p);
         if (ref == 0) {
             b.base = p;
             b.baseTime = block.timestamp;
@@ -430,7 +428,7 @@ library SALib {
         if (block.timestamp <= b.until && p >= b.lo && p <= b.hi) {
             b.until = 0;
             b.base = p; // SA-5 M-2: the guardian confirmed this level
-            b.baseTime = block.timestamp;
+            b.baseTime = b.approvedAt; // SA-7 L-2: the guardian's judgement, not the keeper's consumption
             if (clipped) {
                 SARange.reset(b.range);
                 SARange.record(b.range, p);
@@ -477,6 +475,7 @@ library SALib {
         b.lo = lo;
         b.hi = hi;
         b.until = until;
+        b.approvedAt = block.timestamp;
     }
 
     /// @notice New hedge equity for a keeper report `v`. The guardian's approval for exactly this account, epoch,

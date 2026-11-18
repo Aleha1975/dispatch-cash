@@ -257,8 +257,7 @@ contract SARound3Test is SATestBase {
         _give(a, 1_000e6);
         _moveTo(ref * 1008 / 1000);
         vm.prank(keeper);
-        vm.expectRevert(LPManagerModule.StalePrice.selector);
-        module.sync(a);
+        module.sync(a); // SA-7: books nothing off the band (no revert: it marks a priced change, here none)
         vm.prank(keeper);
         module.reportHedgeEquity(a, 0); // a keeper action that syncs
         assertEq(_acct(a).contributed, c0, "nothing booked off the band");

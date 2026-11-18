@@ -256,8 +256,8 @@ contract SARound5Test is SATestBase {
     }
 
     // ================================================================== Lows
-    /// L-1: one wei-scale native transfer by anyone no longer defers the fee (only a flow of at least 1% of the
-    /// net contributions waits a day).
+    /// L-1: one wei-scale native transfer by anyone does not defer the fee. SA-7: there is no day of waiting at all
+    /// (a priced change, dust included, resets the fee baseline instead: our fee only).
     function test_L1_DustDoesNotDelayFee() public {
         (address a,) = _onboardHybrid(ALICE_PK, 30_000e6);
         _buyBase(a, 12_000e6);

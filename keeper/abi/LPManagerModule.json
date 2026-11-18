@@ -336,6 +336,11 @@
       "internalType": "bool"
      },
      {
+      "name": "flowSeen",
+      "type": "bool",
+      "internalType": "bool"
+     },
+     {
       "name": "contributed",
       "type": "int256",
       "internalType": "int256"
@@ -382,21 +387,6 @@
      },
      {
       "name": "hedgeTime",
-      "type": "uint256",
-      "internalType": "uint256"
-     },
-     {
-      "name": "pricedFlowTime",
-      "type": "uint256",
-      "internalType": "uint256"
-     },
-     {
-      "name": "bookPrice",
-      "type": "uint256",
-      "internalType": "uint256"
-     },
-     {
-      "name": "bookTime",
       "type": "uint256",
       "internalType": "uint256"
      }
@@ -1422,16 +1412,9 @@
     ]
    },
    {
-    "name": "seen",
-    "type": "tuple",
-    "internalType": "struct SARange.R",
-    "components": [
-     {
-      "name": "b",
-      "type": "uint256[9]",
-      "internalType": "uint256[9]"
-     }
-    ]
+    "name": "approvedAt",
+    "type": "uint256",
+    "internalType": "uint256"
    }
   ],
   "stateMutability": "view"

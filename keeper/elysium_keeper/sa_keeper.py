@@ -51,10 +51,6 @@ from .sa_chain import BOOK_BAND_BPS, AccountSnap, GlobalSnap, ModuleReader, hybr
 
 BPS = 10_000
 E18 = 10 ** 18
-FEE_FLOW_WAIT_S = 86400  # SA-4 M-2: LPManagerModule.chargeFee waits a day after a price-dependent client flow
-# SA-6 M-1: re-book every account at a trusted anchor at least this often (a zero-flow sync only refreshes bookTime), so
-# a later client flow is raised by the prices reported since, not by its whole value (beyond the module's 24 h ring)
-BOOK_REFRESH_S = 3 * 3600  # one SARange bucket: the raise then spans about two buckets (~6 h) of reports
 SWAP_MIN_OUT_SLACK_BPS = 30  # minOut = the simulated output less this (the module floor still applies)
 
 
@@ -437,6 +433,10 @@ class SAKeeper:
             self.wind_down(s, g)
             return s
         led = self.ledger.client(a)
+        if s.pending and not s.flow_seen and not g.trusted(self.now()):
+            # SA-7 M-1: a flow that cannot be booked now is marked (sync books nothing, sets flowSeen), so the booking
+            # resets the fee baseline even if the client brings the same amount back before it
+            self.act("sync", a)
         if self.risk_out(a, now) and s.value >= self.sa.min_account_usd * 1e6:
             return self.account_tick_out(a, s, price, g, now)
         if price is None:
@@ -456,9 +456,8 @@ class SAKeeper:
         if not g.paused:
             g = self.r.global_snap()
             t = self.now()
-            if (s.pending or t - s.book_time >= BOOK_REFRESH_S) and g.trusted(t):
-                # SA-3 M-5: book a pending client flow at the first trusted moment; SA-6 M-1: refresh bookTime
-                self.act("sync", a)
+            if s.pending and g.trusted(t):
+                self.act("sync", a)  # SA-3 M-5: book a pending client flow at the first trusted moment
             if hedged:
                 self.margin(s, g, price)
             target_hw, _, _ = self.width_for(a, g, hw)
@@ -628,12 +627,10 @@ class SAKeeper:
         if now < s.last_fee_time + g.params["feeInterval"]:
             return
         if s.pending and g.trusted(now):
-            # SA-4 M-2: book the client flow first (chargeFee's own sync would book it and then refuse the fee)
+            # book the client flow first: a price-dependent one resets the fee baseline (SA-7), so the fee below is
+            # estimated on the books as they will be
             self.act("sync", a)
             s = self.r.account(a)
-        if now < s.priced_flow_time + FEE_FLOW_WAIT_S:
-            self.log("fee_waits_flow", account=a, until=s.priced_flow_time + FEE_FLOW_WAIT_S)
-            return
         if not g.trusted(now):
             # SA-2: chargeFee needs a fresh, unclipped anchor within the pool band that has not changed for
             # minPriceStable; hold the anchor value for a while so the window can elapse

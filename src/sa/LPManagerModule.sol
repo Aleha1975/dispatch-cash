@@ -341,8 +341,8 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
 
     // ------------------------------------------------------------------ onboarding and client control
     /// @notice Register a client-signed delegation (SALib.checkDelegation). The first registration is permissionless
-    ///         (relayer); it books nothing: what the account holds is booked by the first keeper sync at a trusted
-    ///         anchor (SA-2 H-1). Registering the stored delegation again is a no-op; replacing it, or registering
+    ///         (relayer); SA-7: it opens the books in the same transaction at a trusted anchor (otherwise what
+    ///         the account holds is booked by the first sync at a trusted anchor, SA-2 H-1). Registering the stored delegation again is a no-op; replacing it, or registering
     ///         after a revoke, needs the client: the account itself or its pinned owner (M-1).
     function register(Delegation calldata d) external nonReentrant {
         _register(d);
@@ -388,9 +388,12 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         emit Revoked(a, msg.sender);
     }
 
+    /// @dev SA-7: a first registration opens the books in the same transaction at a trusted anchor (what the account
+    ///      holds is booked at the moment it comes under management: no late booking, no raise); at an untrusted
+    ///      anchor it stays pending for the first sync like any flow.
     function _register(Delegation calldata d) internal {
         if (lastPrice == 0) revert NoAnchor();
-        SALib.register(accounts, permissionContext, d, _expect(), lastPrice); // SA-6 L-2: books start at the anchor
+        if (SALib.register(accounts, permissionContext, d, _expect())) _sync(d.delegator);
     }
 
     // ------------------------------------------------------------------ keeper: price anchor
@@ -590,8 +593,8 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     ///         `feeInterval` since the last fee; not paused. SA-3 M-3: profit = value at the anchor - contributed,
     ///         and only while the anchor is not above the pool nor more than poolBandBps above its trailing 24 h low
     ///         (SALib.feeGate), so a walked anchor must be held for a day in public view before it carries a fee.
-    ///         SA-4 M-2: not within a day of the last booking of a price-dependent client flow (the keeper books every
-    ///         flow with sync(a) at once, so the fee never rides on a flow booked at a moved anchor in the same day).
+    ///         SA-7 (replaces SA-4 M-2's day of waiting): a priced booking sets hwm to at least the profit after it
+    ///         (SABook.sync), so the fee never rides on a gain made before a price-dependent client flow.
     ///         SA-4 M-3: profit is measured without hedge equity above the net margin sent. SA-5 M-3: nor more than
     ///         poolBandBps above the guardian-confirmed level, and SA-6 L-3 within a day of that confirmation
     ///         (SALib.feeGate).
@@ -600,7 +603,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         _live(a);
         _sync(a);
         SALib.Account storage s = accounts[a];
-        uint256 next = Math.max(s.lastFeeTime + params.feeInterval, s.pricedFlowTime + 1 days);
+        uint256 next = s.lastFeeTime + params.feeInterval;
         if (block.timestamp < next) revert FeeTooEarly(next);
         if (s.hedgeEquity != 0 && (s.hedgeClipped || block.timestamp > s.hedgeTime + params.maxPriceAge)) {
             revert StaleHedge();
@@ -737,6 +740,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
 
     function _setParams(Params memory p) internal {
         SALib.checkParams(abi.encode(p)); // bounds per parameter and (SA-5 L-4) of their product
+        if (p.poolBandBps < params.poolBandBps) priceBudget.until = 0; // SA-7 I-1: no range wider than 2 new bands
         params = p;
         emit ParamsSet(p);
     }
@@ -777,7 +781,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     /// @dev Book live - snapshot as a client flow at the anchor, only while the anchor is trusted (SABook.sync);
     ///      LP fees paid out of tracked positions are booked as yield at every sync (SA-3 M-1).
     function _sync(address a) internal {
-        SABook.sync(accounts[a], _positions[a], snapPos, a, venue, _trusted() ? lastPrice : 0, priceBudget);
+        SABook.sync(accounts[a], _positions[a], snapPos, a, venue, _trusted() ? lastPrice : 0); // SA-7 I-3: 0 while paused
     }
 
     /// @dev The module's own effect on idle: added to the snapshot, never read back (SABook).
@@ -873,18 +877,18 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         uint256 ref = lastPrice;
         uint256 pool = poolPrice();
         uint256 d = ref > pool ? ref - pool : pool - ref;
-        return _freshOk() && block.timestamp >= lastPriceMoved + st && block.timestamp <= lastPriceTime + st
+        return !paused && _freshOk() && block.timestamp >= lastPriceMoved + st && block.timestamp <= lastPriceTime + st
             && d * BPS <= pool * BOOK_BAND_BPS;
     }
 
     /// @notice Book account `a`'s pending client flow now (SA-3 M-5): the keeper, the account or its pinned owner, so
     ///         the booking moment is not the keeper's choice alone (SA-5 L-3: no third party picks it with a pool push),
-    ///         only at a trusted anchor; SA-4 M-3: only for a registered account.
+    ///         only at a trusted anchor; SA-4 M-3: only for a registered account. SA-7: at an untrusted anchor it books
+    ///         nothing and only marks a pending price-dependent change (Account.flowSeen).
     function sync(address a) external nonReentrant {
         SALib.Account storage s = accounts[a];
         if (s.delegationHash == 0) revert NotRegistered();
         if (msg.sender != keeper && msg.sender != a && msg.sender != s.owner) revert NotOwnAccount();
-        if (!_trusted()) revert StalePrice();
         _sync(a);
     }
 
