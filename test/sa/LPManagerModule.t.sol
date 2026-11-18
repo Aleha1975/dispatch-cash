@@ -341,17 +341,20 @@ contract LPManagerModuleTest is SATestBase {
         uint256 anchor = module.lastPrice();
         _moveTo(anchor * 112 / 100);
         uint256 p = poolPrice();
+        vm.warp(vm.getBlockTimestamp() + 300);
         vm.prank(keeper);
         module.reportPrice(p);
+        // SA-4 M-1: one report moves the anchor one poolBandBps step at most
+        assertTrue(module.lastPriceClipped());
+        assertApproxEqRel(module.lastPrice(), anchor * 10150 / 10000, 1e15);
+        _reportSteps(p, 10); // one step per minPriceStable, up to the 24 h range budget
         assertTrue(module.lastPriceClipped());
         assertApproxEqRel(module.lastPrice(), anchor * 110 / 100, 1e15);
-        // budget used up: a second report cannot move it further
-        vm.prank(keeper);
-        module.reportPrice(p);
+        // budget used up: a further report cannot move it further
+        _reportSteps(p, 1);
         assertApproxEqRel(module.lastPrice(), anchor * 110 / 100, 1e15);
         vm.warp(vm.getBlockTimestamp() + 27 hours); // the sliding window has passed
-        vm.prank(keeper);
-        module.reportPrice(p);
+        _reportSteps(p, 2);
         assertFalse(module.lastPriceClipped());
         assertEq(module.lastPrice(), p);
         // paused: frozen, unless the guardian approves a range

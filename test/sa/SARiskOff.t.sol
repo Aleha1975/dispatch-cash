@@ -107,14 +107,21 @@ contract SARiskOffTest is SATestBase {
         module.swap(a, true, all, p, 0);
         vm.prank(keeper);
         module.swap(a, true, all / 3, p, 0); // ~13%: fits
-        _setParams(5000, 0); // off: no exit sell at all
+        _setParams(5000, 0); // SA-4 L-6: off = the sale goes to the turnover window (no longer refused outright)
         _moveTo(p);
         _report();
         _stable();
         p = poolPrice();
+        (uint256 t0,,, uint256 e0) = module.windows(a);
         vm.prank(keeper);
-        vm.expectRevert(SAWindow.WindowOverflow.selector);
         module.swap(a, true, a.balance / 4, p, 0);
+        (uint256 t1,,, uint256 e1) = module.windows(a);
+        assertGt(t1, t0, "charged to the turnover window");
+        assertEq(e1, e0, "not to the exit window");
+        uint256 rest = a.balance;
+        vm.prank(keeper);
+        vm.expectRevert(SAWindow.WindowOverflow.selector); // beyond the turnover room left
+        module.swap(a, true, rest, p, 0);
     }
 
     function test_R4_BuysWithoutPositionStayOnTurnover() public {

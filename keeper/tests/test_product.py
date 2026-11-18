@@ -526,3 +526,28 @@ def test_status_row_has_strategy_range_and_return(tmp_path):
     assert row["range"]["in_range"] and row["range"]["lower"] < 40 < row["range"]["upper"]
     assert row["strategy"]["mode"] == "manual" and row["strategy"]["effective_width_bps"] == 1000
     assert row["strategy"]["hedged"] is False and "signature" not in row["strategy"]
+
+
+# ---------------------------------------------------------------- SA-4 (round-4 audit) keeper mirrors
+def test_sa4_fee_waits_a_day_after_priced_flow(tmp_path):
+    """SA-4 M-2: chargeFee waits a day after a booked price-dependent client flow; the keeper books a pending flow
+    with sync(a) first and then waits (no reverting chargeFee)."""
+    acct = snap(last_fee_time=NOW - 8 * 86400, pending=5 * E6, priced_flow_time=NOW - 3600, value=1200 * E6)
+    k = bare_keeper(tmp_path, FakeReader({ACCOUNT: acct}))
+    g = k.r.global_snap()
+    k.fee(ACCOUNT, g, NOW)
+    assert [fn for fn, _ in k.calls] == ["sync"]
+    assert any(ev == "fee_waits_flow" for ev, _ in k.logs)
+    acct.pending, acct.priced_flow_time = 0, NOW - 86400 - 1
+    k.calls.clear()
+    k.fee(ACCOUNT, g, NOW)
+    assert "chargeFee" in [fn for fn, _ in k.calls]
+
+
+def test_sa4_return_and_fee_profit_use_net_margin():
+    """SA-4 M-3: the keeper returns at most min(hedge equity, net margin); equity above the net margin is no profit."""
+    s = snap(hedge_equity=900 * E6, net_margin=300 * E6, value=2000 * E6, contributed=1000 * E6)
+    assert s.keeper_return_cap == 300 * E6
+    assert s.nav == 1400 * E6 and s.fee_profit == 400 * E6
+    s2 = snap(hedge_equity=200 * E6, net_margin=300 * E6)
+    assert s2.keeper_return_cap == 200 * E6 and s2.nav == s2.value

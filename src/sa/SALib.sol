@@ -48,6 +48,7 @@ library SALib {
 
     uint256 internal constant BPS = 10_000;
     uint256 internal constant WAD = 1e18;
+    uint256 internal constant MAX_DELEGATION_LIFETIME = 400 days; // SA-4 I-3 (1241)
 
     bytes32 internal constant PERMIT_TYPEHASH =
         keccak256("Permit(address owner,address spender,uint256 value,uint256 nonce,uint256 deadline)");
@@ -67,8 +68,11 @@ library SALib {
     error NotOwnAccount();
     error BadPermit();
     error StalePrice(); // same selector as LPManagerModule.StalePrice
+    error HedgeCap(uint256 after_, uint256 cap); // same selector as LPManagerModule.HedgeCap
+    error ZeroAmount(); // same selector as LPManagerModule.ZeroAmount
 
     event Registered(address indexed account, bytes32 delegationHash, uint8 kind, uint256 until, bool first);
+    event HedgeMarginReturned(address indexed account, uint256 amount, uint256 hedgeEquity, uint256 netMargin);
 
     // ------------------------------------------------------------------ module storage types
     struct Account {
@@ -88,6 +92,7 @@ library SALib {
         uint256 lastFeeTime;
         uint256 feesPaid;
         uint256 hedgeTime; // last hedge report
+        uint256 pricedFlowTime; // SA-4 M-2: last booking of a client flow with a price-dependent term (fee waits 1 day)
     }
 
     struct Budgets {
@@ -159,7 +164,7 @@ library SALib {
         // L-1: the module stores uint64; an expiry beyond it would make the module and the DM disagree on liveness
         if (
             uint128(bytes16(t[0:16])) >= block.timestamp || until < block.timestamp + e.minLifetime
-                || until > type(uint64).max
+                || until > block.timestamp + MAX_DELEGATION_LIFETIME
         ) revert BadDelegation(6);
         (kind, owner) = accountKind(d.delegator, e);
         h = e.dm.getDelegationHash(d);
@@ -232,7 +237,8 @@ library SALib {
     ///         non-revoked delegation, before any other check (SA-2 L-11: top-ups keep working in the delegation's
     ///         last day). Replacing it, or registering after a revoke: only the account or its pinned owner (M-1).
     ///         Registration books nothing (SA-2 L-9 / H-1): what the account holds is a pending flow until the next
-    ///         keeper sync at a trusted anchor (SABook).
+    ///         keeper sync at a trusted anchor (SABook). SA-4 M-3: a first registration starts the books from zero
+    ///         (LPManagerModule.sync refuses an unregistered address; this is defence in depth).
     function register(
         mapping(address => Account) storage accts,
         mapping(address => bytes) storage ctxs,
@@ -258,7 +264,13 @@ library SALib {
         Delegation[] memory ds = new Delegation[](1);
         ds[0] = d;
         ctxs[a] = abi.encode(ds);
-        if (old == 0) s.lastFeeTime = block.timestamp;
+        if (old == 0) {
+            s.lastFeeTime = block.timestamp;
+            s.snapAsset = 0;
+            s.snapBase = 0;
+            s.contributed = 0;
+            s.hwm = 0;
+        }
         emit Registered(a, h, kind, until, old == 0);
         return true;
     }
@@ -283,13 +295,17 @@ library SALib {
     ///         permit for exactly this spender and amount. A permit that was front-run is accepted only if this very
     ///         signature was the owner's last permit (nonce - 1), it has not expired and the allowance it set is
     ///         untouched. SA-3 L-5 / L-7: every (owner, nonce) is pulled on at most once, so a consumed permit cannot
-    ///         be replayed against a later standing approval of the same amount; a standing allowance is never used.
+    ///         be replayed against a later standing approval of the same amount. SA-4 L-9: the once-only slot is
+    ///         written here only; if the owner spends that permit's allowance through `deposit` and approves the same
+    ///         amount again before the deadline, the permit can still pull it once (into the owner's own account).
+    ///         SA-4 I-3: a permit call that returns must have consumed the nonce.
     function pull(address asset, address o, address a, uint256 amount, uint256 deadline, uint8 v, bytes32 r, bytes32 s_)
         external
     {
         uint256 n = IERC20Permit(asset).nonces(o);
-        try IERC20Permit(asset).permit(o, address(this), amount, deadline, v, r, s_) {}
-        catch {
+        try IERC20Permit(asset).permit(o, address(this), amount, deadline, v, r, s_) {
+            if (IERC20Permit(asset).nonces(o) != n + 1) revert BadPermit();
+        } catch {
             if (n == 0 || block.timestamp > deadline) revert BadPermit();
             n -= 1;
             bytes32 digest = keccak256(
@@ -341,11 +357,18 @@ library SALib {
     /// @notice Move the anchor `ref` toward `p` (SA-3: net displacement, not path length). The first report
     ///         (ref == 0) is free. A new anchor must stay inside [max / (1 + cap), min * (1 + cap)], where min / max
     ///         are the lowest / highest anchor held during the trailing 24 h (SARange), so the anchor's 24 h range is
-    ///         at most 1 + cap and an oscillation that comes back costs nothing (a path-length budget is exhausted by
-    ///         ordinary volatility: about sigma^2 / hysteresis per day). Cap 0 (paused) freezes the anchor. A report
-    ///         that does not fit uses a guardian range covering `p` (one-shot): applied unclipped, and it starts a new
-    ///         window (history forgotten: an approval never leaves the keeper without room, SA-3 M-7 / L-2).
-    function movePrice(PriceBudget storage b, uint256 ref, uint256 p, uint256 capWad) external returns (uint256, bool) {
+    ///         at most 1 + cap and an oscillation that comes back costs nothing. SA-4 M-1: one keeper report moves the
+    ///         anchor at most `stepBps` of it, and not at all until the last move is `stable` (minPriceStable), so a
+    ///         walk of the whole budget takes about cap / step confirmed reports in public view. Cap 0 (paused)
+    ///         freezes the anchor. SA-4 L-8: when the window no longer contains the anchor (a lowered cap), only a
+    ///         value inside the window is applied, never a clamp against the report. A report inside an open guardian
+    ///         range (one-shot) consumes it (SA-4 L-4); if the report did not fit the keeper's budget it is applied
+    ///         unclipped and starts a new window (history forgotten: an approval never leaves the keeper without
+    ///         room, SA-3 M-7 / L-2).
+    function movePrice(PriceBudget storage b, uint256 ref, uint256 p, uint256 capWad, uint256 stepBps, bool stable)
+        external
+        returns (uint256, bool)
+    {
         if (ref == 0) {
             SARange.record(b.range, p);
             return (p, false);
@@ -353,16 +376,25 @@ library SALib {
         (uint256 lo, uint256 hi) = SARange.bounds(b.range, ref);
         uint256 up = Math.mulDiv(lo, WAD + capWad, WAD);
         uint256 dn = Math.mulDiv(hi, WAD, WAD + capWad, Math.Rounding.Ceil);
+        uint256 st = stable ? Math.mulDiv(ref, stepBps, BPS) : 0;
+        if (up > ref + st) up = ref + st;
+        if (dn + st < ref) dn = ref - st;
         uint256 q = p;
-        if (dn > up) q = ref; // the window no longer admits a move (cap 0 while paused, or a lowered cap)
-        else if (q > up) q = up;
-        else if (q < dn) q = dn;
+        if (dn > up || ref < dn || ref > up) {
+            if (p < dn || p > up) q = ref; // the window does not contain the anchor (cap 0, a lowered cap)
+        } else if (q > up) {
+            q = up;
+        } else if (q < dn) {
+            q = dn;
+        }
         bool clipped = q != p;
-        if (clipped && block.timestamp <= b.until && p >= b.lo && p <= b.hi) {
+        if (block.timestamp <= b.until && p >= b.lo && p <= b.hi) {
             b.until = 0;
-            SARange.reset(b.range);
-            SARange.record(b.range, p);
-            return (p, false);
+            if (clipped) {
+                SARange.reset(b.range);
+                SARange.record(b.range, p);
+                return (p, false);
+            }
         }
         SARange.record(b.range, ref);
         SARange.record(b.range, q);
@@ -429,9 +461,17 @@ library SALib {
         return (old - d, clipped);
     }
 
-    /// @notice Charge `notional` to the account's turnover window (or, R4, its exit window) `cap`; reverts beyond it.
-    function useTurnover(Budgets storage b, uint256 notional, uint256 cap, bool exit) external {
-        SAWindow.charge(exit ? b.exit : b.turnover, notional, cap);
+    /// @notice Charge `notional` to the account's turnover window (cap turnBps x nav), or, R4, to its exit window
+    ///         (cap exitBps x nav) for an `exit` sale. SA-4 L-6: an exit sale that does not fit the exit window (or
+    ///         with the exit window off) falls back to the turnover window; reverts beyond it.
+    function useTurnover(Budgets storage b, uint256 notional, uint256 nav, uint256 turnBps, uint256 exitBps, bool exit)
+        external
+    {
+        if (exit && notional <= SAWindow.room(b.exit, Math.mulDiv(nav, exitBps, BPS))) {
+            SAWindow.add(b.exit, notional);
+            return;
+        }
+        SAWindow.charge(b.turnover, notional, Math.mulDiv(nav, turnBps, BPS));
     }
 
     /// @notice (turnover used, hedge-decrease used, exit used) in the current 24 h windows.
@@ -446,9 +486,36 @@ library SALib {
         return Math.mulDiv(hi - lo, WAD, lo);
     }
 
+    /// @notice LPManagerModule.swap bounds: (turnover charge, min-out, sqrtPrice limit). The charge is the amount in
+    ///         for a buy and, SA-4 I-6, the higher of the sale's value at the keeper price and at the anchor `ref`;
+    ///         min-out = max(`minOut`, fair value at the keeper price minus `slip`) (SA-2 L-15); the pool may not be
+    ///         pushed beyond `band` of the anchor. SA-4 I-5 (1241): a trade worth nothing at the keeper price reverts.
+    function swapBounds(
+        bool sellBase,
+        uint256 amountIn,
+        uint256 kp,
+        uint256 ref,
+        uint256 minOut,
+        uint256 slip,
+        uint256 band,
+        bool baseIsCurrency0
+    ) external pure returns (uint256 charge, uint256, uint160 limit) {
+        uint256 fair = sellBase ? Math.mulDiv(amountIn, kp, WAD) : Math.mulDiv(amountIn, WAD, kp);
+        charge = sellBase ? Math.max(fair, Math.mulDiv(amountIn, ref, WAD)) : amountIn;
+        uint256 floor = Math.mulDiv(fair, BPS - slip, BPS);
+        if (minOut < floor) minOut = floor;
+        if (minOut == 0 || fair == 0) revert ZeroAmount();
+        limit = _sqrtPriceAt(Math.mulDiv(ref, sellBase ? BPS - band : BPS + band, BPS), baseIsCurrency0);
+        return (charge, minOut, limit);
+    }
+
     // ------------------------------------------------------------------ misc
     /// @notice sqrtPriceX96 of the pool when one 1e18 base unit is worth `price` asset units, clamped to the valid range.
     function sqrtPriceAt(uint256 price, bool baseIsCurrency0) external pure returns (uint160) {
+        return _sqrtPriceAt(price, baseIsCurrency0);
+    }
+
+    function _sqrtPriceAt(uint256 price, bool baseIsCurrency0) private pure returns (uint160) {
         uint256 q = baseIsCurrency0 ? FullMath.mulDiv(price, 1 << 192, 1e18) : FullMath.mulDiv(1e18, 1 << 192, price);
         uint256 s = Math.sqrt(q);
         if (s <= TickMath.MIN_SQRT_PRICE) s = TickMath.MIN_SQRT_PRICE + 1;
@@ -565,6 +632,27 @@ library SALib {
             xs[4] = _permit2Approve(permit2, cIn, executor, 0);
         }
         _redeem(dm, ctx, xs);
+    }
+
+    /// @notice LPManagerModule.returnHedgeMargin after its sync: `amount` USDC from the treasury (which approves the
+    ///         module) into account `a`, booked as the module's own effect (value moves from hedge equity to idle: not
+    ///         a flow). The keeper (not `byTreasury`) returns at most min(hedge equity, net margin sent) (SA-1 H-1,
+    ///         SA-4 M-3 of 1241).
+    function returnMargin(Account storage s, address asset, address treasury, address a, uint256 amount, bool byTreasury)
+        external
+    {
+        uint256 h = s.hedgeEquity;
+        uint256 m = s.netMargin;
+        uint256 lim = h < m ? h : m;
+        if (!byTreasury && amount > lim) revert HedgeCap(amount, lim);
+        SafeERC20.safeTransferFrom(IERC20(asset), treasury, a, amount);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        s.snapAsset += int256(amount);
+        if (amount >= h) s.hedgeClipped = false; // SA-3 L-3: nothing left that could be overstated
+        s.hedgeEquity = amount >= h ? 0 : h - amount;
+        s.netMargin = amount >= m ? 0 : m - amount;
+        s.hedgeEpoch++;
+        emit HedgeMarginReturned(a, amount, s.hedgeEquity, s.netMargin);
     }
 
     /// @notice USDC from the account to one of the module's two fixed recipients, verified at the recipient (H-2:

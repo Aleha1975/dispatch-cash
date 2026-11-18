@@ -102,8 +102,9 @@ contract SARound3Test is SATestBase {
         assertApproxEqAbs(_profit(a), p0, 2, "the fees stay profit");
     }
 
-    /// Siblings: fees taken to an outside address are profit the client withdrew (contributed falls by them, profit
-    /// keeps them); a client burn books the principal as an outflow and keeps the fees as profit, like a collect.
+    /// Siblings: fees taken to an outside address leave the account and the profit (SA-4: never credited above the
+    /// idle surplus); a client burn books the principal as an outflow and its fees as a contribution (SA-4 H-1: a
+    /// changed position credits nothing), so the profit ends where the outside collect left it.
     function test_M1_Sibling_CollectToOutsideAndBurn() public {
         (address a, uint256 id) = _withFees(ALICE_PK);
         uint256 ref = module.lastPrice();
@@ -114,8 +115,13 @@ contract SARound3Test is SATestBase {
         (uint256 u0, uint256 h0) = (usdc.balanceOf(eoa), eoa.balance);
         _clientRemove(ALICE_PK, a, id, false, 0, eoa);
         uint256 fees = _valueAt(usdc.balanceOf(eoa) - u0, eoa.balance - h0, ref);
+        int256 p0 = _profit(a);
         module.sync(a);
-        assertApproxEqAbs(_acct(a).contributed, c0 - int256(fees), 2, "outside collect = withdrawal of profit");
+        // SA-4 H-1 (idle-surplus cap): fees that did not reach the account are not credited as yield; they leave the
+        // profit (our fee lower) instead of being booked as a withdrawal of profit
+        assertGt(fees, 1e6);
+        assertApproxEqAbs(_acct(a).contributed, c0, 2, "outside collect: nothing booked");
+        assertApproxEqAbs(_profit(a), p0, 2);
         int256 pCollect = _profit(a);
 
         vm.revertToState(snap);

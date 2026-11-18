@@ -384,6 +384,11 @@
       "name": "hedgeTime",
       "type": "uint256",
       "internalType": "uint256"
+     },
+     {
+      "name": "pricedFlowTime",
+      "type": "uint256",
+      "internalType": "uint256"
      }
     ]
    }
@@ -1682,6 +1687,16 @@
     "name": "g1",
     "type": "uint256",
     "internalType": "uint256"
+   },
+   {
+    "name": "G0",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
+    "name": "G1",
+    "type": "uint256",
+    "internalType": "uint256"
    }
   ],
   "stateMutability": "view"
@@ -2615,6 +2630,11 @@
  },
  {
   "type": "error",
+  "name": "RangeOverflow",
+  "inputs": []
+ },
+ {
+  "type": "error",
   "name": "Subscribed",
   "inputs": [
    {
@@ -2633,6 +2653,33 @@
   "type": "error",
   "name": "WindowOverflow",
   "inputs": []
+ },
+ {
+  "type": "error",
+  "name": "SafeCastOverflowedIntToUint",
+  "inputs": [
+   {
+    "name": "value",
+    "type": "int256",
+    "internalType": "int256"
+   }
+  ]
+ },
+ {
+  "type": "error",
+  "name": "SafeCastOverflowedUintDowncast",
+  "inputs": [
+   {
+    "name": "bits",
+    "type": "uint8",
+    "internalType": "uint8"
+   },
+   {
+    "name": "value",
+    "type": "uint256",
+    "internalType": "uint256"
+   }
+  ]
  },
  {
   "type": "error",
@@ -2674,22 +2721,6 @@
   "type": "error",
   "name": "RefundFailed",
   "inputs": []
- },
- {
-  "type": "error",
-  "name": "SafeCastOverflowedUintDowncast",
-  "inputs": [
-   {
-    "name": "bits",
-    "type": "uint8",
-    "internalType": "uint8"
-   },
-   {
-    "name": "value",
-    "type": "uint256",
-    "internalType": "uint256"
-   }
-  ]
  },
  {
   "type": "error",
@@ -2895,11 +2926,6 @@
  {
   "type": "error",
   "name": "EnforcedPause",
-  "inputs": []
- },
- {
-  "type": "error",
-  "name": "RangeOverflow",
   "inputs": []
  }
 ]

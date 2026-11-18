@@ -27,10 +27,17 @@ import {LPManagerModule} from "../src/sa/LPManagerModule.sol";
 /// 2. SwapExecutor, ElysiumCustodyEnforcer and LPManagerModule (owner = VaultTimelock; OWNER proposes/executes, OWNER
 ///    and GUARDIAN cancel). Forge links SALib / SABook / V4PositionMath automatically.
 /// Env: OWNER, KEEPER, GUARDIAN, HEDGE_TREASURY, FEE_RECIPIENT, optional TIMELOCK_DELAY (default 48 h, >= 24 h),
-/// optional ALLOW_EOA_OWNER (default false: the timelock operator must be a contract, i.e. a multisig; SA-3 L-13).
+/// optional ALLOW_EOA_OWNER (default false: the timelock operator must be a Safe-style multisig with threshold >= 2,
+/// not an EOA and not an EIP-7702-delegated EOA; SA-3 L-13, SA-4 L-13).
+/// Params: the PILOT values are the script's (SA-4 L-12: swapTurnoverBps 5000, exitTurnoverBps 10000) and are read
+/// back from the deployed module; onboard nobody before `params()` equals them.
 /// After deploying: the keeper calls reportPrice once (anchor), the treasury approves the module for USDC.
 interface IPausable {
     function paused() external view returns (bool);
+}
+
+interface ISafeThreshold {
+    function getThreshold() external view returns (uint256);
 }
 
 interface IPosmWiring {
@@ -83,6 +90,39 @@ contract DeploySA is Script {
         );
     }
 
+    /// SA-4 L-12: the pilot parameters (docs/audit/sa_round4_response.md).
+    function pilotParams() public pure returns (LPManagerModule.Params memory) {
+        return LPManagerModule.Params({
+            feeBps: 1500,
+            hedgeCapBps: 3500,
+            poolBandBps: 150,
+            maxSlippageBps: 150,
+            hedgeStepBps: 500,
+            refDriftBps: 1000,
+            swapTurnoverBps: 5000,
+            feeInterval: 7 days,
+            maxPriceAge: 3600,
+            minPriceStable: 300,
+            exitTurnoverBps: 10000
+        });
+    }
+
+    /// SA-4 L-13: a multisig owner, not a (7702-delegated) EOA: no 0xef0100 designator, Safe threshold >= 2.
+    function _checkOwner(address owner) internal view {
+        if (vm.envOr("ALLOW_EOA_OWNER", false)) return;
+        bytes memory code = owner.code;
+        require(code.length != 0, "OWNER must be a multisig");
+        require(
+            !(code.length == 23 && code[0] == 0xef && code[1] == 0x01 && code[2] == 0x00),
+            "OWNER is a 7702-delegated EOA, not a multisig"
+        );
+        uint256 t;
+        try ISafeThreshold(owner).getThreshold() returns (uint256 x) {
+            t = x;
+        } catch {}
+        require(t >= 2, "OWNER must be a Safe with threshold >= 2");
+    }
+
     function run() external returns (LPManagerModule module, ElysiumCustodyEnforcer enforcer, SwapExecutor executor) {
         require(block.chainid == CHAIN_ID, "wrong chain");
         address owner = vm.envAddress("OWNER");
@@ -108,7 +148,7 @@ contract DeploySA is Script {
                 && CREATE2_DEPLOYER.code.length != 0,
             "missing v4 / Delegation Framework / EntryPoint contracts"
         );
-        require(owner.code.length != 0 || vm.envOr("ALLOW_EOA_OWNER", false), "OWNER must be a multisig");
+        _checkOwner(owner);
         _sameCode(PM, "PoolManager");
         _sameCode(POSM, "PositionManager");
         _sameCode(PERMIT2, "Permit2");
@@ -165,19 +205,7 @@ contract DeploySA is Script {
                 owner: address(timelock),
                 keeper: keeper,
                 guardian: guardian,
-                params: LPManagerModule.Params({
-                    feeBps: 1500,
-                    hedgeCapBps: 3500,
-                    poolBandBps: 150,
-                    maxSlippageBps: 150,
-                    hedgeStepBps: 500,
-                    refDriftBps: 1000,
-                    swapTurnoverBps: 20000,
-                    feeInterval: 7 days,
-                    maxPriceAge: 3600,
-                    minPriceStable: 300,
-                    exitTurnoverBps: 10000
-                })
+                params: pilotParams()
             })
         );
         vm.stopBroadcast();
@@ -205,9 +233,31 @@ contract DeploySA is Script {
         );
         require(
             timelock.hasRole(timelock.PROPOSER_ROLE(), owner) && timelock.hasRole(timelock.EXECUTOR_ROLE(), owner)
-                && timelock.hasRole(timelock.CANCELLER_ROLE(), guardian) && timelock.getMinDelay() == delay,
+                && timelock.hasRole(timelock.CANCELLER_ROLE(), guardian) && timelock.hasRole(timelock.CANCELLER_ROLE(), owner)
+                && timelock.getMinDelay() == delay,
             "timelock roles"
         );
+        // SA-4 L-12: the immutables and the full params tuple, read back from the deployed module
+        require(
+            address(module.asset()) == USDC && module.hedgeTreasury() == treasury && module.feeRecipient() == feeTo
+                && module.permit2() == PERMIT2 && address(module.delegationManager()) == DM
+                && module.timestampEnforcer() == TIMESTAMP_ENFORCER && module.eip7702Impl() == EIP7702_IMPL
+                && !module.paused(),
+            "module immutables"
+        );
+        _checkParams(module);
         // operator step left: the treasury approves the module for USDC (returnHedgeMargin), sized per return
+    }
+
+    function _checkParams(LPManagerModule module) internal view {
+        LPManagerModule.Params memory w = pilotParams();
+        (uint16 a, uint16 b, uint16 c, uint16 d, uint16 e, uint16 f, uint32 g, uint32 h, uint32 i, uint32 j, uint16 k) =
+            module.params();
+        require(
+            a == w.feeBps && b == w.hedgeCapBps && c == w.poolBandBps && d == w.maxSlippageBps && e == w.hedgeStepBps
+                && f == w.refDriftBps && g == w.swapTurnoverBps && h == w.feeInterval && i == w.maxPriceAge
+                && j == w.minPriceStable && k == w.exitTurnoverBps,
+            "module params differ from the pilot values"
+        );
     }
 }

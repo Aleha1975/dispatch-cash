@@ -385,6 +385,7 @@ contract SARound2Test is SATestBase {
         (,, uint256 pu,) = module.windows(address(0));
         assertEq(pu, 0, "a new window, not a full one");
         uint256 anchor = module.lastPrice();
+        vm.warp(vm.getBlockTimestamp() + 300); // SA-4 M-1: the jump must be stable before the next move
         vm.prank(keeper);
         module.reportPrice(anchor + 1);
         assertEq(module.lastPrice(), anchor + 1, "room left: applied");
@@ -403,27 +404,28 @@ contract SARound2Test is SATestBase {
     function test_M4_Sibling_OscillationAndAutoClear() public {
         (address a,) = _withHype(ALICE_PK, 20_000e6);
         uint256 p0 = module.lastPrice();
+        // SA-4 M-1: each move takes one poolBandBps step per minPriceStable (_reportTo)
         for (uint256 i; i < 10; ++i) {
             _moveTo(p0 * 104 / 100);
-            _report();
+            _reportTo();
             _moveTo(p0);
-            _report();
+            _reportTo();
         }
         _moveTo(p0 * 108 / 100);
-        _report(); // 80% of absolute moves in a day, 8% net: applied
+        _reportTo(); // 80% of absolute moves in a day, 8% net: applied
         assertEq(module.lastPrice(), poolPrice());
         assertFalse(module.lastPriceClipped());
         _stable();
         vm.prank(keeper);
         module.sendHedgeMargin(a, 100e6);
         _moveTo(p0 * 113 / 100);
-        _report();
+        _reportTo();
         assertTrue(module.lastPriceClipped());
         assertLe(module.lastPrice(), p0 * 110 / 100, "at most the 24 h low x 1.1");
         vm.prank(keeper);
         module.sendHedgeMargin(a, 100e6); // SA-3 M-7: needs a recent report, not an unclipped anchor
         _moveTo(p0 * 1095 / 1000);
-        _report();
+        _reportTo();
         assertFalse(module.lastPriceClipped(), "auto-clears");
     }
 

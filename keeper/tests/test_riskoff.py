@@ -250,12 +250,45 @@ def test_keeper_exit_burns_then_sells_within_exit_window(tmp_path):
     assert not any(fn in ("mintPosition", "increasePosition", "sendHedgeMargin") for fn, _ in k.calls)
 
 
+def _turnover_bps(k, bps):
+    g0 = k.r.global_snap
+
+    def g():
+        x = g0()
+        x.params["swapTurnoverBps"] = bps
+        return x
+    k.r.global_snap = g
+
+
 def test_keeper_exit_limited_by_exit_room(tmp_path):
+    turn = 1000 * E6 * 5000 // 10_000  # the turnover window at the pilot 5000 bps
     acct = snap(positions=[], native=20 * E18, usdc=200 * E6, value=1000 * E6,
-                windows={"turnoverUsed": 0, "exitUsed": 900 * E6})  # 100 USDC of the 1x exit window left
+                windows={"turnoverUsed": turn, "exitUsed": 900 * E6})  # 100 USDC of the 1x exit window left
     k = ro_keeper(tmp_path, acct)
+    _turnover_bps(k, 5000)
     k.account_tick(ACCOUNT, 40_000_000, k.r.global_snap(), NOW, 0.12)
     assert k.sold[0][1] == 98 * E6 * E18 // 40_000_000  # 98% of the room, in HYPE
+
+
+def test_keeper_exit_falls_back_to_turnover_room(tmp_path):
+    """SA-4 L-6: an exit sale beyond the exit window is charged to the turnover window on chain; the keeper counts
+    both rooms."""
+    acct = snap(positions=[], native=20 * E18, usdc=200 * E6, value=1000 * E6,
+                windows={"turnoverUsed": 400 * E6, "exitUsed": 900 * E6})
+    k = ro_keeper(tmp_path, acct)
+    _turnover_bps(k, 5000)  # 500 of turnover, 100 left
+    k.account_tick(ACCOUNT, 40_000_000, k.r.global_snap(), NOW, 0.12)
+    assert k.sold[0][1] == 196 * E6 * E18 // 40_000_000  # 98% of (100 exit + 100 turnover)
+
+
+def test_keeper_7702_keeps_gas_reserve(tmp_path):
+    """SA-4 L-7 (1241): a 7702 account keeps native HYPE for its own gas."""
+    acct = snap(positions=[], native=10 * E18, usdc=600 * E6, value=1000 * E6,
+                windows={"turnoverUsed": 0, "exitUsed": 0})
+    acct.kind = "eip7702"
+    k = ro_keeper(tmp_path, acct)
+    k.account_tick(ACCOUNT, 40_000_000, k.r.global_snap(), NOW, 0.12)
+    assert k.sold[0][1] == 10 * E18 - int(k.sa.eip7702_gas_reserve_hype * E18)
 
 
 def test_keeper_hedged_keeps_hedge_until_hype_sold(tmp_path):

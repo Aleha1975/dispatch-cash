@@ -350,6 +350,27 @@ abstract contract SATestBase is Test {
         }
     }
 
+    /// SA-4 M-1: report `p` `n` times, one minPriceStable apart (one anchor step of at most poolBandBps each).
+    function _reportSteps(uint256 p, uint256 n) internal {
+        (,,,,,,,,, uint32 st,) = module.params();
+        for (uint256 i; i < n; ++i) {
+            vm.warp(vm.getBlockTimestamp() + st);
+            vm.prank(keeper);
+            module.reportPrice(p);
+        }
+    }
+
+    /// Report the pool price until the anchor reaches it (SA-4 M-1: one step per minPriceStable), then wait stable.
+    function _reportTo() internal {
+        (,,,,,,,,, uint32 st,) = module.params();
+        uint256 p = poolPrice();
+        for (uint256 i; i < 20 && module.lastPrice() != p; ++i) {
+            if (vm.getBlockTimestamp() < module.lastPriceMoved() + st) vm.warp(module.lastPriceMoved() + st);
+            vm.prank(keeper);
+            module.reportPrice(p);
+        }
+    }
+
     function _report() internal {
         uint256 p = poolPrice();
         vm.prank(keeper);
@@ -596,15 +617,21 @@ abstract contract SATestBase is Test {
                     owned = true;
                 }
             } catch {}
-            (uint128 old, uint256 g0, uint256 g1) = module.snapPos(ps[i].tokenId);
-            (uint128 pmLiq, uint256 l0, uint256 l1) = PM.getPositionInfo(
+            (uint128 old, uint256 g0, uint256 g1, uint256 G0, uint256 G1) = module.snapPos(ps[i].tokenId);
+            (, uint256 l0, uint256 l1) = PM.getPositionInfo(
                 key.toId(), POSM_ADDR, ps[i].tickLower, ps[i].tickUpper, bytes32(ps[i].tokenId)
             );
-            uint128 n = owned ? (liq < old ? liq : old) : 0;
-            if (pmLiq == 0) n = old;
+            (uint256 gg0, uint256 gg1) = PM.getFeeGrowthGlobals(key.toId());
+            // SA-4 H-1: only an owned, unchanged position; only up to the global growth; at most the idle surplus
+            uint128 n = owned && liq == old ? old : 0;
             unchecked {
-                sb += int256(FullMath.mulDiv(l0 - g0, n, 1 << 128));
-                sa += int256(FullMath.mulDiv(l1 - g1, n, 1 << 128));
+                if (l0 - g0 > gg0 - G0 || l1 - g1 > gg1 - G1) n = 0;
+                int256 cb = int256(FullMath.mulDiv(l0 - g0, n, 1 << 128));
+                int256 ca = int256(FullMath.mulDiv(l1 - g1, n, 1 << 128));
+                int256 rb = int256(a.balance) - sb;
+                int256 ra = int256(usdc.balanceOf(a)) - sa;
+                sb += rb <= 0 ? int256(0) : (cb > rb ? rb : cb);
+                sa += ra <= 0 ? int256(0) : (ca > ra ? ra : ca);
             }
             f += int256(V4PositionMath.liquidityValue(ps[i].tickLower, ps[i].tickUpper, liq, ref, true))
                 - int256(V4PositionMath.liquidityValue(ps[i].tickLower, ps[i].tickUpper, old, ref, true));

@@ -25,7 +25,8 @@ import {TimelockController} from "@openzeppelin/contracts/governance/TimelockCon
 ///         - A ready operation expires `GRACE_PERIOD` (7 days) after it became executable, and no single operation
 ///           may be scheduled with a delay above MAX_DELAY (SA-3 L-12): levers cannot be stockpiled and fired later.
 ///           An expired operation stays "ready" in the stock views; `isExpired` tells, and a cancel frees its id.
-///         - The proposer role cannot be renounced (SA-3 L-13: a renounce would freeze ownership for good).
+///         - The proposer and executor roles cannot be renounced (SA-3 L-13, SA-4 L-11: a renounce would freeze
+///           ownership for good).
 ///
 ///         The guardian's `setPaused(true)` on the vault stays instant (the guardian calls the vault directly).
 contract VaultTimelock is TimelockController {
@@ -136,7 +137,9 @@ contract VaultTimelock is TimelockController {
     }
 
     function renounceRole(bytes32 role, address account) public override {
-        if (role == PROPOSER_ROLE) revert NoRenounce();
+        // SA-3: the proposer; SA-4 L-11: the executor too (the timelock is its own admin: renouncing either role
+        // would freeze every later operation, including the grantRole that could repair it)
+        if (role == PROPOSER_ROLE || role == EXECUTOR_ROLE) revert NoRenounce();
         super.renounceRole(role, account);
     }
 

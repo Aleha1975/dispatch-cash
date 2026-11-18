@@ -201,6 +201,17 @@ class AccountSnap:
     hedge_time: int = 0
     pending: int = 0  # live state - snapshot at the anchor: a client flow not booked yet (SA-2: booked at a trusted sync)
     value_pool: int = 0  # accountValue at the pool price (margin sends cap on min(value, value_pool))
+    priced_flow_time: int = 0  # SA-4 M-2: last booking of a price-dependent client flow; the fee waits a day after it
+
+    @property
+    def excess_equity(self) -> int:
+        """SA-4 M-3: hedge equity above the net margin sent counts for no keeper budget and no fee (SABook.nav)."""
+        return max(0, self.hedge_equity - self.net_margin)
+
+    @property
+    def nav(self) -> int:
+        """SABook.nav at the anchor: the value the turnover / exit / hedge-step windows and the fee are measured on."""
+        return self.value - self.excess_equity
 
     @property
     def profit(self) -> int:
@@ -210,8 +221,14 @@ class AccountSnap:
     @property
     def fee_profit(self) -> int:
         """The profit chargeFee measures (SA-3 M-3): value at the anchor - contributed, after the sync inside
-        chargeFee has booked the pending flow at that same anchor (so - pending)."""
-        return self.value - self.contributed - self.pending
+        chargeFee has booked the pending flow at that same anchor (so - pending); SA-4 M-3: without hedge equity
+        above the net margin sent."""
+        return self.nav - self.contributed - self.pending
+
+    @property
+    def keeper_return_cap(self) -> int:
+        """SA-4 M-3 (LPManagerModule.returnHedgeMargin): the keeper returns at most min(hedge equity, net margin)."""
+        return min(self.hedge_equity, self.net_margin)
 
     def lp_amounts(self, sqrt_price: int):
         from . import v4math as M
@@ -276,7 +293,7 @@ PRICE_BUDGET_KEYS = ["priceApprovedLo", "priceApprovedHi", "priceApprovedUntil"]
 # SALib.Account field order (LPManagerModule.account(a))
 ACCOUNT_KEYS = ["delegationHash", "owner", "kind", "until", "revoked", "hedgeClipped", "contributed", "hwm",
                 "hedgeEquity", "netMargin", "hedgeEpoch", "snapAsset", "snapBase", "lastFeeTime", "feesPaid",
-                "hedgeTime"]
+                "hedgeTime", "pricedFlowTime"]
 PARAM_KEYS = ["feeBps", "hedgeCapBps", "poolBandBps", "maxSlippageBps", "hedgeStepBps", "refDriftBps",
               "swapTurnoverBps", "feeInterval", "maxPriceAge", "minPriceStable", "exitTurnoverBps"]
 
@@ -346,7 +363,7 @@ class ModuleReader:
             value=c("accountValue", a, price), budgets=dict(zip(BUDGET_KEYS, c("budgets", a)[2:])),
             windows=dict(zip(WINDOW_KEYS, c("windows", a))), owner=to_checksum_address(s["owner"]),
             revoked=s["revoked"], hedge_clipped=s["hedgeClipped"], hedge_time=s["hedgeTime"],
-            value_pool=c("accountValue", a, c("poolPrice")))
+            value_pool=c("accountValue", a, c("poolPrice")), priced_flow_time=s.get("pricedFlowTime", 0))
         snap.pending = self.pending(snap, s, price)
         return snap
 
@@ -354,24 +371,29 @@ class ModuleReader:
         """Live state - snapshot at `price` (SABook.sync's flow): idle deltas plus the liquidity deltas of the
         tracked positions, each valued with V4PositionMath.liquidityValue's formula. SA-3: LP fees paid out of a
         tracked position since the books' last look (PoolManager feeGrowthInsideLast - the module's mark, times the
-        booked liquidity) are yield, added to the snapshot first. A few wei of rounding apart."""
+        booked liquidity) are yield, added to the snapshot first. SA-4 H-1: only for a position still owned with the
+        books' liquidity, only up to the pool's global fee growth since the mark, and never above the idle surplus
+        over the snapshot. A few wei of rounding apart."""
         from . import v4math as M
         sp = math.isqrt(price * (1 << 192) // 10**18)
         snap_asset, snap_base = s["snapAsset"], s["snapBase"]
         marks = {}
+        gg0, gg1 = self.fee_growth_globals() if snap.positions else (0, 0)
         for p in snap.positions:
-            old, g0, g1 = self.m.call("snapPos", p.token_id)
+            old, g0, g1, G0, G1 = self.m.call("snapPos", p.token_id)
             marks[p.token_id] = old
-            pm_liq, l0, l1 = self.position_info(p)
+            _, l0, l1 = self.position_info(p)
             try:
                 owned = to_checksum_address(self.posm.call("ownerOf", p.token_id)) == snap.address
             except Exception:  # burned
                 owned = False
-            n = min(p.liquidity, old) if owned else 0
-            if pm_liq == 0:
-                n = old
-            snap_base += ((l0 - g0) % (1 << 256)) * n >> 128
-            snap_asset += ((l1 - g1) % (1 << 256)) * n >> 128
+            n = old if owned and p.liquidity == old else 0
+            d0, d1 = (l0 - g0) % (1 << 256), (l1 - g1) % (1 << 256)
+            if d0 > (gg0 - G0) % (1 << 256) or d1 > (gg1 - G1) % (1 << 256):
+                n = 0  # PoolManager re-based the position (a cleared tick): nothing counted
+            cb, ca = d0 * n >> 128, d1 * n >> 128
+            snap_base += max(0, min(cb, snap.native - snap_base))
+            snap_asset += max(0, min(ca, snap.usdc - snap_asset))
         f = snap.usdc - snap_asset
         db = snap.native - snap_base
         f += db * price // 10**18 if db >= 0 else -((-db * price + 10**18 - 1) // 10**18)
@@ -383,6 +405,11 @@ class ModuleReader:
                     x, y = M.amounts_for_liquidity(sp, sa_, sb, liq)
                     f += sign * (y + x * price // 10**18)
         return f
+
+    def fee_growth_globals(self) -> tuple[int, int]:
+        """PoolManager feeGrowthGlobal{0,1}X128 of the pool (StateLibrary: pools[id] slot + 1, + 2)."""
+        base = int.from_bytes(self.slot0_key, "big")
+        return tuple(int.from_bytes(self.pm.call("extsload", (base + i).to_bytes(32, "big")), "big") for i in (1, 2))
 
     def position_info(self, p: "APos"):
         """PoolManager.getPositionInfo for the POSM-owned position `p` (liquidity, feeGrowthInside0/1 last), read

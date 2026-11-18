@@ -51,6 +51,7 @@ from .sa_chain import BOOK_BAND_BPS, AccountSnap, GlobalSnap, ModuleReader, hybr
 
 BPS = 10_000
 E18 = 10 ** 18
+FEE_FLOW_WAIT_S = 86400  # SA-4 M-2: LPManagerModule.chargeFee waits a day after a price-dependent client flow
 SWAP_MIN_OUT_SLACK_BPS = 30  # minOut = the simulated output less this (the module floor still applies)
 
 
@@ -345,11 +346,18 @@ class SAKeeper:
         stale = now - g.last_price_time >= min(self.sa.report_every_s, g.params["maxPriceAge"] // 2,
                                                g.params["minPriceStable"] * 2 // 5)
         if price != g.last_price or stale or g.clipped:
+            before = g
             self.act("reportPrice", price)
             g = self.r.global_snap()
             if g.clipped:
-                self.alert("warn", "anchor_budget", f"anchor clipped at {g.last_price / 1e6:.4f} (wanted "
-                                                    f"{price / 1e6:.4f}); guardian: approvePrice(lo, hi, deadline)")
+                # SA-4 M-1: the anchor moves one poolBandBps step per minPriceStable; only an anchor that did not move
+                # although its last move was stable is held by the 24 h budget (a guardian matter)
+                stable = now >= before.last_price_moved + g.params["minPriceStable"]
+                if g.last_price == before.last_price and stable:
+                    self.alert("warn", "anchor_budget", f"anchor clipped at {g.last_price / 1e6:.4f} (wanted "
+                                                        f"{price / 1e6:.4f}); guardian: approvePrice(lo, hi, deadline)")
+                else:
+                    self.log("anchor_stepping", anchor=g.last_price, wanted=price)
         return price, g
 
     # ------------------------------------------------------------ per account
@@ -392,14 +400,21 @@ class SAKeeper:
         if not self.r.global_snap().trusted(self.now()):
             self.log("riskoff_sell_waits_trusted", account=a)
             return s
-        room = max(0, s.value * int(g.params.get("exitTurnoverBps", 0)) // BPS - int(s.windows.get("exitUsed", 0)))
-        amt = min(s.native, int(room * 98 // 100) * E18 // price)
+        room = max(0, s.nav * int(g.params.get("exitTurnoverBps", 0)) // BPS - int(s.windows.get("exitUsed", 0)))
+        # SA-4 L-6: an exit sale beyond the exit window falls back to the turnover window
+        room += max(0, s.nav * g.params["swapTurnoverBps"] // BPS - s.windows["turnoverUsed"])
+        amt = min(s.native - self.gas_reserve(s), int(room * 98 // 100) * E18 // price)
         if amt <= min_amt:
             self.log("riskoff_sell_no_room", account=a, room=room / 1e6, hype=s.native / E18)
             return s
         sold = self.swap(a, True, amt, price)
         self.log("riskoff_sold", account=a, hype=sold / E18, left=(s.native - sold) / E18)
         return self.r.account(a)
+
+    def gas_reserve(self, s: AccountSnap) -> int:
+        """SA-4 L-7 (1241): a 7702 account pays its own gas in native HYPE (revoke, withdrawals): never sell or
+        deploy the last `eip7702_gas_reserve_hype` of it."""
+        return int(self.sa.eip7702_gas_reserve_hype * E18) if s.kind == "eip7702" else 0
 
     def account_tick(self, a: str, price: int | None, g: GlobalSnap, now: int, hw: float):
         s = self.r.account(a)
@@ -526,7 +541,7 @@ class SAKeeper:
             x, y = s.lp_amounts(sp)
             need = rerange_charge(x * price // E18 + y, tick, (p0.tl, p0.tu), S.range_ticks(price, hw, self.spacing),
                                   g.params["maxSlippageBps"], g.params["poolBandBps"])
-            room = max(0, s.value * g.params["swapTurnoverBps"] // BPS - s.windows["turnoverUsed"])
+            room = max(0, s.nav * g.params["swapTurnoverBps"] // BPS - s.windows["turnoverUsed"])
             if need > room * 0.9 or not g.trusted(self.now()):
                 self.log("rerange_postponed", account=a, why=why, need=need / 1e6, room=room / 1e6)
                 why = None
@@ -550,7 +565,8 @@ class SAKeeper:
         buffer = s.value * self.sa.buffer_bps // BPS
         margin_left = max(0, int(s.value * self.sa.margin_frac) - max(s.hedge_equity, s.net_margin)) if hedged else 0
         free = max(0, s.usdc - buffer - margin_left)
-        hv = s.native * price // E18
+        native = max(0, s.native - self.gas_reserve(s))
+        hv = native * price // E18
         v = free + hv
         if v < self.sa.min_deploy_usd * 1e6:
             return
@@ -562,7 +578,7 @@ class SAKeeper:
             self.swap(a, True, (hv - target_hv) * E18 // price, price)
         s = self.r.account(a)
         sp, _ = self.r.slot0()
-        a0, a1 = s.native, max(0, s.usdc - buffer - margin_left)
+        a0, a1 = max(0, s.native - self.gas_reserve(s)), max(0, s.usdc - buffer - margin_left)
         sa_, sb = M.sqrt_price_at_tick(tl), M.sqrt_price_at_tick(tu)
         liq = M.liquidity_for_amounts(sp, sa_, sb, a0 * 995 // 1000, a1 * 995 // 1000)
         u0, u1 = M.amounts_for_liquidity(sp, sa_, sb, liq)
@@ -570,7 +586,7 @@ class SAKeeper:
         if liq <= 0 or val < self.sa.min_deploy_usd * 1e6:
             return
         # sliding 24 h window (SAWindow): capacity returns 24-27 h after use, no decay
-        room = max(0, s.value * g.params["swapTurnoverBps"] // BPS - s.windows["turnoverUsed"])
+        room = max(0, s.nav * g.params["swapTurnoverBps"] // BPS - s.windows["turnoverUsed"])
         charge = S.add_charge(val, g.params["poolBandBps"], g.params["maxSlippageBps"])
         if charge > room * 0.98:
             k = room * 0.98 / charge if charge else 0.0
@@ -593,6 +609,13 @@ class SAKeeper:
     def fee(self, a: str, g: GlobalSnap, now: int):
         s = self.r.account(a)
         if now < s.last_fee_time + g.params["feeInterval"]:
+            return
+        if s.pending and g.trusted(now):
+            # SA-4 M-2: book the client flow first (chargeFee's own sync would book it and then refuse the fee)
+            self.act("sync", a)
+            s = self.r.account(a)
+        if now < s.priced_flow_time + FEE_FLOW_WAIT_S:
+            self.log("fee_waits_flow", account=a, until=s.priced_flow_time + FEE_FLOW_WAIT_S)
             return
         if not g.trusted(now):
             # SA-2: chargeFee needs a fresh, unclipped anchor within the pool band that has not changed for
@@ -697,15 +720,16 @@ class SAKeeper:
             self.log("client_closed", account=a)
             return
         avail = min(g.treasury_usdc, g.treasury_allowance)
-        # SA-1 H-1: the keeper may return at most the account's on-chain hedge equity; always into the account
-        amt = min(eq, avail, s.hedge_equity)
+        # SA-1 H-1 / SA-4 M-3: the keeper may return at most min(on-chain hedge equity, net margin sent); always into
+        # the account
+        amt = min(eq, avail, s.keeper_return_cap)
         if amt >= 10 ** 6:
             self.act("returnHedgeMargin", a, amt)
             self.ledger.margin_returned(a, amt / 1e6)
             self.log("margin_returned", account=a, to=a, usdc=amt / 1e6)
         if eq - amt >= 10 ** 6:
-            why = "on-chain hedge equity is lower: the treasury itself calls returnHedgeMargin" \
-                if s.hedge_equity < eq else "withdraw from HL to the treasury first"
+            why = "on-chain hedge equity / net margin is lower (hedge profit): the treasury itself calls " \
+                  "returnHedgeMargin" if s.keeper_return_cap < eq else "withdraw from HL to the treasury first"
             self.alert("warn", f"exit_margin_{a}", f"MANUAL: {(eq - amt) / 1e6:.2f} USDC of "
                                                    f"{'exited' if close else 'unhedged'} client {a} still "
                                                    f"to return into the account ({why})")

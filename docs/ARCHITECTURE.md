@@ -140,8 +140,12 @@ charge).
   window shortly before. It would take 2-3 days, which defeats the purpose.
 - **Re-entry**: 0.97 × (0.48 + 0.5) ≈ 0.95 of value, i.e. 2 days at 5000. This is acceptable: the market is calm and the
   minimum time out is 24 h anyway.
-- At the deploy default of 20000 everything fits one day. That default quadruples the stolen-keeper bound for every
-  swap, which is why the pilot lowers it.
+- At 20000 everything would fit one day, at four times the stolen-keeper bound for every swap, which is why the pilot
+  runs 5000. SA-4 L-12: `script/DeploySA.s.sol` now deploys the pilot values (5000 / 10000) and reads `params()` back.
+- SA-4 L-6: an exit sale that does not fit the exit window (or with the exit window off) is charged to the turnover
+  window instead of reverting. SA-4 M-1: the anchor moves at most one `poolBandBps` step per `minPriceStable`, so in a
+  fast fall the exit sale waits until the anchor has caught up (about 5 minutes per 1.5%) or the guardian approves a
+  range; the exit sale is never available on an untrusted anchor or while paused (SA-4 M-4 decision).
 
 ### The change (implemented, `src/sa`, folded into audit round 4)
 
@@ -271,7 +275,8 @@ path for the pilot and round 4.** Consider `bookExternalMargin` for a later roun
 
 1. Audit round 4 including the R4 exit window (`docs/audit_sa_round4.txt`), then deploy (module with `exitTurnoverBps`,
    enforcer, executor) and fill `web/config.js`.
-2. Pilot Params: `swapTurnoverBps` 5000, `exitTurnoverBps` 10000. Re-check the page's manual minimum (turnover floor).
+2. Pilot Params: `swapTurnoverBps` 5000, `exitTurnoverBps` 10000 (deployed by the script and read back, SA-4 L-12).
+   Re-check the page's manual minimum (turnover floor).
 3. Guardian bot: pause on an anchor/HL gap, **and automatic `approvePrice` after a > 10%/24 h move** (risk-off exits and
    re-ranges stall without it).
 4. Server: API + keeper units, `sa-requests/` (+ `strategy/`), `sa-status/`, the nginx include. The keeper needs outbound

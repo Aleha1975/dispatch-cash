@@ -535,29 +535,52 @@ contract SARegressionsTest is SATestBase {
     /// costs nothing, a net move is held against the budget for 24-27 h), and the hedge step.
     function test_M7_Sibling_AnchorWindowBothWays() public {
         uint256 p0 = module.lastPrice();
+        // SA-4 M-1: every move is walked one poolBandBps step per minPriceStable (_reportTo)
         _moveTo(p0 * 105 / 100);
-        _report();
+        _reportTo();
         _moveTo(p0);
-        _report(); // 5% up and back: the trailing range is 5%
+        _reportTo(); // 5% up and back: the trailing range is 5%
         vm.warp(vm.getBlockTimestamp() + 23 hours);
         _moveTo(p0 * 103 / 100);
-        _report(); // within [high / 1.1, low * 1.1]: applied
+        _reportTo(); // within [high / 1.1, low * 1.1]: applied
         assertFalse(module.lastPriceClipped());
         assertEq(module.lastPrice(), poolPrice());
         // a net move: low p0, so the anchor may not exceed p0 * 1.1 inside the window
         _moveTo(p0 * 109 / 100);
-        _report();
+        _reportTo();
         _moveTo(p0 * 112 / 100);
         uint256 p = poolPrice();
-        vm.prank(keeper);
-        module.reportPrice(p);
+        _reportTo();
         assertTrue(module.lastPriceClipped());
         assertApproxEqRel(module.lastPrice(), p0 * 110 / 100, 0.001e18);
         // once the low of p0 has left the window (24-27 h after it was last held), the anchor follows
         vm.warp(vm.getBlockTimestamp() + 27 hours);
+        _reportTo();
+        assertEq(module.lastPrice(), p);
+    }
+
+    /// SA-4 M-1 regression (both reports' trace): one keeper report moves the anchor at most poolBandBps, and a
+    /// second move waits until the first is stable. A full refDriftBps walk takes about seven stable windows.
+    function test_SA4_M1_OneStepPerStableWindow() public {
+        uint256 p0 = module.lastPrice();
+        _moveTo(p0 * 9091 / 10000); // the pool pushed down to the drift limit (about -9.1%)
+        uint256 p = poolPrice();
+        vm.warp(vm.getBlockTimestamp() + 300);
         vm.prank(keeper);
         module.reportPrice(p);
+        uint256 a1 = module.lastPrice();
+        assertApproxEqRel(a1, p0 * 9850 / 10000, 1e14, "one band step, not the whole drift budget");
+        vm.prank(keeper);
+        module.reportPrice(p); // same second: no further move until the step is stable
+        assertEq(module.lastPrice(), a1);
+        vm.warp(vm.getBlockTimestamp() + 299);
+        vm.prank(keeper);
+        module.reportPrice(p);
+        assertEq(module.lastPrice(), a1, "still inside minPriceStable");
+        uint256 n = 1;
+        for (; n < 20 && module.lastPrice() != p; ++n) _reportSteps(p, 1);
         assertEq(module.lastPrice(), p);
+        assertGe(n, 7, "about seven confirmed steps for a 9% walk");
     }
 
     function test_M7_Sibling_HedgeStepSlidingWindow() public {
@@ -575,8 +598,8 @@ contract SARegressionsTest is SATestBase {
     }
 
     /// Sibling: a guardian price range is one-shot and charged; validated; cleared by pause and guardian change.
-    /// SA-2 I-7 / M-4: a move that fits the keeper's own room does not use (or burn) the range; a move beyond it is
-    /// applied unclipped, consumes the range and charges only the room that was left.
+    /// SA-4 L-4: the first report inside an open range consumes it; a report beyond the keeper's room (budget or
+    /// SA-4 M-1 step) is applied unclipped and starts a new window.
     function test_M7_Sibling_GuardianRangeOneShot() public {
         uint256 p0 = module.lastPrice();
         vm.startPrank(guardian);
@@ -588,14 +611,19 @@ contract SARegressionsTest is SATestBase {
         module.approvePrice(1, 2, block.timestamp + 1 days + 1);
         module.approvePrice(p0 / 2, p0 * 2, block.timestamp + 1 hours);
         vm.stopPrank();
-        _moveTo(p0 * 108 / 100);
-        _report(); // fits the 10% room: the range is not used
+        _moveTo(p0 * 101 / 100);
+        vm.warp(vm.getBlockTimestamp() + 300);
+        _report(); // fits the keeper's room (one step): applied as is
+        assertEq(module.lastPrice(), poolPrice());
         assertFalse(module.lastPriceClipped());
         (,, uint256 until,) = module.priceBudget();
-        assertGt(until, 0, "a routine report does not burn the approval");
+        assertEq(until, 0, "SA-4 L-4: the first report inside the range consumes it, clipped or not");
         (,, uint256 pu,) = module.windows(address(0));
-        assertGt(pu, 0.07e18, "the trailing range");
+        assertGt(pu, 0.009e18, "the trailing range");
+        vm.prank(guardian);
+        module.approvePrice(p0 / 2, p0 * 2, block.timestamp + 1 hours);
         _moveTo(p0 * 125 / 100);
+        vm.warp(vm.getBlockTimestamp() + 300);
         _report(); // beyond the room: the range applies it unclipped and is consumed
         assertApproxEqRel(module.lastPrice(), p0 * 125 / 100, 0.001e18);
         assertFalse(module.lastPriceClipped());
@@ -604,11 +632,11 @@ contract SARegressionsTest is SATestBase {
         (,, pu,) = module.windows(address(0));
         assertEq(pu, 0, "SA-3: an approved level starts a new window, it does not consume the keeper's room");
         _moveTo(p0 * 130 / 100);
-        _report(); // +4% from the approved level: inside the new window
+        _reportTo(); // +4% from the approved level: inside the new window (walked in steps, SA-4 M-1)
         assertApproxEqRel(module.lastPrice(), p0 * 130 / 100, 0.001e18);
         assertFalse(module.lastPriceClipped());
         _moveTo(p0 * 139 / 100);
-        _report(); // +11.2% from the approved level: clipped at +10%
+        _reportTo(); // +11.2% from the approved level: clipped at +10%
         assertApproxEqRel(module.lastPrice(), p0 * 1375 / 1000, 0.001e18);
         assertFalse(module.lastPriceClipped(), "within the band of the report");
         // cleared by a pause

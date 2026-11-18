@@ -62,7 +62,7 @@ const MODULE_ABI = parseAbi([
   'struct Caveat { address enforcer; bytes terms; bytes args; }',
   'struct Delegation { address delegate; address delegator; bytes32 authority; Caveat[] caveats; uint256 salt; bytes signature; }',
   'struct Position { uint256 tokenId; int24 tickLower; int24 tickUpper; }',
-  'struct Account { bytes32 delegationHash; address owner; uint8 kind; uint64 until; bool revoked; bool hedgeClipped; int256 contributed; int256 hwm; uint256 hedgeEquity; uint256 netMargin; uint256 hedgeEpoch; int256 snapAsset; int256 snapBase; uint256 lastFeeTime; uint256 feesPaid; uint256 hedgeTime; }',
+  'struct Account { bytes32 delegationHash; address owner; uint8 kind; uint64 until; bool revoked; bool hedgeClipped; int256 contributed; int256 hwm; uint256 hedgeEquity; uint256 netMargin; uint256 hedgeEpoch; int256 snapAsset; int256 snapBase; uint256 lastFeeTime; uint256 feesPaid; uint256 hedgeTime; uint256 pricedFlowTime; }',
   'function account(address) view returns (Account)',
   'function revoke(address)',
   'function accountValue(address, uint256) view returns (uint256)',
@@ -70,7 +70,7 @@ const MODULE_ABI = parseAbi([
   'function isActive(address) view returns (bool)',
   'function positionsOf(address) view returns (Position[])',
   'function permissionContext(address) view returns (bytes)',
-  'function params() view returns (uint16 feeBps, uint16 hedgeCapBps, uint16 poolBandBps, uint16 maxSlippageBps, uint16 hedgeStepBps, uint16 refDriftBps, uint32 swapTurnoverBps, uint32 feeInterval, uint32 maxPriceAge, uint32 minPriceStable)',
+  'function params() view returns (uint16 feeBps, uint16 hedgeCapBps, uint16 poolBandBps, uint16 maxSlippageBps, uint16 hedgeStepBps, uint16 refDriftBps, uint32 swapTurnoverBps, uint32 feeInterval, uint32 maxPriceAge, uint32 minPriceStable, uint16 exitTurnoverBps)',
   'function paused() view returns (bool)',
 ]);
 const DELEGATION_COMPONENTS = [

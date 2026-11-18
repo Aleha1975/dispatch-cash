@@ -143,6 +143,7 @@ class SACfg:
     api_recommend_stale_s: int = 7200
     # ---- risk-off product (riskoff.py, docs/ARCHITECTURE.md): accounts whose Strategy has riskOff = true
     riskoff_min_out_s: int = 86400  # once out, stay out at least this long
+    eip7702_gas_reserve_hype: float = 0.05  # SA-4 L-7: native HYPE a 7702 account keeps for its own gas (revoke, exit)
     riskoff_use_rv: bool = False  # also go out when HYPE 7 d Parkinson vol > its monthly q80
     riskoff_refresh_s: int = 900  # re-fetch the 4 h candles at most this often (and when a new bar has closed)
     riskoff_btc_coin: str = "BTC"

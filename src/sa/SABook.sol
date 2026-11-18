@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
@@ -35,23 +36,30 @@ library SABook {
 
     event Flow(address indexed account, int256 value);
 
-    /// @notice Per tracked position: the liquidity the books account for and (SA-3 M-1) PoolManager's
-    ///         feeGrowthInside{0,1}LastX128 of the position as of the books' last look (after a module modify, or a sync).
+    /// @notice Per tracked position: the liquidity the books account for, (SA-3 M-1) PoolManager's
+    ///         feeGrowthInside{0,1}LastX128 of the position and (SA-4 H-1) the pool's feeGrowthGlobal{0,1}X128, both as
+    ///         of the books' last look (after a module modify, or a sync).
     struct Pos {
         uint128 liq;
         uint256 g0;
         uint256 g1;
+        uint256 G0;
+        uint256 G1;
     }
 
     /// @notice Book live state - snapshot as a client flow at `price` and move the snapshot to the live state.
     ///         First, at every sync (also while the anchor is not trusted; it needs no price): LP fees that left a
-    ///         tracked position outside a module action (the client's own collect, increase, decrease or burn) are
-    ///         added to the snapshot, exactly as the module books its own collects, so they stay yield and never
-    ///         become a contribution (SA-3 M-1). They are (feeGrowthInsideLast now - at the books' last look) x the
-    ///         liquidity the books account for, floored by the live liquidity (a client change in between can only
-    ///         make this smaller); a position the client transferred out counts nothing (both in the client's favour).
+    ///         tracked position outside a module action (the client's own collect) are added to the snapshot, exactly
+    ///         as the module books its own collects, so they stay yield and never become a contribution (SA-3 M-1).
+    ///         SA-4 H-1 / L-1 / L-2: only for a position nobody changed since the mark (still owned, PoolManager and
+    ///         the books on the same liquidity), only up to the pool's global fee growth over the same interval (a
+    ///         larger or wrapped difference means PoolManager re-based the position: a tick was cleared and set up
+    ///         again) and never more than the idle balance holds above the snapshot. Every guard can only LOWER the
+    ///         yield counted (a client modify's fees then become a contribution: our fee lower).
     ///         Then, `price` = 0 (anchor not trusted): nothing else is booked or moved; the flow stays pending.
     ///         Positions the account no longer owns are dropped (their snapshot liquidity is an outflow).
+    ///         SA-4 M-2: a booked flow with a price-dependent term (idle base, position liquidity) stamps
+    ///         `pricedFlowTime`; the fee waits a day after it.
     function sync(
         SALib.Account storage s,
         V4PositionMath.Position[] storage ps,
@@ -68,9 +76,10 @@ library SABook {
             Pos storage q = pos[p.tokenId];
             (uint128 liq, bool owned) = _liquidityOf(v.posm, a, p.tokenId);
             uint128 old = q.liq;
-            _feesOut(s, q, v, p, owned ? (liq < old ? liq : old) : 0, old);
+            _feesOut(s, q, v, a, p, owned && liq == old ? old : 0);
             if (price == 0) continue;
             if (liq != old) {
+                s.pricedFlowTime = block.timestamp; // SA-4 M-2
                 // forge-lint: disable-next-line(unsafe-typecast)
                 f += int256(V4PositionMath.liquidityValue(p.tickLower, p.tickUpper, liq, price, v.baseIsCurrency0))
                     // forge-lint: disable-next-line(unsafe-typecast)
@@ -89,6 +98,7 @@ library SABook {
         int256 x = int256(IERC20(v.asset).balanceOf(a));
         int256 b = int256(_bal(v.base, a));
         f += x - s.snapAsset + _mul(b - s.snapBase, price);
+        if (b != s.snapBase) s.pricedFlowTime = block.timestamp;
         s.snapAsset = x;
         s.snapBase = b;
         if (f != 0) {
@@ -97,27 +107,47 @@ library SABook {
         }
     }
 
-    /// @dev SA-3 M-1: fees paid out of position `p` since the books' last look, for liquidity `n` (owned: min(live,
-    ///      snapshot); burned by the client: the snapshot; transferred out: 0), added to the snapshot as yield.
-    function _feesOut(SALib.Account storage s, Pos storage q, SALib.Venue storage v, V4PositionMath.Position memory p, uint128 n, uint128 old)
+    /// @dev SA-3 M-1: fees paid out of position `p` since the books' last look, for liquidity `n` (the snapshot when
+    ///      the position is owned and unchanged, else 0), added to the snapshot as yield. SA-4 H-1: the difference of
+    ///      the position's fee mark is credited only while it does not exceed the pool's global growth since the mark
+    ///      (inside growth on one basis never does), and the credit never exceeds the idle surplus above the snapshot.
+    function _feesOut(SALib.Account storage s, Pos storage q, SALib.Venue storage v, address a, V4PositionMath.Position memory p, uint128 n)
         private
     {
-        (uint128 pmLiq, uint256 l0, uint256 l1) =
+        (, uint256 l0, uint256 l1) =
             v.pm.getPositionInfo(v.id, address(v.posm), p.tickLower, p.tickUpper, bytes32(p.tokenId));
-        if (pmLiq == 0) n = old; // burned or emptied by the client: its last modify paid the fees on `old`
+        (uint256 G0, uint256 G1) = v.pm.getFeeGrowthGlobals(v.id);
         uint256 c0;
         uint256 c1;
         unchecked {
-            c0 = FullMath.mulDiv(l0 - q.g0, n, 1 << 128);
-            c1 = FullMath.mulDiv(l1 - q.g1, n, 1 << 128);
+            uint256 d0 = l0 - q.g0;
+            uint256 d1 = l1 - q.g1;
+            if (d0 > G0 - q.G0 || d1 > G1 - q.G1) n = 0; // re-based by PoolManager (cleared tick): count nothing
+            c0 = FullMath.mulDiv(d0, n, 1 << 128);
+            c1 = FullMath.mulDiv(d1, n, 1 << 128);
         }
         (uint256 cb, uint256 ca) = v.baseIsCurrency0 ? (c0, c1) : (c1, c0);
+        // belt: what PoolManager paid out is in the account; never credit more than idle holds above the snapshot
+        ca = _cap(ca, int256(IERC20(v.asset).balanceOf(a)) - s.snapAsset);
+        cb = _cap(cb, int256(_bal(v.base, a)) - s.snapBase);
         // forge-lint: disable-next-line(unsafe-typecast)
         s.snapAsset += int256(ca);
         // forge-lint: disable-next-line(unsafe-typecast)
         s.snapBase += int256(cb);
+        _mark(q, v, l0, l1, G0, G1);
+    }
+
+    function _cap(uint256 c, int256 room) private pure returns (uint256) {
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return room <= 0 ? 0 : (c > uint256(room) ? uint256(room) : c);
+    }
+
+    function _mark(Pos storage q, SALib.Venue storage v, uint256 l0, uint256 l1, uint256 G0, uint256 G1) private {
+        if (G0 == 0 && G1 == 0) (G0, G1) = v.pm.getFeeGrowthGlobals(v.id);
         q.g0 = l0;
         q.g1 = l1;
+        q.G0 = G0;
+        q.G1 = G1;
     }
 
     /// @notice The module's own effect after a PositionManager call it made on `p` (SA-3: the writes live here):
@@ -135,9 +165,10 @@ library SABook {
         s.snapAsset += dAsset;
         s.snapBase += dBase;
         Pos storage q = pos[p.tokenId];
-        // forge-lint: disable-next-line(unsafe-typecast)
-        q.liq = uint128(uint256(int256(uint256(q.liq)) + dLiq));
-        (, q.g0, q.g1) = v.pm.getPositionInfo(v.id, address(v.posm), p.tickLower, p.tickUpper, bytes32(p.tokenId));
+        q.liq = SafeCast.toUint128(SafeCast.toUint256(int256(uint256(q.liq)) + dLiq)); // SA-4 I-5
+        (, uint256 l0, uint256 l1) =
+            v.pm.getPositionInfo(v.id, address(v.posm), p.tickLower, p.tickUpper, bytes32(p.tokenId));
+        _mark(q, v, l0, l1, 0, 0);
     }
 
     /// @notice Account value at `price`: idle + positions the account still owns (principal at sqrt(price) plus
@@ -148,7 +179,33 @@ library SABook {
         V4PositionMath.Position[] storage ps,
         address a,
         uint256 price
+    ) external view returns (uint256) {
+        return _value(v, s, ps, a, price);
+    }
+
+    /// @notice SA-4 M-3 (1241): the value every keeper budget and the fee are measured on: `value` without hedge
+    ///         equity above the net margin the account really sent (a guardian-approved gain widens no window and
+    ///         carries no fee until the treasury returns it into the account).
+    function nav(
+        SALib.Venue storage v,
+        SALib.Account storage s,
+        V4PositionMath.Position[] storage ps,
+        address a,
+        uint256 price
     ) external view returns (uint256 val) {
+        val = _value(v, s, ps, a, price);
+        uint256 h = s.hedgeEquity;
+        uint256 m = s.netMargin;
+        if (h > m) val -= h - m;
+    }
+
+    function _value(
+        SALib.Venue storage v,
+        SALib.Account storage s,
+        V4PositionMath.Position[] storage ps,
+        address a,
+        uint256 price
+    ) private view returns (uint256 val) {
         val = IERC20(v.asset).balanceOf(a) + Math.mulDiv(_bal(v.base, a), price, WAD) + s.hedgeEquity;
         for (uint256 i; i < ps.length; ++i) {
             V4PositionMath.Position memory p = ps[i];
@@ -189,15 +246,18 @@ library SABook {
     ///         `snap`: the module removes `liq` (burn: everything), of which only m = min(liq, snap) (burn: snap) is
     ///         liquidity the books account for; idle rises by the principal of m at the current sqrt price (rounded
     ///         down, as PoolManager pays) plus the uncollected fees. Liquidity the client added or removed directly
-    ///         stays a pending flow on both sides (position and idle), so it is booked exactly once.
+    ///         stays a pending flow on both sides (position and idle), so it is booked exactly once. SA-4 L-3: m is also
+    ///         at most the live PoolManager liquidity (a burn after a direct client decrease books only what it
+    ///         removes; the rest of the snapshot stays tracked until the next priced sync books it as an outflow).
     function lpRemove(SALib.Venue storage v, V4PositionMath.Position memory p, uint128 liq, bool burn, uint128 snap)
         external
         view
         returns (int256 dAsset, int256 dBase, uint128 m)
     {
+        (uint128 live, uint256 fa, uint256 fb) = _feesAB(v, p);
         m = burn || liq > snap ? snap : liq;
+        if (m > live) m = live;
         (uint256 pa, uint256 pb) = _principal(v, p, m, false);
-        (, uint256 fa, uint256 fb) = _feesAB(v, p);
         // forge-lint: disable-next-line(unsafe-typecast)
         dAsset = int256(pa + fa);
         // forge-lint: disable-next-line(unsafe-typecast)

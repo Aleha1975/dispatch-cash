@@ -41,8 +41,9 @@ import {Delegation, IDelegationManager} from "./vendor/DelegationFramework.sol";
 ///            at the CREATE2 address of the canonical proxy for its owner, which is pinned; funds are pulled only
 ///            from that owner into that account; hedge and fee transfers are verified at the recipient; mints are
 ///            read back from PositionManager; subscribed positions are refused; a 7702 code change or a hybrid
-///            owner change is a revocation (a hybrid's implementation is the client's: its code is treated as
-///            hostile, never trusted); approvals are reset after use.
+///            owner change suspends the module while it lasts (nothing is stored: restoring the code / owner resumes
+///            it; only `revoke` or `disableDelegation` stop it for good, SA-4 I-1); a hybrid's implementation is the
+///            client's: its code is treated as hostile, never trusted; approvals are reset after use.
 ///         B. The snapshot is what the books account for. A module action never reads it back from the account: it
 ///            ADDS its own effect, computed from state the account cannot write (PoolManager before the action, the
 ///            liquidity asked of PositionManager, the SwapExecutor record, the verified recipient delta). So
@@ -51,16 +52,18 @@ import {Delegation, IDelegationManager} from "./vendor/DelegationFramework.sol";
 ///         C. One delegation per account; only the client replaces it (`register` from the account / its owner)
 ///            or stops it (`revoke`).
 ///         D. Fee and custody decisions value positions at the anchor. Booking, fees, swaps and adds need a trusted
-///            anchor (fresh, unclipped, unchanged for minPriceStable, re-confirmed within it, pool within
-///            BOOK_BAND_BPS); the fee is measured at the anchor (the booking price) only while the anchor is not above
-///            the pool nor above its trailing 24 h low by more than the band, and needs a recent, not clipped-down
-///            hedge report (SA-3).
-///         E. Budgets are sliding 24 h windows (SAWindow): <= 1x per any 24 h; the anchor's budget is its trailing
-///            24 h range (SARange, net displacement) with a path backstop.
+///            anchor (fresh, unclipped, unchanged for minPriceStable, reported within the last minPriceStable, pool
+///            within BOOK_BAND_BPS); the fee is measured at the anchor (the booking price) only while the anchor is not
+///            above the pool nor above its trailing 24 h low by more than the band, a day after the last booking of a
+///            price-dependent client flow (SA-4 M-2), and needs a recent, not clipped-down hedge report (SA-3).
+///         E. Budgets are sliding 24 h windows (SAWindow): <= 1x per any 24 h, measured on the value without hedge
+///            equity above the net margin sent (SA-4 M-3). The anchor's budget is its trailing 24 h range (SARange,
+///            net displacement; no path budget, SA-4 I-9) and SA-4 M-1 one step of at most poolBandBps per
+///            minPriceStable.
 ///         F. Guardian approvals bind (account, epoch, stored value, guardian era), are one-shot, expire within
 ///            1 day and are voided by a guardian change or a pause.
-///         G. Keeper margin returns <= the account's own hedge equity; pause stops margin sends and keeper-only
-///            equity decreases; roles pairwise distinct.
+///         G. Keeper margin returns <= min(hedge equity, net margin sent) of the account (SA-4 M-3); pause stops
+///            margin sends and keeper-only equity decreases; roles pairwise distinct.
 ///         H. `revoke` is the exit step that cannot fail silently.
 ///
 ///         ROLES: owner = VaultTimelock (keeper/guardian rotation, bounded params; can never move client funds);
@@ -125,7 +128,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         uint32 feeInterval;
         uint32 maxPriceAge; // the anchor (and the hedge report) must be this recent for a fee or a margin send
         uint32 minPriceStable; // booking and fees need the anchor unchanged for this long (SA-2 L-16 / H-1)
-        uint16 exitTurnoverBps; // R4: own 24 h budget for selling base into the asset with no position held (0 = off)
+        uint16 exitTurnoverBps; // R4: own 24 h budget for selling base with no position held (0 = off: turnover window)
     }
 
     Params public params;
@@ -342,8 +345,9 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     }
 
     /// @notice Relayer path: register (first time) and move `amount` USDC from the account's pinned owner into the
-    ///         account on a fresh EIP-2612 permit for exactly `amount` (SA-2 M-3: a standing allowance is never used;
-    ///         a front-run of this very permit is tolerated). Booked as a contribution at face value at once.
+    ///         account on a fresh EIP-2612 permit for exactly `amount` (SA-2 M-3; a front-run of this very permit is
+    ///         tolerated, see SALib.pull for the one case a same-amount standing allowance is used, SA-4 L-9). Booked
+    ///         as a contribution at face value at once.
     function onboard(Delegation calldata d, uint256 amount, uint256 deadline, uint8 v, bytes32 r, bytes32 s_)
         external
         nonReentrant
@@ -368,11 +372,14 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     }
 
     /// @notice Stop the module for account `a` (M-8, M-1): the account or its pinned owner EOA, one plain call with
-    ///         no external calls, not pausable. Only the client can resume (register again). SA-3 L-14: an account
-    ///         that is not registered yet can revoke in advance (a signed delegation it no longer wants used).
+    ///         no external calls to anyone else, not pausable. Only the client can resume (register again). SA-3
+    ///         L-14: an account that is not registered yet can revoke in advance (a signed delegation it no longer
+    ///         wants used); SA-4 I-2: so can the owner EOA of a hybrid account (derived, pure), deployed or not.
     function revoke(address a) external {
         SALib.Account storage s = accounts[a];
-        if (msg.sender != a && msg.sender != s.owner) revert NotOwnAccount();
+        if (msg.sender != a && msg.sender != s.owner && SALib.hybridAddress(_expect(), msg.sender) != a) {
+            revert NotOwnAccount();
+        }
         s.revoked = true;
         emit Revoked(a, msg.sender);
     }
@@ -388,12 +395,19 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     ///         range (one-shot). Never reverts on the budget: the clipped value is applied; the anchor counts as
     ///         clipped while it is outside the band of this report (`lastPriceClipped`). Reporting the stored anchor
     ///         refreshes it without moving it; SA-3 L-5: a report after a gap longer than minPriceStable counts as a
-    ///         move (an anchor that nobody confirmed during an outage is not "stable").
+    ///         move (an anchor that nobody confirmed during an outage is not "stable"). SA-4 M-1: one report moves
+    ///         the anchor at most poolBandBps, and only once the last move has been stable for minPriceStable.
     function reportPrice(uint256 price) external nonReentrant onlyKeeper {
         _checkPoolBand(price);
         uint256 old = lastPrice;
-        (uint256 p, bool clipped) =
-            SALib.movePrice(priceBudget, old, price, paused ? 0 : uint256(params.refDriftBps) * (WAD / BPS));
+        (uint256 p, bool clipped) = SALib.movePrice(
+            priceBudget,
+            old,
+            price,
+            paused ? 0 : uint256(params.refDriftBps) * (WAD / BPS),
+            params.poolBandBps,
+            block.timestamp >= lastPriceMoved + params.minPriceStable
+        );
         if (p != old || block.timestamp > lastPriceTime + params.minPriceStable) lastPriceMoved = block.timestamp;
         if (p != old) {
             lastPrice = p;
@@ -469,8 +483,11 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     ///         record of this swap (SA-2 L-14), never from the account's balances; SA-3 M-2: the record must be of
     ///         exactly the call the module built (calldata hash), so account code cannot substitute its own swap.
     ///         R4 (risk-off): a sell of base while the account holds no tracked position (everything burned first) is
-    ///         charged to the separate exit window (exitTurnoverBps x value per 24 h) instead of the turnover window;
-    ///         every other swap, and every LP add, stays on the turnover window.
+    ///         charged to the separate exit window (exitTurnoverBps x value per 24 h) instead of the turnover window
+    ///         (SA-4 L-6: the turnover window when the exit window is off or has no room); every other swap, and every
+    ///         LP add, stays on the turnover window. SA-4 I-6: a sell is charged at the higher of its value at the
+    ///         keeper price and at the anchor. SA-4 M-4 (1241): the exit sale has the same gates as every swap (not
+    ///         paused, trusted anchor); a looser gate would be reachable at a keeper-walked anchor.
     function swap(address a, bool sellBase, uint256 amountIn, uint256 keeperPrice, uint256 minOut)
         external
         nonReentrant
@@ -483,13 +500,12 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         _live(a);
         _sync(a);
         uint256 ref = lastPrice;
-        uint256 fair = sellBase ? Math.mulDiv(amountIn, keeperPrice, WAD) : Math.mulDiv(amountIn, WAD, keeperPrice);
-        _useTurnover(a, sellBase ? fair : amountIn, accountValue(a, ref), sellBase && _positions[a].length == 0);
-        uint256 floor = Math.mulDiv(fair, BPS - params.maxSlippageBps, BPS);
-        if (minOut < floor) minOut = floor;
-        if (minOut == 0) revert ZeroAmount();
-        uint256 band = params.poolBandBps;
-        uint160 limit = SALib.sqrtPriceAt(Math.mulDiv(ref, sellBase ? BPS - band : BPS + band, BPS), baseIsCurrency0);
+        uint256 charge;
+        uint160 limit;
+        (charge, minOut, limit) = SALib.swapBounds(
+            sellBase, amountIn, keeperPrice, ref, minOut, params.maxSlippageBps, params.poolBandBps, baseIsCurrency0
+        );
+        _useTurnover(a, charge, _nav(a, ref), sellBase && _positions[a].length == 0);
         bool zeroForOne = sellBase == baseIsCurrency0;
         SwapExecutor x = SwapExecutor(swapExecutor);
         (uint256 n0,,,) = x.lastSwap(a);
@@ -533,24 +549,17 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
 
     /// @notice Pull margin back from `hedgeTreasury` (which approves this module) into the account itself, live or
     ///         not (B: always bracketed; no owner() payout). The keeper may return at most the account's own hedge
-    ///         equity (H-1); the treasury itself may return more (its own decision). Never paused.
+    ///         equity (H-1) and (SA-4 M-3, 1241) at most the net margin the account really sent: a guardian-approved
+    ///         equity gain cannot pull treasury USDC on the keeper key alone; the treasury itself may return more (its
+    ///         own decision, e.g. realised hedge profit). Never paused.
     function returnHedgeMargin(address a, uint256 amount) external nonReentrant {
         bool byTreasury = msg.sender == hedgeTreasury;
         if (!byTreasury && msg.sender != keeper) revert NotKeeper();
         if (amount == 0) revert ZeroAmount();
         SALib.Account storage s = accounts[a];
         if (s.delegationHash == 0) revert NotRegistered();
-        uint256 h = s.hedgeEquity;
-        if (!byTreasury && amount > h) revert HedgeCap(amount, h);
         _sync(a);
-        asset.safeTransferFrom(hedgeTreasury, a, amount);
-        _apply(a, int256(amount), 0); // value moves from hedge equity to idle: not a flow
-        uint256 m = s.netMargin;
-        if (amount >= h) s.hedgeClipped = false; // SA-3 L-3: nothing left that could be overstated
-        s.hedgeEquity = amount >= h ? 0 : h - amount;
-        s.netMargin = amount >= m ? 0 : m - amount;
-        s.hedgeEpoch++;
-        emit HedgeMarginReturned(a, amount, s.hedgeEquity, s.netMargin);
+        SALib.returnMargin(s, address(asset), hedgeTreasury, a, amount, byTreasury);
     }
 
     /// @notice Report the account's off-chain hedge equity (SALib.moveHedge). The keeper alone can only lower it,
@@ -564,7 +573,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         // L-16 / SA-2 L-2: no keeper-only move while paused or on an anchor that is not fresh (age, clipped, band)
         uint256 cap = paused || !_freshOk()
             ? 0
-            : Math.mulDiv(accountValue(a, lastPrice), params.hedgeStepBps, BPS);
+            : Math.mulDiv(_nav(a, lastPrice), params.hedgeStepBps, BPS);
         (uint256 applied, bool clipped) = SALib.moveHedge(s, budgets[a], value, cap, guardianEra);
         emit HedgeEquityReported(a, value, applied, clipped);
     }
@@ -577,12 +586,15 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     ///         `feeInterval` since the last fee; not paused. SA-3 M-3: profit = value at the anchor - contributed,
     ///         and only while the anchor is not above the pool nor more than poolBandBps above its trailing 24 h low
     ///         (SALib.feeGate), so a walked anchor must be held for a day in public view before it carries a fee.
+    ///         SA-4 M-2: not within a day of the last booking of a price-dependent client flow (the keeper books every
+    ///         flow with sync(a) at once, so the fee never rides on a flow booked at a moved anchor in the same day).
+    ///         SA-4 M-3: profit is measured without hedge equity above the net margin sent.
     function chargeFee(address a) external nonReentrant onlyKeeper whenNotPaused returns (uint256 f) {
         if (!_trusted()) revert StalePrice();
         _live(a);
         _sync(a);
         SALib.Account storage s = accounts[a];
-        uint256 next = s.lastFeeTime + params.feeInterval;
+        uint256 next = Math.max(s.lastFeeTime + params.feeInterval, s.pricedFlowTime + 1 days);
         if (block.timestamp < next) revert FeeTooEarly(next);
         if (s.hedgeEquity != 0 && (s.hedgeClipped || block.timestamp > s.hedgeTime + params.maxPriceAge)) {
             revert StaleHedge();
@@ -590,7 +602,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         uint256 ref = lastPrice;
         SALib.feeGate(priceBudget, ref, poolPrice(), params.poolBandBps);
         // forge-lint: disable-next-line(unsafe-typecast)
-        int256 profit = int256(accountValue(a, ref)) - s.contributed;
+        int256 profit = int256(_nav(a, ref)) - s.contributed;
         int256 newHwm;
         (f, newHwm) = SALib.hwmFee(profit, s.hwm, params.feeBps, asset.balanceOf(a) * FEE_MAX_BPS / BPS);
         if (f == 0) return 0;
@@ -790,7 +802,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         internal
     {
         uint256 ref = lastPrice;
-        uint256 nav = accountValue(a, ref);
+        uint256 nav = _nav(a, ref);
         (int256 dA, int256 dB, uint256 charge) =
             SABook.lpAdd(venue, p, liq, ref, params.maxSlippageBps, params.poolBandBps);
         _useTurnover(a, charge, nav, false);
@@ -798,7 +810,9 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         SABook.book(accounts[a], snapPos, venue, p, dA, dB, int256(uint256(liq)));
     }
 
-    /// @dev LP removal: computed effect of removing min(liquidity, snapshot) (burn: the snapshot) plus fees.
+    /// @dev LP removal: computed effect of removing min(liquidity, snapshot, live) (burn: min(snapshot, live)) plus
+    ///      fees. SA-4 L-3: a burned position whose snapshot liquidity was not all removed stays tracked (not owned:
+    ///      worth 0 in `value`) until the next priced sync books the rest as the client's outflow and drops it.
     function _remove(address a, uint256 tokenId, uint128 liquidity, bool burn, uint128 m0, uint128 m1) internal {
         _live(a);
         _sync(a);
@@ -808,7 +822,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         (int256 dA, int256 dB, uint128 m) = SABook.lpRemove(venue, p, liquidity, burn, snapPos[tokenId].liq);
         _modify(a, V4PositionMath.removeData(burn, tokenId, liquidity, m0, m1, currency0, currency1, a), 0, 0);
         SABook.book(accounts[a], snapPos, venue, p, dA, dB, -int256(uint256(m)));
-        if (burn) _removeAt(a, i);
+        if (burn && snapPos[tokenId].liq == 0) _removeAt(a, i);
     }
 
     function _indexOf(address a, uint256 tokenId) internal view returns (uint256) {
@@ -848,11 +862,12 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
             && !_off(ref, poolPrice());
     }
 
-    /// @dev Booking, fees, swaps and LP adds: fresh; unchanged for minPriceStable and re-confirmed by a report within
-    ///      the last minPriceStable (SA-2 L-16, SA-3 L-5: no anchor move and use in one transaction, no anchor taken
-    ///      over unconfirmed after an outage); the pool within BOOK_BAND_BPS of the anchor (SA-3 M-4). The pool is
-    ///      read at this instant only: what bounds a keeper that also pushes the pool is the drift budget, the
-    ///      stable window and (fees) the trailing-low gate, not this read.
+    /// @dev Booking, fees, swaps and LP adds: fresh; unchanged for minPriceStable and reported within the last
+    ///      minPriceStable (SA-2 L-16, SA-3 L-5: no anchor move and use in one transaction, no anchor taken over
+    ///      unconfirmed after an outage; SA-4 L-14: at exactly moved + minPriceStable the moving report satisfies
+    ///      both, so this is not a second-report requirement); the pool within BOOK_BAND_BPS of the anchor (SA-3
+    ///      M-4). The pool is read at this instant only: what bounds a keeper that also pushes the pool is the drift
+    ///      budget with its per-report step (SA-4 M-1), the stable window and (fees) the trailing-low gate.
     function _trusted() internal view returns (bool) {
         uint256 st = params.minPriceStable;
         uint256 ref = lastPrice;
@@ -863,8 +878,9 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     }
 
     /// @notice Book account `a`'s pending client flow now (SA-3 M-5): anyone, only at a trusted anchor, so the
-    ///         booking moment is not the keeper's choice alone.
+    ///         booking moment is not the keeper's choice alone; SA-4 M-3: only for a registered account.
     function sync(address a) external nonReentrant {
+        if (accounts[a].delegationHash == 0) revert NotRegistered();
         if (!_trusted()) revert StalePrice();
         _sync(a);
     }
@@ -881,7 +897,11 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     }
 
     function _useTurnover(address a, uint256 notional, uint256 nav, bool exit) internal {
-        uint256 bps = exit ? params.exitTurnoverBps : params.swapTurnoverBps;
-        SALib.useTurnover(budgets[a], notional, Math.mulDiv(nav, bps, BPS), exit);
+        SALib.useTurnover(budgets[a], notional, nav, params.swapTurnoverBps, params.exitTurnoverBps, exit);
+    }
+
+    /// @dev SA-4 M-3: the value keeper budgets and the fee are measured on (SABook.nav).
+    function _nav(address a, uint256 price) internal view returns (uint256) {
+        return SABook.nav(venue, accounts[a], _positions[a], a, price);
     }
 }
