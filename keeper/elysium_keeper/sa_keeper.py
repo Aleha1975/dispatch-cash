@@ -330,6 +330,20 @@ class SAKeeper:
         pc = S.choose_price(hl, g.pool_price, g.params["poolBandBps"], self.st.band_safety, self.st.max_clamp_dev_bps)
         self.status["price"] = {"hl": hl / 1e6, "pool": g.pool_price / 1e6, "status": pc.status,
                                 "dev_bps": round(pc.dev_bps, 1), "anchor": g.last_price / 1e6}
+        stale = now - g.last_price_time >= min(self.sa.report_every_s, g.params["maxPriceAge"] // 2,
+                                               g.params["minPriceStable"] * 2 // 5)
+        # SA-8 L-3: the pool is held off the market while the market is still at the stored anchor. The module accepts
+        # a pure refresh (price == anchor) without the pool check: keep the anchor fresh (margin sends, hedge reports)
+        # instead of following the pool or letting the anchor age out; risk-adding actions wait (they need the pool
+        # within BOOK_BAND_BPS of the anchor anyway).
+        if (pc.status != "ok" and g.last_price
+                and abs(hl - g.last_price) * BPS <= g.last_price * BOOK_BAND_BPS):
+            if stale:
+                self.act("reportPrice", g.last_price)
+                g = self.r.global_snap()
+            self.alert("warn", "pool_held_off", f"pool {g.pool_price / 1e6:.4f} off HL {hl / 1e6:.4f} "
+                                                f"({pc.dev_bps:.0f} bps) at the anchor: anchor refreshed, no risk-adding actions")
+            return None, g
         if pc.status == "skip":
             self.alert("warn", "price_skip", f"pool {g.pool_price / 1e6:.4f} vs HL {hl / 1e6:.4f} differ "
                                              f"{pc.dev_bps:.0f} bps; skipping risk-adding actions this tick")
@@ -342,8 +356,6 @@ class SAKeeper:
         if (now < self._hold_until and price != g.last_price and g.last_price
                 and abs(g.pool_price - g.last_price) * BPS <= g.pool_price * BOOK_BAND_BPS * self.st.band_safety):
             price = g.last_price
-        stale = now - g.last_price_time >= min(self.sa.report_every_s, g.params["maxPriceAge"] // 2,
-                                               g.params["minPriceStable"] * 2 // 5)
         if price != g.last_price or stale or g.clipped:
             before = g
             self.act("reportPrice", price)

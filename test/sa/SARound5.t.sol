@@ -134,7 +134,9 @@ contract SARound5Test is SATestBase {
     }
 
     /// L-2: a plain client collect after a keeper sync that followed fee accrual stays yield again (the global mark
-    /// moves only with the position's mark, so both span the same interval).
+    /// moves only with the position's mark, so both span the same interval). SA-8 L-1: the credit is USDC only and
+    /// only in a booking where idle base did not change, so the client takes its fees to its wallet and returns the
+    /// USDC part (the base fees leave the profit: yield taken out).
     function test_L2_PlainCollectAfterSyncIsYield() public {
         (address a, uint256 id) = _marked();
         uint256 ref = module.lastPrice();
@@ -147,10 +149,17 @@ contract SARound5Test is SATestBase {
         _stable();
         int256 c0 = _acct(a).contributed;
         int256 p0 = _profit(a);
-        _clientDecrease(ALICE_PK, a, id, 0); // the client's own collect
+        address eoa = vm.addr(ALICE_PK);
+        (uint256 u0, uint256 h0) = (usdc.balanceOf(eoa), eoa.balance);
+        _clientPosm(ALICE_PK, a, V4PositionMath.removeData(false, id, 0, 0, 0, address(0), address(usdc), eoa), 0);
+        uint256 fu = usdc.balanceOf(eoa) - u0;
+        uint256 fh = eoa.balance - h0;
+        assertGt(fu, 1e6);
+        vm.prank(eoa);
+        usdc.transfer(a, fu);
         _keeperSync(a);
         assertApproxEqAbs(_acct(a).contributed, c0, 2, "the collect is not a contribution");
-        assertApproxEqAbs(_profit(a), p0, 2, "the fees stay profit");
+        assertApproxEqAbs(_profit(a), p0 - int256(fh * ref / 1e18), 2, "the USDC fees stay profit");
     }
 
     // ================================================================== M-2: anchor bound to a confirmed level

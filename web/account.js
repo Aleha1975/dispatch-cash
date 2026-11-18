@@ -317,8 +317,10 @@ async function readAccount(a) {
   // SA-2: a client flow (e.g. a USDC top-up sent straight to the account) is booked into `contributed` at the next
   // trusted sync (SA-3: the keeper calls sync(a) at the first trusted moment; SA-5 L-3: only the keeper, the account or
   // its owner may); until then it is the idle
-  // difference to the module's snapshot (counted as deposit here). Approximation: LP fees the client collected
-  // itself are yield on chain (SA-3), shown here as a deposit until the next sync.
+  // difference to the module's snapshot (counted as deposit here). SA-8: a first registration books nothing, so
+  // everything the account holds shows here as pending until that first sync. Approximation: USDC LP fees the client
+  // collected itself are yield on chain when idle HYPE did not change (SA-3, SA-8 L-1), shown here as a deposit until
+  // the next sync.
   const dBase = hype - acc.snapBase;
   const pending = registered ? usdcBal - acc.snapAsset + (dBase >= 0n ? dBase * price / 10n ** 18n : -((-dBase * price + 10n ** 18n - 1n) / 10n ** 18n)) : 0n;
   return { address: a, registered, kind: acc.kind, until: Number(acc.until), revoked: acc.revoked, contributed: acc.contributed + pending, hwm: acc.hwm,

@@ -216,20 +216,6 @@ contract SARound7Test is SATestBase {
         assertLe(f, 1e6, "nothing above the mark the booking set");
     }
 
-    /// Registration at a trusted anchor opens the books in the same transaction: what the account holds is booked at
-    /// the moment it comes under management, with no raise. Fails on e6a2de5 (registration booked nothing).
-    function test_Open_RegistrationBooksHoldings() public {
-        address a = _deployHybrid(vm.addr(ALICE_PK));
-        vm.deal(a, 100 ether);
-        _deal(a, 20_000e6);
-        _stable();
-        Delegation memory d = _moduleDelegation(a, ALICE_PK);
-        vm.prank(relayer);
-        module.register(d);
-        assertEq(_acct(a).contributed, int256(20_000e6 + 100 * module.lastPrice()));
-        assertEq(_acct(a).hwm, 0, "no raise at the opening");
-    }
-
     // ================================================================== Lows / Infos
     /// L-2: the 1-day confirmation counts from the guardian's approvePrice, not from the keeper's consumption.
     /// Approved at T, consumed at T + 23 h, fee at T + 25 h: refused. Fails on e6a2de5 (counted from T + 23 h).

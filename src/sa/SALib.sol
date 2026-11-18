@@ -126,9 +126,6 @@ library SALib {
     /// SA-6 L-3: a fee needs the guardian-confirmed level to be at most this old.
     uint256 internal constant CONFIRM_TTL = 1 days;
 
-    /// SA-7: `hwm` of an account between its first registration and the opening sync in the same transaction.
-    int256 internal constant OPEN = type(int256).min;
-
     /// keccak256("elysium.SALib.usedPermit"): (owner, nonce) of every permit the module pulled on (SA-3 L-5 / L-7)
     bytes32 internal constant USED_PERMIT = 0x6abd87adb26a402fe713f1d3f200068eae79f0e9a26a829d328b8969c2899fff;
 
@@ -254,8 +251,8 @@ library SALib {
     ///         only. A no-op for the stored, non-revoked delegation, before any other check (SA-2 L-11: top-ups keep working in the delegation's
     ///         last day). Replacing it, or registering after a revoke: only the account or its pinned owner (M-1).
     ///         SA-4 M-3: a first registration starts the books from zero (LPManagerModule.sync refuses an unregistered
-    ///         address; this is defence in depth). SA-7: the module then opens the books at a trusted anchor in the
-    ///         same transaction (SABook.sync: `hwm` = OPEN marks the opening); otherwise what the account holds stays a pending flow.
+    ///         address; this is defence in depth). SA-8 M-1: nothing is booked here; what the account holds is a
+    ///         pending flow, booked by the first sync at a trusted anchor under the one rule of SABook.sync.
     function register(
         mapping(address => Account) storage accts,
         mapping(address => bytes) storage ctxs,
@@ -286,7 +283,7 @@ library SALib {
             s.snapAsset = 0;
             s.snapBase = 0;
             s.contributed = 0;
-            s.hwm = OPEN; // SA-7: SABook.sync in the same transaction opens the books (and sets hwm to 0)
+            s.hwm = 0; // SA-8 M-1: no opening booking; what the account holds is a pending flow (SABook.sync)
             s.flowSeen = false;
         }
         emit Registered(a, h, kind, until, old == 0);

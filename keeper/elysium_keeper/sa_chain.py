@@ -406,9 +406,10 @@ class ModuleReader:
         tracked position since the books' last look (PoolManager feeGrowthInsideLast - the module's mark, times the
         booked liquidity) are yield, added to the snapshot first. SA-4 H-1: only for a position still owned with the
         books' liquidity, only up to the pool's global fee growth since the mark, and never above the idle surplus
-        over the snapshot. SA-5 M-1: nor if PoolManager's liquidity at the books' last look (`seen`) differed, nor
-        while idle is below the snapshot in either token. SA-6 L-1: nothing at all while any tracked position is
-        pending (not owned, or its liquidity differs from the books'). A few wei of rounding apart."""
+        over the snapshot. SA-5 M-1: nor if PoolManager's liquidity at the books' last look (`seen`) differed. SA-6
+        L-1: nothing at all while any tracked position is pending (not owned, or its liquidity differs from the
+        books'). SA-8 L-1: USDC fees only, and nothing at all while idle base differs from the snapshot (decided on
+        the raw balances before any credit). A few wei of rounding apart."""
         from . import v4math as M
         sp = math.isqrt(price * (1 << 192) // 10**18)
         snap_asset, snap_base = s["snapAsset"], s["snapBase"]
@@ -421,7 +422,8 @@ class ModuleReader:
             except Exception:  # burned
                 owned = False
             rows.append((p, owned, self.m.call("snapPos", p.token_id)))
-        dirty = any(not o or p.liquidity != sp_[0] for p, o, sp_ in rows)  # SA-6 L-1
+        # SA-6 L-1 / SA-8 L-1: no credit while a position is pending or idle base changed
+        dirty = snap.native != snap_base or any(not o or p.liquidity != sp_[0] for p, o, sp_ in rows)
         for p, owned, (old, seen, g0, g1, G0, G1) in reversed(rows):  # SABook.sync walks the list from the end
             marks[p.token_id] = old
             _, l0, l1 = self.position_info(p)
@@ -429,12 +431,8 @@ class ModuleReader:
             d0, d1 = (l0 - g0) % (1 << 256), (l1 - g1) % (1 << 256)
             if d0 > (gg0 - G0) % (1 << 256) or d1 > (gg1 - G1) % (1 << 256):
                 n = 0  # PoolManager re-based the position (a cleared tick): nothing counted
-            ra, rb = snap.usdc - snap_asset, snap.native - snap_base
-            if ra < 0 or rb < 0:
-                n = 0  # SA-5 M-1: a mix change (one token below the snapshot) is not yield
-            cb, ca = d0 * n >> 128, d1 * n >> 128
-            snap_base += max(0, min(cb, rb))
-            snap_asset += max(0, min(ca, ra))
+            ra = snap.usdc - snap_asset
+            snap_asset += max(0, min(d1 * n >> 128, ra))  # SA-8 L-1: the USDC side only (base is currency0)
         f = snap.usdc - snap_asset
         db = snap.native - snap_base
         f += db * price // 10**18 if db >= 0 else -((-db * price + 10**18 - 1) // 10**18)

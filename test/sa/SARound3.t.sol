@@ -83,24 +83,30 @@ contract SARound3Test is SATestBase {
     }
 
     // ================================================================== class F: LP fees are yield (1227 M-1)
-    /// PoC: the client collects its own position's fees into the account. Round 2 booked the extra idle as a client
-    /// deposit, so the fees (already in the value as uncollected fees) left the profit (fee base erosion). Now the
-    /// fees paid out of a tracked position since the books' last look are added to the snapshot first: contributed
-    /// does not move, the fees stay profit.
+    /// PoC: the client collects its own position's fees. Round 2 booked the extra idle as a client deposit, so the
+    /// fees (already in the value as uncollected fees) left the profit (fee base erosion). Now the USDC fees paid out
+    /// of a tracked position since the books' last look are added to the snapshot first: contributed does not move,
+    /// they stay profit. SA-8 L-1: only in a booking where idle base did not change (a base credit could absorb a
+    /// base inflow); here the client's base fees left to its own wallet (they leave the profit: yield taken out), the
+    /// USDC fees came back into the account. A collect into the account itself changes idle base: then nothing is
+    /// credited and the whole collect is a priced contribution (SARound8.test_L1_Sibling_CollectWithBaseIsPricedContribution).
     function test_M1_PoC_ClientCollectIsProfit() public {
         (address a, uint256 id) = _withFees(ALICE_PK);
         uint256 ref = module.lastPrice();
         int256 c0 = _acct(a).contributed;
         int256 p0 = _profit(a);
-        (uint256 u0, uint256 h0) = (usdc.balanceOf(a), a.balance);
-        _clientRemove(ALICE_PK, a, id, false, 0, a);
-        uint256 fees = _valueAt(usdc.balanceOf(a) - u0, a.balance - h0, ref);
-        assertGt(fees, 1e6, "fees collected");
+        address eoa = vm.addr(ALICE_PK);
+        (uint256 u0, uint256 h0) = (usdc.balanceOf(eoa), eoa.balance);
+        _clientRemove(ALICE_PK, a, id, false, 0, eoa);
+        (uint256 fu, uint256 fh) = (usdc.balanceOf(eoa) - u0, eoa.balance - h0);
+        assertGt(fu, 1e6, "USDC fees collected");
+        vm.prank(eoa);
+        usdc.transfer(a, fu); // the USDC part back into the account
         assertApproxEqAbs(_pending(a), 0, 2, "fees are not a client flow");
         vm.prank(keeper);
         module.sync(a);
         assertApproxEqAbs(_acct(a).contributed, c0, 2, "nothing booked as a deposit");
-        assertApproxEqAbs(_profit(a), p0, 2, "the fees stay profit");
+        assertApproxEqAbs(_profit(a), p0 - int256(_valueAt(0, fh, ref)), 2, "the USDC fees stay profit");
     }
 
     /// Siblings: fees taken to an outside address leave the account and the profit (SA-4: never credited above the

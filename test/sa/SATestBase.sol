@@ -628,9 +628,11 @@ abstract contract SATestBase is Test {
         int256 sa = s.snapAsset;
         int256 sb = s.snapBase;
         V4PositionMath.Position[] memory ps = module.positionsOf(a);
+        bool baseMoved = int256(a.balance) != sb; // SA-8 L-1: no credit at all when idle base changed
         for (uint256 i = ps.length; i != 0;) {
             --i;
             (int256 ca, int256 cb, int256 dv) = _pendingPos(a, ps[i], sa, sb, ref);
+            if (baseMoved) (ca, cb) = (0, 0);
             sa += ca;
             sb += cb;
             f += dv;
@@ -658,8 +660,8 @@ abstract contract SATestBase is Test {
         }
         int256 rb = int256(a.balance) - sb;
         int256 ra = int256(usdc.balanceOf(a)) - sa;
-        if (ra < 0 || rb < 0) return (0, 0); // SA-5 M-1: a mix change is not yield
-        cb = cb > rb ? rb : cb;
+        if (ra < 0 || rb != 0) return (0, 0); // SA-5 M-1 / SA-8 L-1: no credit when idle base changed
+        cb = 0; // SA-8 L-1: never a base credit
         ca = ca > ra ? ra : ca;
     }
 

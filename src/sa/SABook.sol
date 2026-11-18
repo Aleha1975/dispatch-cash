@@ -50,34 +50,37 @@ library SABook {
     }
 
     /// @notice Book live state - snapshot as a client flow at `price` and move the snapshot to the live state.
-    ///         First, at every sync (also while the anchor is not trusted; it needs no price): LP fees that left a
-    ///         tracked position outside a module action (the client's own collect) are added to the snapshot, exactly
+    ///         First, at every sync (also while the anchor is not trusted; it needs no price): USDC LP fees that left
+    ///         a tracked position outside a module action (the client's own collect) are added to the snapshot, exactly
     ///         as the module books its own collects, so they stay yield and never become a contribution (SA-3 M-1).
     ///         SA-4 H-1 / SA-5 M-1: only for a position nobody changed since the mark (still owned, PoolManager and
     ///         the books on the same liquidity now AND at the last look), only up to the pool's global fee growth over
-    ///         the same interval (a larger or wrapped difference means PoolManager re-based the position), only while
-    ///         idle holds no less than the snapshot in EITHER token (a dip and restore at another price changes the
-    ///         mix: one token up, the other down; that is not yield) and never more than idle holds above the
-    ///         snapshot in each token. Every guard can only LOWER the yield counted (a client modify's fees then
-    ///         become a contribution: our fee lower). SA-6 L-1: nothing at all in a sync where ANY tracked position
-    ///         is pending (not owned, or PoolManager's liquidity differs from the books'): its pending principal sits
-    ///         in idle too and must not serve as room for another position's credit.
+    ///         the same interval (a larger or wrapped difference means PoolManager re-based the position), and never
+    ///         more than idle USDC holds above the snapshot. SA-6 L-1: nothing at all in a sync where ANY tracked
+    ///         position is pending (not owned, or PoolManager's liquidity differs from the books'). SA-8 L-1: nothing at
+    ///         all in a sync where idle base differs from the books in units, and never a base credit: "a
+    ///         price-dependent change happened" is decided on the raw balances, before any credit (a credit could
+    ///         otherwise absorb a base inflow and hide it). Every guard can only LOWER the yield counted (the fees
+    ///         then become a contribution: our fee lower).
     ///         Then, `price` = 0 (anchor not trusted): nothing else is booked or moved; the flow stays pending. SA-7
     ///         M-1: if idle base or a tracked position differs from the books, `flowSeen` is set.
-    ///         Positions the account no longer owns are dropped (their snapshot liquidity is an outflow).
+    ///         At a trusted anchor, positions the account no longer owns are dropped (their snapshot liquidity is an
+    ///         outflow); at an untrusted one they stay tracked (and marked) until a trusted sync.
     ///
-    ///         SA-7 (replaces SA-4 M-2, SA-5 L-1 / M-4 and SA-6 M-1): a client flow with a price-dependent part (idle
-    ///         base, a tracked position's liquidity) happened at some market price that the books cannot know. The
-    ///         booking values it at this anchor, so profit may differ from the truth by an unknown phantom e. Therefore
-    ///         a booking in which idle base or a tracked position's liquidity changed at all (in units, so 1 wei counts),
-    ///         or that follows a `flowSeen` mark, sets (`priced` = the sum of |change| of each component at this anchor)
+    ///         SA-7: a client flow with a price-dependent part (idle base, a tracked position's liquidity) happened at
+    ///         some market price that the books cannot know. The booking values it at this anchor, so profit may
+    ///         differ from the truth by an unknown phantom e. Therefore a booking in which idle base or a tracked
+    ///         position's liquidity changed at all (in units, so 1 wei counts), or that follows a `flowSeen` mark, sets
+    ///         (`priced` = the sum of |change| of each component at this anchor)
     ///             hwm = max(profit after the booking, hwm + priced).
     ///         Fee is charged only above hwm. (1) profit after the booking >= true profit + e: if the account was at
     ///         or above its mark, no part of e is ever charged (the uncharged gain up to now is forgone). (2) hwm +
     ///         priced >= hwm + e for every outflow (a value at the flow is >= 0, so e <= the booked value) and for an
     ///         inflow booked at no less than half its arrival price: this holds below the mark too. No price record,
-    ///         no time window, no dust threshold. The opening sync (in the first registration's transaction, `hwm` =
-    ///         SALib.OPEN) books what the account holds at the moment it comes under management: no raise. Only hwm rises: the fee can only be lower.
+    ///         no time window, no dust threshold. SA-8 M-1: no exception. What an account holds when it is first
+    ///         registered is a pending inflow like any other (the books start at zero), booked by the first sync at a
+    ///         trusted anchor under the same rule: base held at registration raises hwm by its value. Only hwm rises:
+    ///         the fee can only be lower.
     function sync(
         SALib.Account storage s,
         V4PositionMath.Position[] storage ps,
@@ -86,12 +89,11 @@ library SABook {
         SALib.Venue storage v,
         uint256 price
     ) external {
-        bool open = s.hwm == SALib.OPEN; // the first registration's own sync: no lateness, no raise
-        if (open) s.hwm = 0;
         int256 f;
         uint256 priced;
         uint256 i = ps.length;
-        bool dirty = _dirty(ps, pos, v, a); // SA-6 L-1
+        // SA-6 L-1 / SA-8 L-1: no credit while a position is pending or idle base changed (raw, before any credit)
+        bool dirty = int256(_bal(v.base, a)) != s.snapBase || _dirty(ps, pos, v, a);
         while (i != 0) {
             --i;
             V4PositionMath.Position memory p = ps[i];
@@ -118,8 +120,8 @@ library SABook {
             }
         }
         if (price == 0) {
-            if (dirty || int256(_bal(v.base, a)) != s.snapBase) s.flowSeen = true; // SA-7 M-1
-        } else if (_bookIdle(s, v, a, price, f, priced, open)) {
+            if (dirty) s.flowSeen = true; // SA-7 M-1
+        } else if (_bookIdle(s, v, a, price, f, priced)) {
             _raise(s, v, ps, a, price);
         }
     }
@@ -139,16 +141,15 @@ library SABook {
 
     /// @dev `sync` at a trusted anchor, after the positions: book idle - snapshot and the positions' flow `f`. The
     ///      price-dependent part is `priced` so far plus |idle base change| at `price`; if it changed at all (in units) or
-    ///      `flowSeen` is set (and this is not the `open` booking), clear the mark, add it to hwm (the floor of SA-7's raise) and
-    ///      return true.
+    ///      `flowSeen` is set, clear the mark, add it to hwm (the floor of SA-7's raise) and return true. SA-8 M-1: the
+    ///      first booking after a registration is no exception.
     function _bookIdle(
         SALib.Account storage s,
         SALib.Venue storage v,
         address a,
         uint256 price,
         int256 f,
-        uint256 priced,
-        bool open
+        uint256 priced
     ) private returns (bool) {
         int256 x = int256(IERC20(v.asset).balanceOf(a));
         int256 b = int256(_bal(v.base, a));
@@ -164,7 +165,7 @@ library SABook {
             s.contributed += f;
             emit Flow(a, f);
         }
-        if (open || !moved) return false;
+        if (!moved) return false;
         s.hwm += SafeCast.toInt256(priced);
         return true;
     }
@@ -188,9 +189,9 @@ library SABook {
     ///      the position is owned and unchanged, else 0), added to the snapshot as yield. SA-4 H-1: the difference of
     ///      the position's fee mark is credited only while it does not exceed the pool's global growth since the mark
     ///      (inside growth on one basis never does), and the credit never exceeds the idle surplus above the snapshot.
-    ///      SA-5 M-1: nothing if PoolManager's liquidity at the last look differed (a dip seen by any sync), or if idle
-    ///      is below the snapshot in either token (Option A of the report). SA-5 L-2: the global mark moves only with
-    ///      the position's mark.
+    ///      SA-5 M-1: nothing if PoolManager's liquidity at the last look differed (a dip seen by any sync). SA-8 L-1:
+    ///      USDC only (`sync` passes n = 0 whenever idle base changed, so a base credit could only ever be 0). SA-5 L-2:
+    ///      the global mark moves only with the position's mark.
     function _feesOut(SALib.Account storage s, Pos storage q, SALib.Venue storage v, address a, V4PositionMath.Position memory p, uint128 n)
         private
     {
@@ -198,35 +199,17 @@ library SABook {
             v.pm.getPositionInfo(v.id, address(v.posm), p.tickLower, p.tickUpper, bytes32(p.tokenId));
         (uint256 G0, uint256 G1) = v.pm.getFeeGrowthGlobals(v.id);
         if (q.seen != n) n = 0; // SA-5 M-1: PoolManager's liquidity differed at the last look
-        uint256 c0;
-        uint256 c1;
+        uint256 c;
         unchecked {
             uint256 d0 = l0 - q.g0;
             uint256 d1 = l1 - q.g1;
             if (d0 > G0 - q.G0 || d1 > G1 - q.G1) n = 0; // re-based by PoolManager (cleared tick): count nothing
-            c0 = FullMath.mulDiv(d0, n, 1 << 128);
-            c1 = FullMath.mulDiv(d1, n, 1 << 128);
+            c = FullMath.mulDiv(v.baseIsCurrency0 ? d1 : d0, n, 1 << 128); // the asset side only (SA-8 L-1)
         }
-        if (v.baseIsCurrency0) _credit(s, v, a, c1, c0);
-        else _credit(s, v, a, c0, c1);
+        int256 room = int256(IERC20(v.asset).balanceOf(a)) - s.snapAsset;
+        // forge-lint: disable-next-line(unsafe-typecast)
+        if (room > 0) s.snapAsset += int256(c > uint256(room) ? uint256(room) : c);
         _mark(q, pl, l0, l1, G0, G1);
-    }
-
-    /// @dev Add the credit (ca asset, cb base) to the snapshot: nothing if idle is below the snapshot in either token
-    ///      (SA-5 M-1, a mix change is not yield), and never more than idle holds above it in each token.
-    function _credit(SALib.Account storage s, SALib.Venue storage v, address a, uint256 ca, uint256 cb) private {
-        int256 ra = int256(IERC20(v.asset).balanceOf(a)) - s.snapAsset;
-        int256 rb = int256(_bal(v.base, a)) - s.snapBase;
-        if (ra < 0 || rb < 0) return;
-        // forge-lint: disable-next-line(unsafe-typecast)
-        s.snapAsset += int256(_cap(ca, ra));
-        // forge-lint: disable-next-line(unsafe-typecast)
-        s.snapBase += int256(_cap(cb, rb));
-    }
-
-    function _cap(uint256 c, int256 room) private pure returns (uint256) {
-        // forge-lint: disable-next-line(unsafe-typecast)
-        return room <= 0 ? 0 : (c > uint256(room) ? uint256(room) : c);
     }
 
     /// @dev SA-5 L-2: the global mark moves only when the position's fee mark moves (both span one interval).

@@ -582,3 +582,21 @@ def test_sa7_account_tick_marks_flow_it_cannot_book(tmp_path):
         k.r.global_snap = lambda g=g: g
         k.account_tick(ACCOUNT, 40_000_000, g, NOW, 0.12)
         assert ("sync" in [fn for fn, _ in k.calls]) is want, (kw, trusted)
+
+
+# ---------------------------------------------------------------- SA-8 (round-8 audit) keeper mirrors
+def test_sa8_anchor_refreshed_while_pool_held_off(tmp_path):
+    """SA-8 L-3: the pool is held 3% off while the market (HL) is still at the anchor. The keeper re-reports the stored
+    anchor when it is due (the module skips the pool check for a pure refresh) and takes no risk-adding action; it
+    never follows the pushed pool."""
+    from test_sa_unit import _g
+    k = bare_keeper(tmp_path, FakeReader({}))
+    k.status, k._hold_until = {}, 0
+    k.info = types.SimpleNamespace(mid=lambda coin: 40.0)
+    for last_time, want in ((NOW - 3000, True), (NOW, False)):
+        g = _g(pool_price=41_200_000, last_price_time=last_time)
+        k.r.global_snap = lambda g=g: g
+        k.calls.clear()
+        price, _ = k.anchor(NOW)
+        assert price is None
+        assert k.calls == ([("reportPrice", (40_000_000,))] if want else [])
