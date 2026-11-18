@@ -62,7 +62,7 @@ const MODULE_ABI = parseAbi([
   'struct Caveat { address enforcer; bytes terms; bytes args; }',
   'struct Delegation { address delegate; address delegator; bytes32 authority; Caveat[] caveats; uint256 salt; bytes signature; }',
   'struct Position { uint256 tokenId; int24 tickLower; int24 tickUpper; }',
-  'struct Account { bytes32 delegationHash; address owner; uint8 kind; uint64 until; bool revoked; bool hedgeClipped; int256 contributed; int256 hwm; uint256 hedgeEquity; uint256 netMargin; uint256 hedgeEpoch; int256 snapAsset; int256 snapBase; uint256 lastFeeTime; uint256 feesPaid; uint256 hedgeTime; uint256 pricedFlowTime; uint256 bookPrice; }',
+  'struct Account { bytes32 delegationHash; address owner; uint8 kind; uint64 until; bool revoked; bool hedgeClipped; int256 contributed; int256 hwm; uint256 hedgeEquity; uint256 netMargin; uint256 hedgeEpoch; int256 snapAsset; int256 snapBase; uint256 lastFeeTime; uint256 feesPaid; uint256 hedgeTime; uint256 pricedFlowTime; uint256 bookPrice; uint256 bookTime; }',
   'function account(address) view returns (Account)',
   'function revoke(address)',
   'function accountValue(address, uint256) view returns (uint256)',

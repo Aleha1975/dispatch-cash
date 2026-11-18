@@ -381,6 +381,16 @@ abstract contract SATestBase is Test {
         module.reportPrice(p);
     }
 
+    /// SA-6 L-3: a fee needs a guardian confirmation within the last day: the guardian confirms the stored anchor
+    /// (+-0.5%) and the keeper's report of it consumes the range.
+    function _fresh() internal {
+        uint256 p = module.lastPrice();
+        vm.prank(guardian);
+        module.approvePrice(p * 995 / 1000, p * 1005 / 1000, vm.getBlockTimestamp() + 1 hours);
+        vm.prank(keeper);
+        module.reportPrice(p);
+    }
+
     function _report() internal {
         uint256 p = poolPrice();
         vm.prank(keeper);

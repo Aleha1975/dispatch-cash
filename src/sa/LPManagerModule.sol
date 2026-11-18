@@ -55,10 +55,11 @@ import {Delegation, IDelegationManager} from "./vendor/DelegationFramework.sol";
 ///            anchor (fresh, unclipped, unchanged for minPriceStable, reported within the last minPriceStable, pool
 ///            within BOOK_BAND_BPS); the fee is measured at the anchor (the booking price) only while the anchor is not
 ///            above the pool nor above its trailing 24 h low or (SA-5 M-3) the guardian-confirmed level by more than
-///            the band, a day after the last booking of a material price-dependent client flow (SA-4 M-2, SA-5 L-1),
-///            and needs a recent, not clipped-down hedge report (SA-3). SA-5 M-4: a priced flow booked at another
-///            anchor than the account's previous priced booking raises the high-water mark by its largest possible
-///            gain between the two (a late booking can only lower the fee).
+    ///            the band, a day after the last booking of a material price-dependent client flow (SA-4 M-2, SA-5 L-1),
+///            within a day of the guardian's last confirmation (SA-6 L-3), and needs a recent, not clipped-down
+///            hedge report (SA-3). SA-6 M-1: every priced booking raises the high-water mark by the most the flow
+///            can have gained at any price between the last priced booking and now (the anchors at both ends and
+///            every keeper report between, SABook.sync), so a late booking can only lower the fee.
 ///         E. Budgets are sliding 24 h windows (SAWindow): <= 1x per any 24 h, measured on the value without hedge
 ///            equity above the net margin sent (SA-4 M-3); an LP add is charged at its whole principal (SA-5 M-2). The
 ///            anchor's budget is its trailing 24 h range (SARange, net displacement; no path budget, SA-4 I-9), SA-4
@@ -72,7 +73,7 @@ import {Delegation, IDelegationManager} from "./vendor/DelegationFramework.sol";
 ///
 ///         ROLES: owner = VaultTimelock (keeper/guardian rotation, bounded params, SA-5 L-4 incl. their product; can
 ///         never move client funds);
-///         keeper (hot key, all actions above, multicall over many accounts); guardian (pause, price-range and
+///         keeper (hot key, all actions above; SA-6 I-1: one account per multicall, by the keeper's rule); guardian (pause, price-range and
 ///         hedge-equity co-signatures; cannot unpause or move funds).
 contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
@@ -86,7 +87,6 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     /// 60 s..1 day; minPriceStable 300 s..1 day; (refDrift + band + slippage) x (turnover + exit) <= 40% (SA-5 L-4).
     uint256 public constant MAX_FEE_BPS = 2_000;
     uint256 public constant MAX_HEDGE_CAP_BPS = 3_500;
-    uint256 internal constant MAX_POOL_BAND_BPS = 500;
     uint256 public constant MIN_FEE_INTERVAL = 7 days; // == ElysiumCustodyEnforcer.FEE_INTERVAL
     uint256 internal constant FEE_MAX_BPS = 2_000; // == ElysiumCustodyEnforcer.FEE_MAX_BPS (fee <= 20% of idle USDC)
     uint256 public constant MAX_POSITIONS = 4;
@@ -390,7 +390,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
 
     function _register(Delegation calldata d) internal {
         if (lastPrice == 0) revert NoAnchor();
-        SALib.register(accounts, permissionContext, d, _expect());
+        SALib.register(accounts, permissionContext, d, _expect(), lastPrice); // SA-6 L-2: books start at the anchor
     }
 
     // ------------------------------------------------------------------ keeper: price anchor
@@ -593,7 +593,8 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     ///         SA-4 M-2: not within a day of the last booking of a price-dependent client flow (the keeper books every
     ///         flow with sync(a) at once, so the fee never rides on a flow booked at a moved anchor in the same day).
     ///         SA-4 M-3: profit is measured without hedge equity above the net margin sent. SA-5 M-3: nor more than
-    ///         poolBandBps above the guardian-confirmed level (SALib.feeGate).
+    ///         poolBandBps above the guardian-confirmed level, and SA-6 L-3 within a day of that confirmation
+    ///         (SALib.feeGate).
     function chargeFee(address a) external nonReentrant onlyKeeper whenNotPaused returns (uint256 f) {
         if (!_trusted()) revert StalePrice();
         _live(a);
@@ -619,7 +620,8 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     }
 
     // ------------------------------------------------------------------ keeper: batching
-    /// @notice Run several keeper calls (typically over many accounts) in one transaction. With `allowFailure`
+    /// @notice Run several keeper calls in one transaction. SA-6 I-1: the keeper batches the calls of ONE account per
+    ///         multicall (account code runs inside a bracket and could move the pool for another account's next item). With `allowFailure`
     ///         a failing call is reported (CallFailed, reason truncated to 256 bytes) and the rest continue. SA-2 L-4:
     ///         at most 256 bytes of a failing call's return data are copied into this frame's memory (inner frames
     ///         bubble theirs). No per-item gas bound: the keeper batches one account per transaction.
@@ -653,10 +655,11 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     // ------------------------------------------------------------------ guardian
     /// @notice One-shot price range: the next report inside [lo, hi] before `until` (<= 1 day) consumes it and becomes
     ///         the guardian-confirmed level the anchor is bound to (SA-5 M-2); if it does not fit the keeper's budget it
-    ///         is applied unclipped and starts a new 24 h window (SA-3). Cleared by a pause and a guardian change. SA-5
-    ///         I-1: at most 10% wide.
+    ///         is applied unclipped and starts a new 24 h window (SA-3). Cleared by a pause and a guardian change. SA-6
+    ///         L-4: at most 2 x poolBandBps wide (3% at the pilot values; was 10%), since the keeper's report picks the
+    ///         level inside it.
     function approvePrice(uint256 lo, uint256 hi, uint256 until) external onlyGuardian {
-        SALib.approvePrice(priceBudget, lo, hi, until, MAX_APPROVAL_TTL, 2 * MAX_POOL_BAND_BPS); // SA-5 I-1: <= 10% wide
+        SALib.approvePrice(priceBudget, lo, hi, until, MAX_APPROVAL_TTL, 2 * uint256(params.poolBandBps)); // SA-6 L-4
         emit PriceApproved(lo, hi, until);
     }
 
@@ -774,7 +777,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     /// @dev Book live - snapshot as a client flow at the anchor, only while the anchor is trusted (SABook.sync);
     ///      LP fees paid out of tracked positions are booked as yield at every sync (SA-3 M-1).
     function _sync(address a) internal {
-        SABook.sync(accounts[a], _positions[a], snapPos, a, venue, _trusted() ? lastPrice : 0);
+        SABook.sync(accounts[a], _positions[a], snapPos, a, venue, _trusted() ? lastPrice : 0, priceBudget);
     }
 
     /// @dev The module's own effect on idle: added to the snapshot, never read back (SABook).

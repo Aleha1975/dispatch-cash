@@ -52,6 +52,9 @@ from .sa_chain import BOOK_BAND_BPS, AccountSnap, GlobalSnap, ModuleReader, hybr
 BPS = 10_000
 E18 = 10 ** 18
 FEE_FLOW_WAIT_S = 86400  # SA-4 M-2: LPManagerModule.chargeFee waits a day after a price-dependent client flow
+# SA-6 M-1: re-book every account at a trusted anchor at least this often (a zero-flow sync only refreshes bookTime), so
+# a later client flow is raised by the prices reported since, not by its whole value (beyond the module's 24 h ring)
+BOOK_REFRESH_S = 3 * 3600  # one SARange bucket: the raise then spans about two buckets (~6 h) of reports
 SWAP_MIN_OUT_SLACK_BPS = 30  # minOut = the simulated output less this (the module floor still applies)
 
 
@@ -359,7 +362,7 @@ class SAKeeper:
                     lo, hi = price * 995 // 1000, price * 1005 // 1000
                     self.alert("warn", "anchor_budget", f"anchor clipped at {g.last_price / 1e6:.4f} (wanted "
                                                         f"{price / 1e6:.4f}){why}; guardian: approvePrice({lo}, "
-                                                        f"{hi}, now + 1 h) after checking the market (<= 10% wide)")
+                                                        f"{hi}, now + 1 h) after checking the market (<= 2 x poolBandBps wide)")
                 else:
                     self.log("anchor_stepping", anchor=g.last_price, wanted=price)
         return price, g
@@ -452,8 +455,10 @@ class SAKeeper:
         hedged = bool(self.prefs_of(a)["hedged"])
         if not g.paused:
             g = self.r.global_snap()
-            if s.pending and g.trusted(self.now()):
-                self.act("sync", a)  # SA-3 M-5: book a pending client flow at the first trusted moment
+            t = self.now()
+            if (s.pending or t - s.book_time >= BOOK_REFRESH_S) and g.trusted(t):
+                # SA-3 M-5: book a pending client flow at the first trusted moment; SA-6 M-1: refresh bookTime
+                self.act("sync", a)
             if hedged:
                 self.margin(s, g, price)
             target_hw, _, _ = self.width_for(a, g, hw)
@@ -644,6 +649,14 @@ class SAKeeper:
                 return
         fee, new_hwm = hwm_fee(s.fee_profit, s.hwm, g.params["feeBps"])
         if fee <= 0:
+            return
+        if not g.base_fresh(now):
+            # SA-6 L-3: chargeFee needs the guardian's confirmation of the level within the last day
+            self.log("fee_waits_confirm", account=a, base=g.price_base, base_time=g.price_base_time)
+            lo, hi = g.last_price * 995 // 1000, g.last_price * 1005 // 1000
+            self.alert("info", "fee_needs_confirm", f"fee due for {a}; the confirmed level is older than a day; "
+                                                    f"guardian: approvePrice({lo}, {hi}, now + 1 h) after checking "
+                                                    f"the market")
             return
         if not g.fee_gate():
             # SA-3 M-3: the anchor must not be above the pool nor more than poolBandBps above its trailing 24 h low;

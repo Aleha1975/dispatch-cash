@@ -249,6 +249,7 @@ contract SARound5Test is SATestBase {
         _keeperSync(a); // booked at P1
         _hold(30);
         _feeReady();
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         uint256 f = module.chargeFee(a);
         assertEq(f, 0, "no fee on the gain the withdrawn HYPE made after it left");
@@ -265,6 +266,7 @@ contract SARound5Test is SATestBase {
         vm.warp(vm.getBlockTimestamp() + 7 days);
         _feeReady();
         vm.deal(a, a.balance + 1e12); // a stranger's dust
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         module.chargeFee(a); // no FeeTooEarly
     }
@@ -299,13 +301,13 @@ contract SARound5Test is SATestBase {
         module.setParams(defaultParams());
     }
 
-    /// I-1: a guardian range is at most 10% wide.
+    /// I-1: a guardian range is bounded in width (SA-6 L-4: 2 x poolBandBps, 3% at these params; was 10%).
     function test_I1_GuardianRangeWidthBounded() public {
         uint256 p = module.lastPrice();
         vm.prank(guardian);
         vm.expectRevert(LPManagerModule.BadParam.selector);
         module.approvePrice(p, p * 2, vm.getBlockTimestamp() + 1 hours);
         vm.prank(guardian);
-        module.approvePrice(p, p * 11 / 10, vm.getBlockTimestamp() + 1 hours);
+        module.approvePrice(p, p * 103 / 100, vm.getBlockTimestamp() + 1 hours);
     }
 }

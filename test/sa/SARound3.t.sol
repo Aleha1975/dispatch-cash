@@ -214,11 +214,13 @@ contract SARound3Test is SATestBase {
         vm.warp(vm.getBlockTimestamp() + 25 hours);
         _step(module.lastPrice());
         uint256 snap = vm.snapshotState();
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         uint256 f1 = module.chargeFee(a);
         assertGt(f1, 0);
         vm.revertToState(snap);
         _give(a, 10_000e6); // the client's parked deposit, not booked yet
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         uint256 f2 = module.chargeFee(a);
         assertApproxEqAbs(f2, f1, 1, "a parked deposit does not change the fee");
@@ -233,10 +235,12 @@ contract SARound3Test is SATestBase {
         vm.warp(vm.getBlockTimestamp() + 25 hours);
         _step(module.lastPrice());
         uint256 snap = vm.snapshotState();
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         uint256 f1 = module.chargeFee(a);
         vm.revertToState(snap);
         _clientExec1(ALICE_PK, a, address(usdc), 0, abi.encodeCall(IERC20.transfer, (vm.addr(ALICE_PK), 5_000e6)));
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         uint256 f2 = module.chargeFee(a);
         assertApproxEqAbs(f2, f1, 1, "a withdrawal does not change the fee");

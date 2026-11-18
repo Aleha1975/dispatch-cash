@@ -551,3 +551,35 @@ def test_sa4_return_and_fee_profit_use_net_margin():
     assert s.nav == 1400 * E6 and s.fee_profit == 400 * E6
     s2 = snap(hedge_equity=200 * E6, net_margin=300 * E6)
     assert s2.keeper_return_cap == 200 * E6 and s2.nav == s2.value
+
+
+# ---------------------------------------------------------------- SA-6 (round-6 audit) keeper mirrors
+def test_sa6_fee_waits_for_recent_confirmation(tmp_path):
+    """SA-6 L-3: chargeFee needs the guardian's confirmation of the level within a day; the keeper waits and asks."""
+    from test_sa_unit import _g
+    acct = snap(last_fee_time=NOW - 8 * 86400, value=1200 * E6)
+    k = bare_keeper(tmp_path, FakeReader({ACCOUNT: acct}))
+    pb = {"priceBase": 40_000_000, "priceBaseTime": NOW - 86400 - 1}
+    g = _g(last_price_time=NOW, last_price_moved=NOW - 400, price_budget=pb)
+    assert not g.base_fresh(NOW) and g.base_fresh(NOW - 1)
+    k.fee(ACCOUNT, g, NOW)
+    assert "chargeFee" not in [fn for fn, _ in k.calls]
+    assert any(ev == "fee_waits_confirm" for ev, _ in k.logs)
+    pb["priceBaseTime"] = NOW - 3600
+    k.fee(ACCOUNT, g, NOW)
+    assert "chargeFee" in [fn for fn, _ in k.calls]
+
+
+def test_sa6_account_tick_refreshes_booking(tmp_path):
+    """SA-6 M-1: a zero-flow sync re-books an account whose last priced sync is older than BOOK_REFRESH_S, so a later
+    client flow is raised by the prices reported since (not by its whole value beyond the module's 24 h ring)."""
+    from elysium_keeper.sa_keeper import BOOK_REFRESH_S
+    for age, want in ((BOOK_REFRESH_S, True), (60, False)):
+        k = bare_keeper(tmp_path, FakeReader({ACCOUNT: snap(book_time=NOW - age)}),
+                        {ACCOUNT: make_strategy(hedged=False, nonce=5).record(NOW)})
+        k.manage_lp = lambda *a, **kw: None
+        k.fee = lambda *a: None
+        k.return_margin = lambda *a, **kw: None
+        k.report_equity = lambda *a, **kw: None
+        k.account_tick(ACCOUNT, 40_000_000, k.r.global_snap(), NOW, 0.12)
+        assert ("sync" in [fn for fn, _ in k.calls]) is want

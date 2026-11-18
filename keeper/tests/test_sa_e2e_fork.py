@@ -317,7 +317,12 @@ def test_sa_end_to_end(env):
     hl.set(fork.now(), p0 / 1e6)
     st = k.tick()  # the report after the gap counts as a move (SA-3 L-5)
     assert not st["errors"], st["errors"]
+    # SA-6 L-3: the fee waits for the guardian's confirmation within a day; the guardian confirms the market and the
+    # keeper's next report consumes the range
+    lp = m.call("lastPrice")
+    fork.send(GUARDIAN, m, "approvePrice", lp * 995 // 1000, lp * 1005 // 1000, fork.now() + 3600)
     st = settle(fork, k, hl)
+    assert m.call("priceBudget")[4] >= fork.now() - 3600, "confirmed"
     fees = k.state.d.get("fees_by_account", {})
     for a in (a1, a2):
         fees_paid = k.r.account(a).fees_paid

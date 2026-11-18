@@ -202,7 +202,9 @@ class AccountSnap:
     pending: int = 0  # live state - snapshot at the anchor: a client flow not booked yet (SA-2: booked at a trusted sync)
     value_pool: int = 0  # accountValue at the pool price (margin sends cap on min(value, value_pool))
     priced_flow_time: int = 0  # SA-4 M-2: last booking of a price-dependent client flow; the fee waits a day after it
-    book_price: int = 0  # SA-5 M-4: anchor of the last priced sync (a flow booked at another anchor raises the hwm)
+    book_price: int = 0  # SA-5 M-4: anchor of the last priced sync (or of the registration, SA-6 L-2)
+    book_time: int = 0  # SA-6 M-1: time of the last priced sync; a flow booked later raises the hwm by its largest
+    #                     gain at any price reported since (the whole priced value beyond 24 h: refresh it, BOOK_REFRESH_S)
 
     @property
     def excess_equity(self) -> int:
@@ -290,6 +292,16 @@ class GlobalSnap:
             lo = min(lo, self.price_base)
         return lp <= self.pool_price and lp * 10_000 <= lo * (10_000 + self.params["poolBandBps"])
 
+    @property
+    def price_base_time(self) -> int:
+        """SA-6 L-3: when the guardian-confirmed level was set (priceBudget().baseTime); 0 = unknown."""
+        return int(self.price_budget.get("priceBaseTime", 0) or 0)
+
+    def base_fresh(self, now: int) -> bool:
+        """SA-6 L-3 (SALib.feeGate): a fee needs the confirmation within CONFIRM_TTL_S (unknown: not checked here)."""
+        t = self.price_base_time
+        return not t or now <= t + CONFIRM_TTL_S
+
     def base_gate(self) -> bool:
         """SA-5 M-3: the fee gate's confirmed-level part alone (False = the guardian must confirm the market)."""
         b = self.price_base
@@ -310,11 +322,12 @@ BOOK_BAND_BPS = 50  # LPManagerModule.BOOK_BAND_BPS (read from the module when a
 ZERO_ADDRESS = "0x" + "00" * 20
 BUDGET_KEYS = ["hedgeApproved", "hedgeApprovedEpoch", "hedgeApprovedUntil", "hedgeApprovedEra"]
 WINDOW_KEYS = ["turnoverUsed", "hedgeUsed", "priceUsed", "exitUsed"]
-PRICE_BUDGET_KEYS = ["priceApprovedLo", "priceApprovedHi", "priceApprovedUntil", "priceBase"]
+PRICE_BUDGET_KEYS = ["priceApprovedLo", "priceApprovedHi", "priceApprovedUntil", "priceBase", "priceBaseTime"]
+CONFIRM_TTL_S = 86400  # SA-6 L-3: SALib.CONFIRM_TTL, chargeFee needs a guardian confirmation at most this old
 # SALib.Account field order (LPManagerModule.account(a))
 ACCOUNT_KEYS = ["delegationHash", "owner", "kind", "until", "revoked", "hedgeClipped", "contributed", "hwm",
                 "hedgeEquity", "netMargin", "hedgeEpoch", "snapAsset", "snapBase", "lastFeeTime", "feesPaid",
-                "hedgeTime", "pricedFlowTime", "bookPrice"]
+                "hedgeTime", "pricedFlowTime", "bookPrice", "bookTime"]
 PARAM_KEYS = ["feeBps", "hedgeCapBps", "poolBandBps", "maxSlippageBps", "hedgeStepBps", "refDriftBps",
               "swapTurnoverBps", "feeInterval", "maxPriceAge", "minPriceStable", "exitTurnoverBps"]
 
@@ -351,7 +364,7 @@ class ModuleReader:
         g = GlobalSnap(last_price=c("lastPrice"), last_price_time=c("lastPriceTime"), clipped=c("lastPriceClipped"),
                        paused=c("paused"), pool_price=c("poolPrice"), sqrt_price=sp, tick=tick,
                        params=dict(zip(PARAM_KEYS, c("params"))),
-                       price_budget=dict(zip(PRICE_BUDGET_KEYS, c("priceBudget")[0:4])),
+                       price_budget=dict(zip(PRICE_BUDGET_KEYS, c("priceBudget")[0:5])),
                        treasury=self.treasury, fee_recipient=self.fee_recipient,
                        last_price_moved=c("lastPriceMoved"), last_reported=c("lastReported"))
         g.price_budget["priceUsed"] = c("windows", ZERO_ADDRESS)[2]  # (hi - lo) / lo of the trailing range, WAD
@@ -385,7 +398,7 @@ class ModuleReader:
             windows=dict(zip(WINDOW_KEYS, c("windows", a))), owner=to_checksum_address(s["owner"]),
             revoked=s["revoked"], hedge_clipped=s["hedgeClipped"], hedge_time=s["hedgeTime"],
             value_pool=c("accountValue", a, c("poolPrice")), priced_flow_time=s.get("pricedFlowTime", 0),
-            book_price=s.get("bookPrice", 0))
+            book_price=s.get("bookPrice", 0), book_time=s.get("bookTime", 0))
         snap.pending = self.pending(snap, s, price)
         return snap
 
@@ -396,21 +409,25 @@ class ModuleReader:
         booked liquidity) are yield, added to the snapshot first. SA-4 H-1: only for a position still owned with the
         books' liquidity, only up to the pool's global fee growth since the mark, and never above the idle surplus
         over the snapshot. SA-5 M-1: nor if PoolManager's liquidity at the books' last look (`seen`) differed, nor
-        while idle is below the snapshot in either token. A few wei of rounding apart."""
+        while idle is below the snapshot in either token. SA-6 L-1: nothing at all while any tracked position is
+        pending (not owned, or its liquidity differs from the books'). A few wei of rounding apart."""
         from . import v4math as M
         sp = math.isqrt(price * (1 << 192) // 10**18)
         snap_asset, snap_base = s["snapAsset"], s["snapBase"]
         marks = {}
         gg0, gg1 = self.fee_growth_globals() if snap.positions else (0, 0)
+        rows = []
         for p in snap.positions:
-            old, seen, g0, g1, G0, G1 = self.m.call("snapPos", p.token_id)
-            marks[p.token_id] = old
-            _, l0, l1 = self.position_info(p)
             try:
                 owned = to_checksum_address(self.posm.call("ownerOf", p.token_id)) == snap.address
             except Exception:  # burned
                 owned = False
-            n = old if owned and p.liquidity == old and seen == old else 0
+            rows.append((p, owned, self.m.call("snapPos", p.token_id)))
+        dirty = any(not o or p.liquidity != sp_[0] for p, o, sp_ in rows)  # SA-6 L-1
+        for p, owned, (old, seen, g0, g1, G0, G1) in reversed(rows):  # SABook.sync walks the list from the end
+            marks[p.token_id] = old
+            _, l0, l1 = self.position_info(p)
+            n = old if not dirty and owned and p.liquidity == old and seen == old else 0
             d0, d1 = (l0 - g0) % (1 << 256), (l1 - g1) % (1 << 256)
             if d0 > (gg0 - G0) % (1 << 256) or d1 > (gg1 - G1) % (1 << 256):
                 n = 0  # PoolManager re-based the position (a cleared tick): nothing counted

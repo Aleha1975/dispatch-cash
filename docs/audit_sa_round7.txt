@@ -1,0 +1,163 @@
+Elysium LP smart accounts: per-client MetaMask Delegation Framework accounts managed through one module, with a custom custody caveat enforcer - audit round 7 (FIX VERIFICATION BEFORE THE PILOT: verify the round-6 fixes, hunt principal-loss paths only)
+
+CONTEXT FOR THIS ROUND
+Round 6 (job 1252) found no Critical or High, one Medium and four Lows. The report agrees that no one can move funds
+outside {client, pool, hedgeTreasury, feeRecipient} and that no one can block a client exit. The Medium and all four
+Lows were fees on principal:
+- M-1: the round-5 M-4 late-booking adjustment was measured from bookPrice, so a client flow made at a third price
+  (an anchor round trip while the anchor was untrusted) was booked with too small an adjustment.
+- L-1: the pending principal of another tracked position served as room for a credit.
+- L-2: the first booking after registration had no reference price.
+- L-3: a stale confirmed level above the market let a fee be measured above the market.
+- L-4: the keeper picked the confirmed level inside a guardian range of up to 10%.
+All five are fixed in this submission, with I-9; the other Informationals are documented or accepted in the response.
+The pilot is still about USD 250 of the operator's own funds in one or two accounts on Elysium mainnet. For this
+round, please:
+- VERIFY the round-6 fixes (list below) against the round-6 report, ESPECIALLY M-1;
+- HUNT only for paths where client PRINCIPAL can be lost or moved:
+  - funds leaving the account to an address other than the client, the pool, the immutable hedge treasury (bounded) or
+    the fee recipient (bounded);
+  - a fee charged on principal beyond the stated bounds;
+  - a client unable to exit or to stop the module;
+  - a stolen keeper exceeding the stated bound.
+- Fee-accuracy residuals that only LOWER the operator's fee are ACCEPTED (listed in the response). Please do not spend
+  effort on them, except to say if one of them is in fact a principal-loss path. The M-1 fix deliberately trades fee
+  accuracy for safety: every priced client flow raises the high-water mark by the reported price range since the
+  account's previous priced booking, and by the whole priced value after a gap longer than 24 h.
+
+SCOPE
+- src/sa/SABook.sol (external linked library): CHANGED.
+  - sync takes the PriceBudget (storage). Every priced sync writes bookPrice and the NEW Account.bookTime.
+  - NEW _late (M-1, replaces the round-5 M-4 adjustment): [lo, hi] = bookPrice, this anchor and the extremes of every
+    keeper report since bookTime's 3 h bucket (SARange.since on PriceBudget.seen); hwm += ceil(priced x
+    max(hi - price, price - lo) / lo) with SafeCast (I-9). When bookTime's bucket has left the 24 h ring:
+    hwm += priced.
+  - NEW _dirty (L-1): if any tracked position is not owned or its PoolManager liquidity differs from the books', no
+    position is credited in that sync.
+  - The tail of sync moved into _bookIdle (stack depth); same logic.
+- src/sa/SALib.sol (external linked library): CHANGED.
+  - Account: NEW bookTime (last field).
+  - PriceBudget: NEW baseTime (after base) and NEW seen (an SARange ring after range).
+  - movePrice: records every report in seen; stamps baseTime with every write of base (the first report and a
+    consumed guardian range).
+  - feeGate: reverts StalePrice when block.timestamp > baseTime + CONFIRM_TTL (1 day) (L-3).
+  - register(..., price): a first registration sets bookPrice = price (the module's lastPrice) and bookTime = now (L-2).
+- src/sa/SARange.sol: CHANGED. NEW since(r, cur, t): (min, max) of cur and every live bucket from the bucket of t on,
+  and whether that bucket is still in the ring.
+- src/sa/LPManagerModule.sol: CHANGED.
+  - _sync passes priceBudget; _register passes lastPrice.
+  - approvePrice: width cap 2 x params.poolBandBps (L-4; was 2 x MAX_POOL_BAND_BPS = 10%).
+  - NatSpec: rule D, chargeFee, approvePrice, multicall (one account per multicall, I-1).
+  - The priceBudget getter returns (lo, hi, until, base, baseTime, range, seen); account() has bookTime.
+- Unchanged since round 6: src/sa/SAWindow.sol, src/sa/SwapExecutor.sol, src/sa/ElysiumCustodyEnforcer.sol,
+  src/sa/vendor/DelegationFramework.sol, src/V4PositionMath.sol, src/VaultTimelock.sol, script/DeploySA.s.sol. The
+  pooled vault is shelved and OUT of scope.
+Build: solc 0.8.26, via-IR, optimizer runs 1, evm cancun. OpenZeppelin 5.4.0, v4-core/periphery from lib/. NOT deployed.
+Runtime sizes: module 24,240 B (336 under EIP-170), SALib 19,308 B, SABook 8,491 B, enforcer 7,802 B, SwapExecutor
+3,774 B, VaultTimelock 6,155 B, V4PositionMath 6,059 B.
+Foundry suites:
+- test/sa/SARound6.t.sol: 9 tests, new. The 7 finding tests fail on the round-6 commit 0fe4d85 (run with the new
+  SATestBase.sol there; the file compiles there); the other 2 (flat market, hybrid exit with the module and the
+  DelegationManager paused) are sanity and coverage.
+- SARound5.t.sol (12), SARound4.t.sol (15), SARiskOff.t.sol (7), SARound3.t.sol (19), SARound2.t.sol (25),
+  SARegressions.t.sol (34), LPManagerModule.t.sol (31), CustodyEnforcer.t.sol (27). Fee tests now confirm the level
+  first (SATestBase._fresh).
+- test/fork/SmartAccount.fork.t.sol (3, ELYSIUM_FORK=true).
+Keeper (Python): unit tests and anvil-fork e2e (it re-books every account every 3 h and waits for the confirmation
+before a fee).
+
+SOURCE
+{{REPO_URL}} at commit {{COMMIT}} (branch sa-r7, one commit on top of 0fe4d85; `git diff 0fe4d85 {{COMMIT}}` is the whole
+change). Part of the submission:
+- docs/audit/sa_round6_report_1252.md: the round-6 report.
+- docs/audit/sa_round6_response.md: per-finding status, regression tests, accepted residuals (restated: residual 2
+  dip and restore, residual 4 late booking, residual 5 fee after a push, residual 6 fee deferral, residual 7
+  stolen-keeper bound), where we read the report differently, go-live additions.
+- docs/SMART_ACCOUNT_DESIGN.md section 6: as-built design.
+- Earlier rounds: docs/audit/sa_round1_*.md .. sa_round5_*.md.
+
+CHAIN CONTEXT (unchanged)
+Elysium mainnet, chain id 99901, Arbitrum Orbit (Nitro) L2, native gas token HYPE, Prague/7702. Pool: PoolKey(native HYPE,
+USDC 0xb47c4C8F73F009CC0C0d3f92B388d13E293F0B65, fee 3000, tickSpacing 60, hooks 0). PoolManager
+0xE2e105d3F7209A9DA11f83cCf3E7398a753823F1, PositionManager 0x1d1C51b9d07fD27d36412A2b66CC23D19Eb3E518, Permit2
+0x000000000022D473030F116dDEE9F6B43aC78BA3. Delegation Framework v1.3.0 (DelegationManager
+0xdb9B1e94B5b69Df7e401DDbedE43491141047dB3). The pool is thin (about USD 700 moves it 1.5%).
+
+TASK 1: VERIFY THE ROUND-6 FIXES (principal first)
+For every round-6 Medium and Low, state fixed / partly fixed / not fixed / regressed, with a trace or a Foundry test.
+In particular:
+1. M-1 (SABook._late, SARange.since, PriceBudget.seen, Account.bookTime).
+   - Retry the report's traces: the wick round trip (withdrawal at the bottom, booked after the return); the partial
+     round trip (flow at 30, bookPrice 40, booking at 36); the deposit in a spike booked after the return; a keeper
+     that stops reporting; a stolen keeper that resets bookPrice with a zero-flow priced sync at a walked anchor and
+     then books a later client flow.
+   - Is the raise >= the phantom gain for every price in [lo, hi], for base and for liquidity flows, in both
+     directions? (Our argument: V(P) concave with V(0) >= 0 gives |V(P') - V(P)| <= V(P) x |P' - P| / P.)
+   - Does every path that books a priced flow pass through _late, and does every priced sync write bookPrice and
+     bookTime? Are there flows that are priced but not counted in `priced` (positions dropped, burned-but-tracked
+     positions, the first booking after registration, a re-registration after a revoke)?
+   - SARange.since: is the bucket filter (idx >= bucket(bookTime), idx + 9 > now) a superset of the reports made
+     since bookTime? Is the `ok` flag exactly "bookTime's bucket is still in the ring"? Bucket-boundary and empty-ring
+     cases.
+   - Is residual 4 as restated (only a market excursion between two keeper reports, or while the keeper does not
+     report, is uncovered; beyond 24 h the whole priced value) the whole of what is left? Can a third party, the
+     client or a stolen keeper make the recorded range miss a price at which a client flow happened, other than by
+     the keeper not reporting?
+   - Can the raise overflow, revert a sync, or block anything other than our fee?
+2. L-1 (SABook._dirty). Retry the report's two-position trace. Is residual 2 as restated (room from a raw top-up, an
+   untracked position, or fees in the other token; growth bounded by the position's own mark) what the code enforces?
+3. L-2 (SALib.register with price). Does every first registration start bookPrice and bookTime? What about an account
+   that revoked in advance and then registers (s.revoked set, old == 0)?
+4. L-3 (PriceBudget.baseTime, feeGate). Can a fee be charged more than one day after the last write of base? Can
+   anyone other than a guardian range (or the very first report) write base or baseTime?
+5. L-4 (approvePrice width 2 x poolBandBps). Does a later setParams that raises poolBandBps widen an approval already
+   open? Is residual 7 as restated (the keeper's choice inside a range <= 2 x poolBandBps) correct?
+
+TASK 2: PRINCIPAL-LOSS HUNT (only this)
+Look for any path, by anyone, that moves client principal out of the account other than:
+- into the pool (LP and swaps within the stated bounds);
+- to hedgeTreasury (<= hedgeCapBps);
+- to feeRecipient (<= feeBps of profit above the HWM).
+"Anyone" means: the client's own code (excepted for its own account), the keeper within or beyond its bounds, the
+relayer, a third party, the guardian, the timelock.
+Check:
+- the restated late-booking bound (residual 4) and the fee-after-push bound (residual 5, now with a 1-day confirmation);
+- the restated stolen-keeper bound (residual 7);
+- the margin-return bound (keeper <= min(hedgeEquity, netMargin));
+- that no new code path (the report ring, the dirty check, the register argument) can revert a client exit, a
+  revoke or a removal.
+Check that the client can always exit (revoke, withdraw, burn) with the module and the DelegationManager paused,
+including the hybrid path through handleOps (now covered by SARound6.test_Exit_HybridHandleOpsWithModuleAndDMPaused).
+
+TASK 3: ACCEPTED RESIDUALS AND NEW TRADE-OFFS
+For each accepted residual in docs/audit/sa_round6_response.md, say only:
+- whether it is really bounded as stated;
+- whether it can reach principal.
+Please also say whether any of the new guards creates a new principal or exit liveness problem:
+- the report ring and the raise on every priced flow (including the whole-value raise after 24 h);
+- the dirty check;
+- the 1-day confirmation for a fee;
+- the narrower guardian range.
+
+TRUST MODEL AND ROLES (unchanged, except the guardian's confirmation duty before each fee)
+- client: owns the account, every token and position NFT; acts directly at any time; revoke() stops management.
+- module owner: VaultTimelock (>= 24 h, a Safe as proposer / canceller).
+- keeper (hot key): every module action within on-chain budgets; reports the price at least every 120 s; batches one
+  account per multicall.
+- guardian: pause, one-shot price ranges (<= 2 x poolBandBps wide; the confirmed level the anchor is bound to, needed
+  within a day before every fee) and hedge approvals.
+- relayer: deploys accounts, first registration and onboard (permissionless).
+- hedgeTreasury / feeRecipient: immutable operator addresses.
+
+OUT OF SCOPE (INTENTIONAL)
+- Fee-accuracy residuals that only lower the operator's fee.
+- Keeper honesty within the bounds.
+- Hyperliquid, the bridge, the treasury's custody, the off-chain ledger.
+- Uniswap v4, Permit2, USDC and the Delegation Framework themselves (their interaction with our contracts is in scope).
+- The shelved pooled vault.
+
+DELIVERABLE
+- Findings with severity, a concrete trace or a Foundry test, and the smallest fix.
+- For every round-6 Medium and Low, the status.
+- A clear statement whether you see any principal-loss path for a pilot of about USD 250 at the script parameters
+  (DeploySA.pilotParams).

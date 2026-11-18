@@ -75,6 +75,7 @@ contract SARound2Test is SATestBase {
         assertApproxEqAbs(_profit(a), profit0, 2, "a client flow does not move profit");
         vm.warp(vm.getBlockTimestamp() + 7 days);
         _settleAt(ref);
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         assertEq(module.chargeFee(a), 0, "no fee on principal");
     }
@@ -570,6 +571,7 @@ contract SARound2Test is SATestBase {
         uint256 vp = module.accountValue(a, poolPrice());
         uint256 v = module.accountValue(a, module.lastPrice());
         int256 conservative = int256(Math.min(v, vp)) - _acct(a).contributed - _pending(a);
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         uint256 f = module.chargeFee(a);
         assertEq(f, uint256(conservative) * 1500 / 10_000);

@@ -394,6 +394,11 @@
       "name": "bookPrice",
       "type": "uint256",
       "internalType": "uint256"
+     },
+     {
+      "name": "bookTime",
+      "type": "uint256",
+      "internalType": "uint256"
      }
     ]
    }
@@ -1400,7 +1405,24 @@
     "internalType": "uint256"
    },
    {
+    "name": "baseTime",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
     "name": "range",
+    "type": "tuple",
+    "internalType": "struct SARange.R",
+    "components": [
+     {
+      "name": "b",
+      "type": "uint256[9]",
+      "internalType": "uint256[9]"
+     }
+    ]
+   },
+   {
+    "name": "seen",
     "type": "tuple",
     "internalType": "struct SARange.R",
     "components": [

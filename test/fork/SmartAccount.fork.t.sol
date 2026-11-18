@@ -95,6 +95,7 @@ contract SmartAccountForkTest is SATestBase {
         // SA-3 M-3: profit at the anchor (the fee gate needs the anchor not above the pool)
         int256 profit = int256(module.accountValue(a, module.lastPrice())) - module.account(a).contributed;
         uint256 maxFee = usdc.balanceOf(a) * 2000 / 10_000;
+        _fresh(); // SA-6 L-3: a fee needs the guardian's confirmation within the last day
         vm.prank(keeper);
         uint256 f = module.chargeFee(a);
         if (profit > 0) assertEq(f, Math.min(uint256(profit) * 1500 / 10_000, maxFee));

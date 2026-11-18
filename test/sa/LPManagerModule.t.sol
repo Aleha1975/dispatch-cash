@@ -585,6 +585,7 @@ contract LPManagerModuleTest is SATestBase {
         _syncTouch(a); // collect fees into idle
         int256 profit = _profit(a);
         assertGt(profit, 0, "LP fees made a profit");
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         uint256 f = module.chargeFee(a);
         assertEq(f, uint256(profit) * 1500 / 10_000);
@@ -592,6 +593,7 @@ contract LPManagerModuleTest is SATestBase {
         assertEq(_acct(a).hwm, profit - int256(f));
         assertEq(_acct(a).feesPaid, f);
         // not again within the interval
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         vm.expectPartialRevert(LPManagerModule.FeeTooEarly.selector);
         module.chargeFee(a);
@@ -599,6 +601,7 @@ contract LPManagerModuleTest is SATestBase {
         vm.warp(vm.getBlockTimestamp() + 7 days);
         _report();
         _stable();
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         assertEq(module.chargeFee(a), 0);
     }
@@ -633,6 +636,7 @@ contract LPManagerModuleTest is SATestBase {
         vm.warp(vm.getBlockTimestamp() + 7 days);
         _report();
         _stable();
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         assertLe(module.chargeFee(a), 1e6 * 1500 / 10_000);
     }
@@ -674,6 +678,7 @@ contract LPManagerModuleTest is SATestBase {
         uint256 full = uint256(profit) * 1500 / 10_000;
         uint256 idle = usdc.balanceOf(a);
         // L-11: almost everything is in the position: charge the 20%-of-idle slice, advance the mark by its gain
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         uint256 f = module.chargeFee(a);
         assertEq(f, Math.min(full, idle * 2000 / 10_000));

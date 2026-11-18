@@ -123,6 +123,7 @@ contract SARound4Test is SATestBase {
         vm.warp(vm.getBlockTimestamp() + 7 days);
         _feeReady();
         uint256 snap = vm.snapshotState();
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         uint256 fHonest = module.chargeFee(a);
         vm.revertToState(snap);
@@ -138,6 +139,7 @@ contract SARound4Test is SATestBase {
         assertLe(c1, c0 + 1_000e6, "at most the collected fees are booked (as a contribution)");
         vm.warp(vm.getBlockTimestamp() + 1 days); // SA-4 M-2: the client's flow had a price-dependent term
         _feeReady();
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         uint256 f = module.chargeFee(a);
         assertLe(f, fHonest + 1, "no fee beyond the honest one");
@@ -164,6 +166,7 @@ contract SARound4Test is SATestBase {
         assertLe(_profit(a), p0 + 2, "profit not raised by the client's empty / refill");
         vm.warp(vm.getBlockTimestamp() + 1 days); // SA-4 M-2
         _feeReady();
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         uint256 f = module.chargeFee(a);
         assertLe(f, uint256(p0 > 0 ? p0 : int256(0)) * 1500 / 10_000 + 1, "fee only on the real profit");
@@ -219,17 +222,20 @@ contract SARound4Test is SATestBase {
         vm.warp(vm.getBlockTimestamp() + 7 days);
         _feeReady();
         uint256 snap = vm.snapshotState();
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         module.chargeFee(a); // nothing in the way without a flow (a zero fee is fine)
         vm.revertToState(snap);
         _clientExec1(ALICE_PK, a, vm.addr(ALICE_PK), a.balance / 2, "");
         vm.prank(keeper);
         module.sync(a);
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(LPManagerModule.FeeTooEarly.selector, block.timestamp + 1 days));
         module.chargeFee(a);
         vm.warp(vm.getBlockTimestamp() + 1 days);
         _feeReady();
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         module.chargeFee(a);
     }
@@ -245,6 +251,7 @@ contract SARound4Test is SATestBase {
         _clientExec1(ALICE_PK, a, address(usdc), 0, abi.encodeCall(IERC20.transfer, (vm.addr(ALICE_PK), 1_000e6)));
         vm.prank(keeper);
         module.sync(a);
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         module.chargeFee(a); // no FeeTooEarly
     }
@@ -287,6 +294,7 @@ contract SARound4Test is SATestBase {
         _feeReady();
         _reportEquity(a, 1_000e6); // the fee needs a recent hedge report
         uint256 snap = vm.snapshotState();
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         uint256 f0 = module.chargeFee(a);
         vm.revertToState(snap);
@@ -294,6 +302,7 @@ contract SARound4Test is SATestBase {
         vm.prank(guardian);
         module.approveHedgeEquity(a, s.hedgeEpoch, s.hedgeEquity, 1_000_000e6, block.timestamp + 1 hours);
         _reportEquity(a, 1_000_000e6);
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         assertEq(module.chargeFee(a), f0, "no fee on approved equity above the net margin");
         // the turnover window is still measured on the real value (about 10k; 2x at the test params)

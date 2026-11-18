@@ -153,6 +153,7 @@ contract SARegressionsTest is SATestBase {
         _report();
         _syncTouch(a);
         _upgradeTo(ALICE_PK, a, 1);
+        _fresh(); // SA-6 L-3
         vm.prank(keeper);
         vm.expectRevert(SALib.TransferMismatch.selector);
         module.chargeFee(a);
@@ -187,6 +188,7 @@ contract SARegressionsTest is SATestBase {
         vm.prank(vm.addr(ALICE_PK));
         usdc.transfer(a, 5_000e6);
         for (uint256 i; i < 3; ++i) {
+            _fresh(); // SA-6 L-3
             vm.prank(keeper);
             assertEq(module.chargeFee(a), 0);
         }
@@ -614,16 +616,16 @@ contract SARegressionsTest is SATestBase {
         module.approvePrice(0, 1, block.timestamp + 1 hours);
         vm.expectRevert(LPManagerModule.BadParam.selector);
         module.approvePrice(1, 2, block.timestamp + 1 days + 1);
-        vm.expectRevert(LPManagerModule.BadParam.selector); // SA-5 I-1: at most 10% wide
-        module.approvePrice(p0, p0 * 1101 / 1000, block.timestamp + 1 hours);
-        module.approvePrice(p0, p0 * 11 / 10, block.timestamp + 1 hours);
+        vm.expectRevert(LPManagerModule.BadParam.selector); // SA-6 L-4: at most 2 x poolBandBps (3%) wide
+        module.approvePrice(p0, p0 * 10301 / 10000, block.timestamp + 1 hours);
+        module.approvePrice(p0, p0 * 103 / 100, block.timestamp + 1 hours);
         vm.stopPrank();
         _moveTo(p0 * 101 / 100);
         vm.warp(vm.getBlockTimestamp() + 300);
         _report(); // fits the keeper's room (one step): applied as is
         assertEq(module.lastPrice(), poolPrice());
         assertFalse(module.lastPriceClipped());
-        (,, uint256 until, uint256 base,) = module.priceBudget();
+        (,, uint256 until, uint256 base,,,) = module.priceBudget();
         assertEq(until, 0, "SA-4 L-4: the first report inside the range consumes it, clipped or not");
         assertEq(base, poolPrice(), "SA-5 M-2: and becomes the confirmed level");
         (,, uint256 pu,) = module.windows(address(0));
@@ -636,7 +638,7 @@ contract SARegressionsTest is SATestBase {
         _report(); // beyond the room: the range applies it unclipped and is consumed
         assertApproxEqRel(module.lastPrice(), p0 * 125 / 100, 0.001e18);
         assertFalse(module.lastPriceClipped());
-        (,, until,,) = module.priceBudget();
+        (,, until,,,,) = module.priceBudget();
         assertEq(until, 0, "one-shot");
         (,, pu,) = module.windows(address(0));
         assertEq(pu, 0, "SA-3: an approved level starts a new window, it does not consume the keeper's room");
