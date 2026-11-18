@@ -201,19 +201,20 @@ contract SARiskOffTest is SATestBase {
         (uint128 liq, uint128 m0, uint128 m1) = _liqFor(a, tl, tu, a.balance, usdc.balanceOf(a));
         kp = poolPrice();
         vm.prank(keeper);
-        vm.expectRevert(SAWindow.WindowOverflow.selector); // 40% + 0.5 x ~80% > 50%: not all on day 1
+        vm.expectRevert(SAWindow.WindowOverflow.selector); // 40% + ~60% > 50%: not all on day 1 (SA-5 M-2: adds 1:1)
         module.mintPosition(a, tl, tu, liq, m0, m1, kp);
         vm.prank(keeper);
-        module.mintPosition(a, tl, tu, liq / 5, m0, m1, kp); // a part fits
-        // day 2: the rest
-        vm.warp(vm.getBlockTimestamp() + 27 hours);
-        _report();
-        _stable();
-        V4PositionMath.Position[] memory ps = module.positionsOf(a);
-        (liq, m0, m1) = _liqFor(a, tl, tu, a.balance, usdc.balanceOf(a));
-        kp = poolPrice();
-        vm.prank(keeper);
-        module.increasePosition(a, ps[0].tokenId, liq, m0, m1, kp);
+        uint256 id = module.mintPosition(a, tl, tu, liq / 20, m0, m1, kp); // a part fits
+        // days 2 and 3: the rest, about half of the value a day
+        for (uint256 d; d < 2; ++d) {
+            vm.warp(vm.getBlockTimestamp() + 27 hours);
+            _report();
+            _stable();
+            (liq, m0, m1) = _liqFor(a, tl, tu, a.balance, usdc.balanceOf(a));
+            kp = poolPrice();
+            vm.prank(keeper);
+            module.increasePosition(a, id, d == 0 ? liq / 2 : liq, m0, m1, kp);
+        }
         assertEq(_exitUsed(a), 0, "the exit window has expired; re-entry used only turnover");
         assertGt(module.accountValue(a, module.lastPrice()), nav * 99 / 100);
     }

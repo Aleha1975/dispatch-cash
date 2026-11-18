@@ -187,3 +187,17 @@ def test_fee_gate_and_trailing_low():
     assert not _g(trailing_low=lo).fee_gate()  # anchor 2% above the low > poolBandBps 1.5%
     assert _g(trailing_low=39_500_000).fee_gate()
     assert not _g(pool_price=39_990_000).fee_gate()  # anchor above the pool
+
+
+def test_sa5_fee_gate_and_drift_limit_use_confirmed_level():
+    """SA-5 M-2 / M-3: the guardian-confirmed level (priceBudget().base) is part of the fee gate's low and bounds the
+    anchor's walk to refDriftBps."""
+    pb = {"priceBase": 38_000_000}
+    g = _g(trailing_low=39_900_000, price_budget=pb)
+    assert g.price_base == 38_000_000
+    assert not g.fee_gate() and not g.base_gate()  # 5.3% above the confirmed level > poolBandBps
+    assert _g(trailing_low=39_900_000, price_budget={"priceBase": 39_700_000}).fee_gate()
+    assert _g(trailing_low=39_900_000).fee_gate()  # no base known: the 24 h low alone
+    assert _g(last_price=41_800_000, pool_price=41_800_000, price_budget=pb).at_drift_limit()  # 38 x 1.1
+    assert _g(last_price=34_546_000, pool_price=34_546_000, price_budget=pb).at_drift_limit()  # 38 / 1.1
+    assert not _g(price_budget=pb).at_drift_limit()

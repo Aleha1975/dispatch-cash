@@ -146,6 +146,9 @@ charge).
   window instead of reverting. SA-4 M-1: the anchor moves at most one `poolBandBps` step per `minPriceStable`, so in a
   fast fall the exit sale waits until the anchor has caught up (about 5 minutes per 1.5%) or the guardian approves a
   range; the exit sale is never available on an untrusted anchor or while paused (SA-4 M-4 decision).
+- SA-5 M-2: LP adds are charged 1:1 (their whole principal), so re-entry at 5000 takes three days (about 0.4 swap +
+  0.95 adds of value), and in a fall of more than `refDriftBps` from the guardian-confirmed level the exit sale waits for
+  the guardian's `approvePrice`. SA-5 I-2: the keeper sells into the exit room and the turnover room in separate swaps.
 
 ### The change (implemented, `src/sa`, folded into audit round 4)
 

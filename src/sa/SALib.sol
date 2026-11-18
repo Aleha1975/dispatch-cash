@@ -70,6 +70,7 @@ library SALib {
     error StalePrice(); // same selector as LPManagerModule.StalePrice
     error HedgeCap(uint256 after_, uint256 cap); // same selector as LPManagerModule.HedgeCap
     error ZeroAmount(); // same selector as LPManagerModule.ZeroAmount
+    error BadParam(); // same selector as LPManagerModule.BadParam
 
     event Registered(address indexed account, bytes32 delegationHash, uint8 kind, uint256 until, bool first);
     event HedgeMarginReturned(address indexed account, uint256 amount, uint256 hedgeEquity, uint256 netMargin);
@@ -92,7 +93,8 @@ library SALib {
         uint256 lastFeeTime;
         uint256 feesPaid;
         uint256 hedgeTime; // last hedge report
-        uint256 pricedFlowTime; // SA-4 M-2: last booking of a client flow with a price-dependent term (fee waits 1 day)
+        uint256 pricedFlowTime; // SA-4 M-2: last booking of a material client flow with a price term (fee waits 1 day)
+        uint256 bookPrice; // SA-5 M-4: the anchor of the account's last priced sync
     }
 
     struct Budgets {
@@ -109,6 +111,10 @@ library SALib {
         uint256 lo; // guardian range, one-shot
         uint256 hi;
         uint256 until;
+        /// SA-5 M-2 / M-3: the guardian-confirmed level: the first report, then every report that consumed a guardian
+        /// range. It is part of every range bound (`_bounds`): a keeper-only walk stays within refDriftBps of it over
+        /// any number of days, and a fee is measured at most poolBandBps above it.
+        uint256 base;
         SARange.R range; // SA-3: trailing 24 h (min, max) of the anchor: the drift budget is net displacement
     }
 
@@ -333,6 +339,21 @@ library SALib {
         if (t.balanceOf(a) - b0 != amount) revert TransferMismatch();
     }
 
+    // ------------------------------------------------------------------ params
+    /// @notice LPManagerModule._setParams bounds, on abi.encode(Params) (11 words in declaration order): feeBps <= 2000,
+    ///         hedgeCapBps <= 3500, poolBandBps 1..500, maxSlippageBps 1..500, hedgeStepBps <= 2000, refDriftBps <= 2000,
+    ///         swapTurnoverBps <= 50000, feeInterval 7..365 days, maxPriceAge 60 s..1 day, minPriceStable (SA-5 L-4)
+    ///         300 s..1 day, exitTurnoverBps <= 10000, and (SA-5 L-4) the stolen-keeper bound per 24 h
+    ///         (refDrift + band + slippage) x (turnover + exit) <= 40% of the value.
+    function checkParams(bytes memory e) external pure {
+        uint256[11] memory q = abi.decode(e, (uint256[11]));
+        if (
+            q[0] > 2_000 || q[1] > 3_500 || q[2] == 0 || q[2] > 500 || q[3] == 0 || q[3] > 500 || q[4] > 2_000
+                || q[5] > 2_000 || q[6] > 50_000 || q[7] < 7 days || q[7] > 365 days || q[8] < 60 || q[8] > 1 days
+                || q[9] < 300 || q[9] > 1 days || q[10] > 10_000 || (q[5] + q[2] + q[3]) * (q[6] + q[10]) > 4_000 * BPS
+        ) revert BadParam();
+    }
+
     // ------------------------------------------------------------------ fee
     /// @notice Per-account high-water-mark fee, at most `maxFee` (L-11: a partial fee advances the mark only by the
     ///         gain it actually charged). `profit` = account value - net contributions; `hwm` = profit already charged.
@@ -355,25 +376,27 @@ library SALib {
 
     // ------------------------------------------------------------------ budgets
     /// @notice Move the anchor `ref` toward `p` (SA-3: net displacement, not path length). The first report
-    ///         (ref == 0) is free. A new anchor must stay inside [max / (1 + cap), min * (1 + cap)], where min / max
-    ///         are the lowest / highest anchor held during the trailing 24 h (SARange), so the anchor's 24 h range is
-    ///         at most 1 + cap and an oscillation that comes back costs nothing. SA-4 M-1: one keeper report moves the
-    ///         anchor at most `stepBps` of it, and not at all until the last move is `stable` (minPriceStable), so a
-    ///         walk of the whole budget takes about cap / step confirmed reports in public view. Cap 0 (paused)
-    ///         freezes the anchor. SA-4 L-8: when the window no longer contains the anchor (a lowered cap), only a
-    ///         value inside the window is applied, never a clamp against the report. A report inside an open guardian
-    ///         range (one-shot) consumes it (SA-4 L-4); if the report did not fit the keeper's budget it is applied
-    ///         unclipped and starts a new window (history forgotten: an approval never leaves the keeper without
-    ///         room, SA-3 M-7 / L-2).
+    ///         (ref == 0) is free and sets the guardian-confirmed level `base`. A new anchor must stay inside
+    ///         [max / (1 + cap), min * (1 + cap)], where min / max are the lowest / highest of `base` and every anchor
+    ///         held during the trailing 24 h (SARange), so the anchor's 24 h range is at most 1 + cap, an oscillation
+    ///         that comes back costs nothing and (SA-5 M-2) the anchor never leaves base * (1 + cap)^(+-1) without the
+    ///         guardian, however many days the keeper walks. SA-4 M-1: one keeper report moves the anchor at most
+    ///         `stepBps` of it, and not at all until the last move is `stable` (minPriceStable). Cap 0 (paused) freezes
+    ///         the anchor. SA-4 L-8: when the window no longer contains the anchor (a lowered cap), only a value inside
+    ///         the window is applied, never a clamp against the report. A report inside an open guardian range
+    ///         (one-shot) consumes it (SA-4 L-4) and becomes the new `base`; if the report did not fit the keeper's
+    ///         budget it is applied unclipped and starts a new window (history forgotten: an approval never leaves the
+    ///         keeper without room, SA-3 M-7 / L-2).
     function movePrice(PriceBudget storage b, uint256 ref, uint256 p, uint256 capWad, uint256 stepBps, bool stable)
         external
         returns (uint256, bool)
     {
         if (ref == 0) {
+            b.base = p;
             SARange.record(b.range, p);
             return (p, false);
         }
-        (uint256 lo, uint256 hi) = SARange.bounds(b.range, ref);
+        (uint256 lo, uint256 hi) = _bounds(b, ref);
         uint256 up = Math.mulDiv(lo, WAD + capWad, WAD);
         uint256 dn = Math.mulDiv(hi, WAD, WAD + capWad, Math.Rounding.Ceil);
         uint256 st = stable ? Math.mulDiv(ref, stepBps, BPS) : 0;
@@ -390,6 +413,7 @@ library SALib {
         bool clipped = q != p;
         if (block.timestamp <= b.until && p >= b.lo && p <= b.hi) {
             b.until = 0;
+            b.base = p; // SA-5 M-2: the guardian confirmed this level
             if (clipped) {
                 SARange.reset(b.range);
                 SARange.record(b.range, p);
@@ -401,12 +425,35 @@ library SALib {
         return (q, clipped);
     }
 
+    /// @dev (min, max) of the anchor's trailing 24 h range, `ref` and (SA-5 M-2 / M-3) the guardian-confirmed `base`.
+    function _bounds(PriceBudget storage b, uint256 ref) private view returns (uint256 lo, uint256 hi) {
+        (lo, hi) = SARange.bounds(b.range, ref);
+        uint256 g = b.base;
+        if (g != 0) {
+            if (g < lo) lo = g;
+            if (g > hi) hi = g;
+        }
+    }
+
     /// @notice SA-3 M-3 / M-6: a fee is measured at the anchor (the booking price), and only while the anchor is not
     ///         above the pool and not more than `bandBps` above the lowest anchor of the trailing 24 h. A walked-up
-    ///         anchor must therefore be held in public view for a day before it can carry a fee.
+    ///         anchor must therefore be held in public view for a day before it can carry a fee. SA-5 M-3: nor more
+    ///         than `bandBps` above the guardian-confirmed `base` (the low no longer follows a walk of several days).
     function feeGate(PriceBudget storage b, uint256 ref, uint256 pool, uint256 bandBps) external view {
-        (uint256 lo,) = SARange.bounds(b.range, ref);
+        (uint256 lo,) = _bounds(b, ref);
         if (ref > pool || ref * BPS > lo * (BPS + bandBps)) revert StalePrice();
+    }
+
+    /// @notice SA-5 I-1: the guardian's one-shot range, at most `maxWidthBps` wide (lo > 0, until <= now + ttl).
+    function approvePrice(PriceBudget storage b, uint256 lo, uint256 hi, uint256 until, uint256 ttl, uint256 maxWidthBps)
+        external
+    {
+        if (lo == 0 || lo > hi || hi * BPS > lo * (BPS + maxWidthBps) || until > block.timestamp + ttl) {
+            revert BadParam();
+        }
+        b.lo = lo;
+        b.hi = hi;
+        b.until = until;
     }
 
     /// @notice New hedge equity for a keeper report `v`. The guardian's approval for exactly this account, epoch,
@@ -482,7 +529,7 @@ library SALib {
     /// @notice SA-3: the anchor's trailing 24 h range (max / min - 1, WAD) given the current anchor `ref`.
     function priceUsed(PriceBudget storage b, uint256 ref) external view returns (uint256) {
         if (ref == 0) return 0;
-        (uint256 lo, uint256 hi) = SARange.bounds(b.range, ref);
+        (uint256 lo, uint256 hi) = _bounds(b, ref);
         return Math.mulDiv(hi - lo, WAD, lo);
     }
 

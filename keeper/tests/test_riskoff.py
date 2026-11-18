@@ -271,14 +271,14 @@ def test_keeper_exit_limited_by_exit_room(tmp_path):
 
 
 def test_keeper_exit_falls_back_to_turnover_room(tmp_path):
-    """SA-4 L-6: an exit sale beyond the exit window is charged to the turnover window on chain; the keeper counts
-    both rooms."""
+    """SA-4 L-6: an exit sale beyond the exit window is charged to the turnover window on chain; the keeper uses
+    both rooms. SA-5 I-2: one sale is never split between the windows, so the keeper sends one sale per window."""
     acct = snap(positions=[], native=20 * E18, usdc=200 * E6, value=1000 * E6,
                 windows={"turnoverUsed": 400 * E6, "exitUsed": 900 * E6})
     k = ro_keeper(tmp_path, acct)
     _turnover_bps(k, 5000)  # 500 of turnover, 100 left
     k.account_tick(ACCOUNT, 40_000_000, k.r.global_snap(), NOW, 0.12)
-    assert k.sold[0][1] == 196 * E6 * E18 // 40_000_000  # 98% of (100 exit + 100 turnover)
+    assert [x[1] for x in k.sold] == [98 * E6 * E18 // 40_000_000] * 2  # 98% of the 100 exit, then of the 100 turnover
 
 
 def test_keeper_7702_keeps_gas_reserve(tmp_path):

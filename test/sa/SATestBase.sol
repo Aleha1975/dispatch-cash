@@ -371,6 +371,16 @@ abstract contract SATestBase is Test {
         }
     }
 
+    /// SA-5 M-2 / M-3: the guardian confirms the market (a range of +-0.5% around the pool) and the keeper's next
+    /// report consumes it: the anchor's confirmed level (`base`) is the pool price.
+    function _confirm() internal {
+        uint256 p = poolPrice();
+        vm.prank(guardian);
+        module.approvePrice(p * 995 / 1000, p * 1005 / 1000, vm.getBlockTimestamp() + 1 hours);
+        vm.prank(keeper);
+        module.reportPrice(p);
+    }
+
     function _report() internal {
         uint256 p = poolPrice();
         vm.prank(keeper);
@@ -608,37 +618,59 @@ abstract contract SATestBase is Test {
         int256 sa = s.snapAsset;
         int256 sb = s.snapBase;
         V4PositionMath.Position[] memory ps = module.positionsOf(a);
-        for (uint256 i; i < ps.length; ++i) {
-            uint128 liq;
-            bool owned;
-            try POSM.ownerOf(ps[i].tokenId) returns (address o) {
-                if (o == a) {
-                    liq = POSM.getPositionLiquidity(ps[i].tokenId);
-                    owned = true;
-                }
-            } catch {}
-            (uint128 old, uint256 g0, uint256 g1, uint256 G0, uint256 G1) = module.snapPos(ps[i].tokenId);
-            (, uint256 l0, uint256 l1) = PM.getPositionInfo(
-                key.toId(), POSM_ADDR, ps[i].tickLower, ps[i].tickUpper, bytes32(ps[i].tokenId)
-            );
-            (uint256 gg0, uint256 gg1) = PM.getFeeGrowthGlobals(key.toId());
-            // SA-4 H-1: only an owned, unchanged position; only up to the global growth; at most the idle surplus
-            uint128 n = owned && liq == old ? old : 0;
-            unchecked {
-                if (l0 - g0 > gg0 - G0 || l1 - g1 > gg1 - G1) n = 0;
-                int256 cb = int256(FullMath.mulDiv(l0 - g0, n, 1 << 128));
-                int256 ca = int256(FullMath.mulDiv(l1 - g1, n, 1 << 128));
-                int256 rb = int256(a.balance) - sb;
-                int256 ra = int256(usdc.balanceOf(a)) - sa;
-                sb += rb <= 0 ? int256(0) : (cb > rb ? rb : cb);
-                sa += ra <= 0 ? int256(0) : (ca > ra ? ra : ca);
-            }
-            f += int256(V4PositionMath.liquidityValue(ps[i].tickLower, ps[i].tickUpper, liq, ref, true))
-                - int256(V4PositionMath.liquidityValue(ps[i].tickLower, ps[i].tickUpper, old, ref, true));
+        for (uint256 i = ps.length; i != 0;) {
+            --i;
+            (int256 ca, int256 cb, int256 dv) = _pendingPos(a, ps[i], sa, sb, ref);
+            sa += ca;
+            sb += cb;
+            f += dv;
         }
         f += int256(usdc.balanceOf(a)) - sa;
         int256 db = int256(a.balance) - sb;
         f += db >= 0 ? int256(uint256(db) * ref / 1e18) : -int256((uint256(-db) * ref + 1e18 - 1) / 1e18);
+    }
+
+    /// SABook._feesOut: (asset credit, base credit) of `p` for liquidity `n` against snapshots (sa, sb) of `a`.
+    function _credit(address a, V4PositionMath.Position memory p, uint128 n, int256 sa, int256 sb)
+        internal
+        view
+        returns (int256 ca, int256 cb)
+    {
+        (, uint128 seen, uint256 g0, uint256 g1, uint256 G0, uint256 G1) = module.snapPos(p.tokenId);
+        (, uint256 l0, uint256 l1) = PM.getPositionInfo(key.toId(), POSM_ADDR, p.tickLower, p.tickUpper, bytes32(p.tokenId));
+        (uint256 gg0, uint256 gg1) = PM.getFeeGrowthGlobals(key.toId());
+        // SA-4 H-1 / SA-5 M-1: unchanged at the last look too; only up to the global growth
+        if (seen != n) n = 0;
+        unchecked {
+            if (l0 - g0 > gg0 - G0 || l1 - g1 > gg1 - G1) n = 0;
+            cb = int256(FullMath.mulDiv(l0 - g0, n, 1 << 128));
+            ca = int256(FullMath.mulDiv(l1 - g1, n, 1 << 128));
+        }
+        int256 rb = int256(a.balance) - sb;
+        int256 ra = int256(usdc.balanceOf(a)) - sa;
+        if (ra < 0 || rb < 0) return (0, 0); // SA-5 M-1: a mix change is not yield
+        cb = cb > rb ? rb : cb;
+        ca = ca > ra ? ra : ca;
+    }
+
+    /// (asset credit, base credit, liquidity value change at `ref`) of one tracked position (SABook.sync).
+    function _pendingPos(address a, V4PositionMath.Position memory p, int256 sa, int256 sb, uint256 ref)
+        internal
+        view
+        returns (int256 ca, int256 cb, int256 dv)
+    {
+        uint128 liq;
+        bool owned;
+        try POSM.ownerOf(p.tokenId) returns (address o) {
+            if (o == a) {
+                liq = POSM.getPositionLiquidity(p.tokenId);
+                owned = true;
+            }
+        } catch {}
+        (uint128 old,,,,,) = module.snapPos(p.tokenId);
+        (ca, cb) = _credit(a, p, owned && liq == old ? old : 0, sa, sb);
+        dv = int256(V4PositionMath.liquidityValue(p.tickLower, p.tickUpper, liq, ref, true))
+            - int256(V4PositionMath.liquidityValue(p.tickLower, p.tickUpper, old, ref, true));
     }
 
     function _syncTouch(address a) internal {

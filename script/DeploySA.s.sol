@@ -31,7 +31,8 @@ import {LPManagerModule} from "../src/sa/LPManagerModule.sol";
 /// not an EOA and not an EIP-7702-delegated EOA; SA-3 L-13, SA-4 L-13).
 /// Params: the PILOT values are the script's (SA-4 L-12: swapTurnoverBps 5000, exitTurnoverBps 10000) and are read
 /// back from the deployed module; onboard nobody before `params()` equals them.
-/// After deploying: the keeper calls reportPrice once (anchor), the treasury approves the module for USDC.
+/// After deploying: the keeper calls reportPrice once (anchor; SA-5 M-2: also the first guardian-confirmed level, so
+/// report the checked market price), the treasury approves the module for USDC.
 interface IPausable {
     function paused() external view returns (bool);
 }

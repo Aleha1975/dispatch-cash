@@ -355,6 +355,12 @@ contract LPManagerModuleTest is SATestBase {
         assertApproxEqRel(module.lastPrice(), anchor * 110 / 100, 1e15);
         vm.warp(vm.getBlockTimestamp() + 27 hours); // the sliding window has passed
         _reportSteps(p, 2);
+        // SA-5 M-2: but the anchor stays within refDriftBps of the guardian-confirmed level, however long the walk
+        assertTrue(module.lastPriceClipped());
+        assertApproxEqRel(module.lastPrice(), anchor * 110 / 100, 1e15);
+        vm.prank(guardian);
+        module.approvePrice(p * 995 / 1000, p * 1005 / 1000, vm.getBlockTimestamp() + 1 hours);
+        _reportSteps(p, 1); // consumes the range: the new confirmed level
         assertFalse(module.lastPriceClipped());
         assertEq(module.lastPrice(), p);
         // paused: frozen, unless the guardian approves a range
@@ -367,7 +373,7 @@ contract LPManagerModuleTest is SATestBase {
         module.reportPrice(p2);
         assertEq(module.lastPrice(), p);
         vm.prank(guardian);
-        module.approvePrice(p2 * 99 / 100, p2 * 101 / 100, block.timestamp + 1 hours);
+        module.approvePrice(p2 * 99 / 100, p2 * 101 / 100, vm.getBlockTimestamp() + 1 hours);
         vm.prank(keeper);
         module.reportPrice(p2);
         assertEq(module.lastPrice(), p2);

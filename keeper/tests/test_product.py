@@ -368,7 +368,7 @@ def test_pos_half_width_and_charge():
     v = 1000 * E6
     centre = rerange_charge(v, 0, (-600, 600), (-600, 600), 150, 150)
     edge = rerange_charge(v, -540, (-600, 600), (-1140, 60), 150, 150)
-    assert centre == pytest.approx(v * 0.5, rel=1e-6)  # no swap, only the add charge
+    assert centre == pytest.approx(v * 1.0, rel=1e-6)  # no swap, only the add charge (SA-5 M-2: whole principal)
     assert edge > centre
 
 

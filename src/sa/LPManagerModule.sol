@@ -54,19 +54,24 @@ import {Delegation, IDelegationManager} from "./vendor/DelegationFramework.sol";
 ///         D. Fee and custody decisions value positions at the anchor. Booking, fees, swaps and adds need a trusted
 ///            anchor (fresh, unclipped, unchanged for minPriceStable, reported within the last minPriceStable, pool
 ///            within BOOK_BAND_BPS); the fee is measured at the anchor (the booking price) only while the anchor is not
-///            above the pool nor above its trailing 24 h low by more than the band, a day after the last booking of a
-///            price-dependent client flow (SA-4 M-2), and needs a recent, not clipped-down hedge report (SA-3).
+///            above the pool nor above its trailing 24 h low or (SA-5 M-3) the guardian-confirmed level by more than
+///            the band, a day after the last booking of a material price-dependent client flow (SA-4 M-2, SA-5 L-1),
+///            and needs a recent, not clipped-down hedge report (SA-3). SA-5 M-4: a priced flow booked at another
+///            anchor than the account's previous priced booking raises the high-water mark by its largest possible
+///            gain between the two (a late booking can only lower the fee).
 ///         E. Budgets are sliding 24 h windows (SAWindow): <= 1x per any 24 h, measured on the value without hedge
-///            equity above the net margin sent (SA-4 M-3). The anchor's budget is its trailing 24 h range (SARange,
-///            net displacement; no path budget, SA-4 I-9) and SA-4 M-1 one step of at most poolBandBps per
-///            minPriceStable.
+///            equity above the net margin sent (SA-4 M-3); an LP add is charged at its whole principal (SA-5 M-2). The
+///            anchor's budget is its trailing 24 h range (SARange, net displacement; no path budget, SA-4 I-9), SA-4
+///            M-1 one step of at most poolBandBps per minPriceStable, and SA-5 M-2 refDriftBps around the
+///            guardian-confirmed level (an absolute bound: the keeper alone never walks it further, however long).
 ///         F. Guardian approvals bind (account, epoch, stored value, guardian era), are one-shot, expire within
 ///            1 day and are voided by a guardian change or a pause.
 ///         G. Keeper margin returns <= min(hedge equity, net margin sent) of the account (SA-4 M-3); pause stops
 ///            margin sends and keeper-only equity decreases; roles pairwise distinct.
 ///         H. `revoke` is the exit step that cannot fail silently.
 ///
-///         ROLES: owner = VaultTimelock (keeper/guardian rotation, bounded params; can never move client funds);
+///         ROLES: owner = VaultTimelock (keeper/guardian rotation, bounded params, SA-5 L-4 incl. their product; can
+///         never move client funds);
 ///         keeper (hot key, all actions above, multicall over many accounts); guardian (pause, price-range and
 ///         hedge-equity co-signatures; cannot unpause or move funds).
 contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
@@ -75,14 +80,13 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
 
     uint256 internal constant BPS = 10_000;
     uint256 internal constant WAD = 1e18;
+    /// Parameter bounds: enforced by SALib.checkParams (SA-5: moved there for EIP-170), listed here for reference:
+    /// poolBandBps, maxSlippageBps 1..500; hedgeStepBps, refDriftBps <= 2000; swapTurnoverBps <= 50000;
+    /// exitTurnoverBps <= 10000 (R4: at most 1x the account value per 24 h); feeInterval 7..365 days; maxPriceAge
+    /// 60 s..1 day; minPriceStable 300 s..1 day; (refDrift + band + slippage) x (turnover + exit) <= 40% (SA-5 L-4).
     uint256 public constant MAX_FEE_BPS = 2_000;
     uint256 public constant MAX_HEDGE_CAP_BPS = 3_500;
     uint256 internal constant MAX_POOL_BAND_BPS = 500;
-    uint256 internal constant MAX_SLIPPAGE_BPS = 500;
-    uint256 internal constant MAX_HEDGE_STEP_BPS = 2_000;
-    uint256 internal constant MAX_REF_DRIFT_BPS = 2_000;
-    uint256 internal constant MAX_TURNOVER_BPS = 50_000;
-    uint256 internal constant MAX_EXIT_TURNOVER_BPS = 10_000; // R4: at most 1x the account value per 24 h
     uint256 public constant MIN_FEE_INTERVAL = 7 days; // == ElysiumCustodyEnforcer.FEE_INTERVAL
     uint256 internal constant FEE_MAX_BPS = 2_000; // == ElysiumCustodyEnforcer.FEE_MAX_BPS (fee <= 20% of idle USDC)
     uint256 public constant MAX_POSITIONS = 4;
@@ -142,14 +146,14 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     uint256 public lastPriceTime; // last report (freshness)
     uint256 public lastPriceMoved; // last change of the anchor value (stable window)
     uint256 public lastReported; // the keeper's last reported price
-    SALib.PriceBudget public priceBudget; // getter: (lo, hi, until) of the guardian range
+    SALib.PriceBudget public priceBudget; // getter: (lo, hi, until) of the guardian range, base (SA-5 M-2), range
 
     // ------------------------------------------------------------------ accounts
     mapping(address => SALib.Account) internal accounts;
     mapping(address => bytes) public permissionContext; // abi.encode(Delegation[1])
     mapping(address => SALib.Budgets) public budgets; // getter: hedge approval (value, epoch + 1, until, era)
     mapping(address => V4PositionMath.Position[]) internal _positions;
-    mapping(uint256 => SABook.Pos) public snapPos; // getter: (liquidity, feeGrowth0 mark, feeGrowth1 mark) (SA-3 M-1)
+    mapping(uint256 => SABook.Pos) public snapPos; // getter: (liq, seen, g0, g1, G0, G1) (SA-3 M-1, SA-4 H-1, SA-5 M-1)
     SALib.Venue internal venue;
 
     // ------------------------------------------------------------------ events
@@ -588,7 +592,8 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     ///         (SALib.feeGate), so a walked anchor must be held for a day in public view before it carries a fee.
     ///         SA-4 M-2: not within a day of the last booking of a price-dependent client flow (the keeper books every
     ///         flow with sync(a) at once, so the fee never rides on a flow booked at a moved anchor in the same day).
-    ///         SA-4 M-3: profit is measured without hedge equity above the net margin sent.
+    ///         SA-4 M-3: profit is measured without hedge equity above the net margin sent. SA-5 M-3: nor more than
+    ///         poolBandBps above the guardian-confirmed level (SALib.feeGate).
     function chargeFee(address a) external nonReentrant onlyKeeper whenNotPaused returns (uint256 f) {
         if (!_trusted()) revert StalePrice();
         _live(a);
@@ -646,14 +651,12 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     }
 
     // ------------------------------------------------------------------ guardian
-    /// @notice One-shot price range: the next report inside [lo, hi] before `until` (<= 1 day) that does not fit the
-    ///         keeper's budget is applied unclipped and starts a new 24 h window (SA-3); then the range is gone.
-    ///         Cleared by a pause and a guardian change.
+    /// @notice One-shot price range: the next report inside [lo, hi] before `until` (<= 1 day) consumes it and becomes
+    ///         the guardian-confirmed level the anchor is bound to (SA-5 M-2); if it does not fit the keeper's budget it
+    ///         is applied unclipped and starts a new 24 h window (SA-3). Cleared by a pause and a guardian change. SA-5
+    ///         I-1: at most 10% wide.
     function approvePrice(uint256 lo, uint256 hi, uint256 until) external onlyGuardian {
-        if (lo == 0 || lo > hi || until > block.timestamp + MAX_APPROVAL_TTL) revert BadParam();
-        priceBudget.lo = lo;
-        priceBudget.hi = hi;
-        priceBudget.until = until;
+        SALib.approvePrice(priceBudget, lo, hi, until, MAX_APPROVAL_TTL, 2 * MAX_POOL_BAND_BPS); // SA-5 I-1: <= 10% wide
         emit PriceApproved(lo, hi, until);
     }
 
@@ -730,13 +733,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
     }
 
     function _setParams(Params memory p) internal {
-        if (
-            p.feeBps > MAX_FEE_BPS || p.hedgeCapBps > MAX_HEDGE_CAP_BPS || p.poolBandBps == 0
-                || p.poolBandBps > MAX_POOL_BAND_BPS || p.maxSlippageBps == 0 || p.maxSlippageBps > MAX_SLIPPAGE_BPS
-                || p.hedgeStepBps > MAX_HEDGE_STEP_BPS || p.refDriftBps > MAX_REF_DRIFT_BPS
-                || p.swapTurnoverBps > MAX_TURNOVER_BPS || p.exitTurnoverBps > MAX_EXIT_TURNOVER_BPS || p.feeInterval < MIN_FEE_INTERVAL || p.feeInterval > 365 days
-                || p.maxPriceAge < 60 || p.maxPriceAge > 1 days || p.minPriceStable < 60 || p.minPriceStable > 1 days
-        ) revert BadParam();
+        SALib.checkParams(abi.encode(p)); // bounds per parameter and (SA-5 L-4) of their product
         params = p;
         emit ParamsSet(p);
     }
@@ -804,7 +801,7 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
         uint256 ref = lastPrice;
         uint256 nav = _nav(a, ref);
         (int256 dA, int256 dB, uint256 charge) =
-            SABook.lpAdd(venue, p, liq, ref, params.maxSlippageBps, params.poolBandBps);
+            SABook.lpAdd(venue, p, liq, ref, params.maxSlippageBps);
         _useTurnover(a, charge, nav, false);
         _modify(a, data, m0, m1);
         SABook.book(accounts[a], snapPos, venue, p, dA, dB, int256(uint256(liq)));
@@ -877,10 +874,13 @@ contract LPManagerModule is Ownable2Step, ReentrancyGuardTransient {
             && d * BPS <= pool * BOOK_BAND_BPS;
     }
 
-    /// @notice Book account `a`'s pending client flow now (SA-3 M-5): anyone, only at a trusted anchor, so the
-    ///         booking moment is not the keeper's choice alone; SA-4 M-3: only for a registered account.
+    /// @notice Book account `a`'s pending client flow now (SA-3 M-5): the keeper, the account or its pinned owner, so
+    ///         the booking moment is not the keeper's choice alone (SA-5 L-3: no third party picks it with a pool push),
+    ///         only at a trusted anchor; SA-4 M-3: only for a registered account.
     function sync(address a) external nonReentrant {
-        if (accounts[a].delegationHash == 0) revert NotRegistered();
+        SALib.Account storage s = accounts[a];
+        if (s.delegationHash == 0) revert NotRegistered();
+        if (msg.sender != keeper && msg.sender != a && msg.sender != s.owner) revert NotOwnAccount();
         if (!_trusted()) revert StalePrice();
         _sync(a);
     }

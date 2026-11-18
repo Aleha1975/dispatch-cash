@@ -114,8 +114,9 @@ contract SARound2Test is SATestBase {
         _report();
         _reportEquity(a, 0);
         assertEq(_acct(a).contributed, c0, "not booked at a clipped anchor");
-        vm.prank(guardian);
-        module.approvePrice(ref, ref * 2, block.timestamp + 1 hours);
+        uint256 pp = poolPrice();
+        vm.prank(guardian); // SA-5 I-1: a range at most 10% wide around the market
+        module.approvePrice(pp * 99 / 100, pp * 101 / 100, vm.getBlockTimestamp() + 1 hours);
         _report();
         assertFalse(module.lastPriceClipped());
         _stable();
@@ -378,9 +379,10 @@ contract SARound2Test is SATestBase {
     function test_M4_PoC_SaturatedWindowOneUnitDoesNotBlock() public {
         (address a,) = _withHype(ALICE_PK, 20_000e6);
         uint256 p0 = module.lastPrice();
-        vm.prank(guardian);
-        module.approvePrice(p0, p0 * 2, block.timestamp + 1 hours);
         _moveTo(p0 * 125 / 100);
+        uint256 pp = poolPrice();
+        vm.prank(guardian); // SA-5 I-1: a range at most 10% wide around the market
+        module.approvePrice(pp * 99 / 100, pp * 101 / 100, vm.getBlockTimestamp() + 1 hours);
         _report();
         (,, uint256 pu,) = module.windows(address(0));
         assertEq(pu, 0, "a new window, not a full one");

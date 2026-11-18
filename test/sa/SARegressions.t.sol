@@ -553,8 +553,13 @@ contract SARegressionsTest is SATestBase {
         _reportTo();
         assertTrue(module.lastPriceClipped());
         assertApproxEqRel(module.lastPrice(), p0 * 110 / 100, 0.001e18);
-        // once the low of p0 has left the window (24-27 h after it was last held), the anchor follows
+        // once the low of p0 has left the window (24-27 h after it was last held), the anchor would follow; SA-5 M-2:
+        // it stays within refDriftBps of the guardian-confirmed level (the first report, p0) until the guardian moves it
         vm.warp(vm.getBlockTimestamp() + 27 hours);
+        _reportTo();
+        assertApproxEqRel(module.lastPrice(), p0 * 110 / 100, 0.001e18);
+        vm.prank(guardian);
+        module.approvePrice(p * 995 / 1000, p * 1005 / 1000, vm.getBlockTimestamp() + 1 hours);
         _reportTo();
         assertEq(module.lastPrice(), p);
     }
@@ -609,25 +614,29 @@ contract SARegressionsTest is SATestBase {
         module.approvePrice(0, 1, block.timestamp + 1 hours);
         vm.expectRevert(LPManagerModule.BadParam.selector);
         module.approvePrice(1, 2, block.timestamp + 1 days + 1);
-        module.approvePrice(p0 / 2, p0 * 2, block.timestamp + 1 hours);
+        vm.expectRevert(LPManagerModule.BadParam.selector); // SA-5 I-1: at most 10% wide
+        module.approvePrice(p0, p0 * 1101 / 1000, block.timestamp + 1 hours);
+        module.approvePrice(p0, p0 * 11 / 10, block.timestamp + 1 hours);
         vm.stopPrank();
         _moveTo(p0 * 101 / 100);
         vm.warp(vm.getBlockTimestamp() + 300);
         _report(); // fits the keeper's room (one step): applied as is
         assertEq(module.lastPrice(), poolPrice());
         assertFalse(module.lastPriceClipped());
-        (,, uint256 until,) = module.priceBudget();
+        (,, uint256 until, uint256 base,) = module.priceBudget();
         assertEq(until, 0, "SA-4 L-4: the first report inside the range consumes it, clipped or not");
+        assertEq(base, poolPrice(), "SA-5 M-2: and becomes the confirmed level");
         (,, uint256 pu,) = module.windows(address(0));
         assertGt(pu, 0.009e18, "the trailing range");
-        vm.prank(guardian);
-        module.approvePrice(p0 / 2, p0 * 2, block.timestamp + 1 hours);
         _moveTo(p0 * 125 / 100);
+        uint256 pp = poolPrice();
+        vm.prank(guardian);
+        module.approvePrice(pp * 99 / 100, pp * 101 / 100, vm.getBlockTimestamp() + 1 hours);
         vm.warp(vm.getBlockTimestamp() + 300);
         _report(); // beyond the room: the range applies it unclipped and is consumed
         assertApproxEqRel(module.lastPrice(), p0 * 125 / 100, 0.001e18);
         assertFalse(module.lastPriceClipped());
-        (,, until,) = module.priceBudget();
+        (,, until,,) = module.priceBudget();
         assertEq(until, 0, "one-shot");
         (,, pu,) = module.windows(address(0));
         assertEq(pu, 0, "SA-3: an approved level starts a new window, it does not consume the keeper's room");
@@ -640,8 +649,9 @@ contract SARegressionsTest is SATestBase {
         assertApproxEqRel(module.lastPrice(), p0 * 1375 / 1000, 0.001e18);
         assertFalse(module.lastPriceClipped(), "within the band of the report");
         // cleared by a pause
+        pp = poolPrice();
         vm.prank(guardian);
-        module.approvePrice(p0 / 2, p0 * 2, block.timestamp + 1 hours);
+        module.approvePrice(pp * 99 / 100, pp * 101 / 100, vm.getBlockTimestamp() + 1 hours);
         vm.prank(guardian);
         module.setPaused(true);
         uint256 frozen = module.lastPrice();

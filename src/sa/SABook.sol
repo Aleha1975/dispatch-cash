@@ -36,11 +36,13 @@ library SABook {
 
     event Flow(address indexed account, int256 value);
 
-    /// @notice Per tracked position: the liquidity the books account for, (SA-3 M-1) PoolManager's
-    ///         feeGrowthInside{0,1}LastX128 of the position and (SA-4 H-1) the pool's feeGrowthGlobal{0,1}X128, both as
-    ///         of the books' last look (after a module modify, or a sync).
+    /// @notice Per tracked position: the liquidity the books account for, (SA-5 M-1) PoolManager's liquidity of the
+    ///         position at the books' last look, (SA-3 M-1) PoolManager's feeGrowthInside{0,1}LastX128 of the position
+    ///         and (SA-4 H-1) the pool's feeGrowthGlobal{0,1}X128 as of the moment that fee mark was taken (SA-5 L-2:
+    ///         the global mark moves only when the position's mark moves, so both span the same interval).
     struct Pos {
         uint128 liq;
+        uint128 seen;
         uint256 g0;
         uint256 g1;
         uint256 G0;
@@ -51,15 +53,20 @@ library SABook {
     ///         First, at every sync (also while the anchor is not trusted; it needs no price): LP fees that left a
     ///         tracked position outside a module action (the client's own collect) are added to the snapshot, exactly
     ///         as the module books its own collects, so they stay yield and never become a contribution (SA-3 M-1).
-    ///         SA-4 H-1 / L-1 / L-2: only for a position nobody changed since the mark (still owned, PoolManager and
-    ///         the books on the same liquidity), only up to the pool's global fee growth over the same interval (a
-    ///         larger or wrapped difference means PoolManager re-based the position: a tick was cleared and set up
-    ///         again) and never more than the idle balance holds above the snapshot. Every guard can only LOWER the
-    ///         yield counted (a client modify's fees then become a contribution: our fee lower).
+    ///         SA-4 H-1 / SA-5 M-1: only for a position nobody changed since the mark (still owned, PoolManager and
+    ///         the books on the same liquidity now AND at the last look), only up to the pool's global fee growth over
+    ///         the same interval (a larger or wrapped difference means PoolManager re-based the position), only while
+    ///         idle holds no less than the snapshot in EITHER token (a dip and restore at another price changes the
+    ///         mix: one token up, the other down; that is not yield) and never more than idle holds above the
+    ///         snapshot in each token. Every guard can only LOWER the yield counted (a client modify's fees then
+    ///         become a contribution: our fee lower).
     ///         Then, `price` = 0 (anchor not trusted): nothing else is booked or moved; the flow stays pending.
     ///         Positions the account no longer owns are dropped (their snapshot liquidity is an outflow).
-    ///         SA-4 M-2: a booked flow with a price-dependent term (idle base, position liquidity) stamps
-    ///         `pricedFlowTime`; the fee waits a day after it.
+    ///         SA-4 M-2 / SA-5 L-1: a booked flow whose price-dependent part (idle base, position liquidity) is at least
+    ///         1% of the net contributions stamps `pricedFlowTime`; the fee waits a day after it (dust sent by a third
+    ///         party does not). SA-5 M-4: a priced flow booked at an anchor other than the one of the account's last
+    ///         priced sync raises the high-water mark by the most the flow can have gained or lost between the two
+    ///         (it may have happened at the earlier anchor): a late booking can only lower the fee.
     function sync(
         SALib.Account storage s,
         V4PositionMath.Position[] storage ps,
@@ -69,6 +76,7 @@ library SABook {
         uint256 price
     ) external {
         int256 f;
+        uint256 priced;
         uint256 i = ps.length;
         while (i != 0) {
             --i;
@@ -79,11 +87,11 @@ library SABook {
             _feesOut(s, q, v, a, p, owned && liq == old ? old : 0);
             if (price == 0) continue;
             if (liq != old) {
-                s.pricedFlowTime = block.timestamp; // SA-4 M-2
+                uint256 lv = V4PositionMath.liquidityValue(p.tickLower, p.tickUpper, liq, price, v.baseIsCurrency0);
+                uint256 ov = V4PositionMath.liquidityValue(p.tickLower, p.tickUpper, old, price, v.baseIsCurrency0);
+                priced += lv > ov ? lv - ov : ov - lv;
                 // forge-lint: disable-next-line(unsafe-typecast)
-                f += int256(V4PositionMath.liquidityValue(p.tickLower, p.tickUpper, liq, price, v.baseIsCurrency0))
-                    // forge-lint: disable-next-line(unsafe-typecast)
-                    - int256(V4PositionMath.liquidityValue(p.tickLower, p.tickUpper, old, price, v.baseIsCurrency0));
+                f += int256(lv) - int256(ov);
             }
             if (owned) {
                 q.liq = liq;
@@ -97,12 +105,25 @@ library SABook {
         if (price == 0) return;
         int256 x = int256(IERC20(v.asset).balanceOf(a));
         int256 b = int256(_bal(v.base, a));
-        f += x - s.snapAsset + _mul(b - s.snapBase, price);
-        if (b != s.snapBase) s.pricedFlowTime = block.timestamp;
+        int256 fb = _mul(b - s.snapBase, price);
+        // forge-lint: disable-next-line(unsafe-typecast)
+        priced += uint256(fb < 0 ? -fb : fb);
+        f += x - s.snapAsset + fb;
+        int256 c = s.contributed;
+        // forge-lint: disable-next-line(unsafe-typecast)
+        if (priced != 0 && priced * 100 >= uint256(c < 0 ? -c : c)) s.pricedFlowTime = block.timestamp; // SA-5 L-1
+        uint256 p0 = s.bookPrice;
+        if (priced != 0 && p0 != 0 && p0 != price) {
+            // forge-lint: disable-next-line(unsafe-typecast)
+            s.hwm += int256(
+                Math.mulDiv(priced, price > p0 ? price - p0 : p0 - price, Math.min(price, p0), Math.Rounding.Ceil)
+            );
+        }
+        s.bookPrice = price;
         s.snapAsset = x;
         s.snapBase = b;
         if (f != 0) {
-            s.contributed += f;
+            s.contributed = c + f;
             emit Flow(a, f);
         }
     }
@@ -111,12 +132,16 @@ library SABook {
     ///      the position is owned and unchanged, else 0), added to the snapshot as yield. SA-4 H-1: the difference of
     ///      the position's fee mark is credited only while it does not exceed the pool's global growth since the mark
     ///      (inside growth on one basis never does), and the credit never exceeds the idle surplus above the snapshot.
+    ///      SA-5 M-1: nothing if PoolManager's liquidity at the last look differed (a dip seen by any sync), or if idle
+    ///      is below the snapshot in either token (Option A of the report). SA-5 L-2: the global mark moves only with
+    ///      the position's mark.
     function _feesOut(SALib.Account storage s, Pos storage q, SALib.Venue storage v, address a, V4PositionMath.Position memory p, uint128 n)
         private
     {
-        (, uint256 l0, uint256 l1) =
+        (uint128 pl, uint256 l0, uint256 l1) =
             v.pm.getPositionInfo(v.id, address(v.posm), p.tickLower, p.tickUpper, bytes32(p.tokenId));
         (uint256 G0, uint256 G1) = v.pm.getFeeGrowthGlobals(v.id);
+        if (q.seen != n) n = 0; // SA-5 M-1: PoolManager's liquidity differed at the last look
         uint256 c0;
         uint256 c1;
         unchecked {
@@ -126,15 +151,21 @@ library SABook {
             c0 = FullMath.mulDiv(d0, n, 1 << 128);
             c1 = FullMath.mulDiv(d1, n, 1 << 128);
         }
-        (uint256 cb, uint256 ca) = v.baseIsCurrency0 ? (c0, c1) : (c1, c0);
-        // belt: what PoolManager paid out is in the account; never credit more than idle holds above the snapshot
-        ca = _cap(ca, int256(IERC20(v.asset).balanceOf(a)) - s.snapAsset);
-        cb = _cap(cb, int256(_bal(v.base, a)) - s.snapBase);
+        if (v.baseIsCurrency0) _credit(s, v, a, c1, c0);
+        else _credit(s, v, a, c0, c1);
+        _mark(q, pl, l0, l1, G0, G1);
+    }
+
+    /// @dev Add the credit (ca asset, cb base) to the snapshot: nothing if idle is below the snapshot in either token
+    ///      (SA-5 M-1, a mix change is not yield), and never more than idle holds above it in each token.
+    function _credit(SALib.Account storage s, SALib.Venue storage v, address a, uint256 ca, uint256 cb) private {
+        int256 ra = int256(IERC20(v.asset).balanceOf(a)) - s.snapAsset;
+        int256 rb = int256(_bal(v.base, a)) - s.snapBase;
+        if (ra < 0 || rb < 0) return;
         // forge-lint: disable-next-line(unsafe-typecast)
-        s.snapAsset += int256(ca);
+        s.snapAsset += int256(_cap(ca, ra));
         // forge-lint: disable-next-line(unsafe-typecast)
-        s.snapBase += int256(cb);
-        _mark(q, v, l0, l1, G0, G1);
+        s.snapBase += int256(_cap(cb, rb));
     }
 
     function _cap(uint256 c, int256 room) private pure returns (uint256) {
@@ -142,12 +173,15 @@ library SABook {
         return room <= 0 ? 0 : (c > uint256(room) ? uint256(room) : c);
     }
 
-    function _mark(Pos storage q, SALib.Venue storage v, uint256 l0, uint256 l1, uint256 G0, uint256 G1) private {
-        if (G0 == 0 && G1 == 0) (G0, G1) = v.pm.getFeeGrowthGlobals(v.id);
+    /// @dev SA-5 L-2: the global mark moves only when the position's fee mark moves (both span one interval).
+    function _mark(Pos storage q, uint128 pl, uint256 l0, uint256 l1, uint256 G0, uint256 G1) private {
+        if (l0 != q.g0 || l1 != q.g1) {
+            q.G0 = G0;
+            q.G1 = G1;
+        }
         q.g0 = l0;
         q.g1 = l1;
-        q.G0 = G0;
-        q.G1 = G1;
+        q.seen = pl;
     }
 
     /// @notice The module's own effect after a PositionManager call it made on `p` (SA-3: the writes live here):
@@ -166,9 +200,14 @@ library SABook {
         s.snapBase += dBase;
         Pos storage q = pos[p.tokenId];
         q.liq = SafeCast.toUint128(SafeCast.toUint256(int256(uint256(q.liq)) + dLiq)); // SA-4 I-5
-        (, uint256 l0, uint256 l1) =
+        (uint128 pl, uint256 l0, uint256 l1) =
             v.pm.getPositionInfo(v.id, address(v.posm), p.tickLower, p.tickUpper, bytes32(p.tokenId));
-        _mark(q, v, l0, l1, 0, 0);
+        (uint256 G0, uint256 G1) = v.pm.getFeeGrowthGlobals(v.id);
+        q.G0 = G0; // the module touched the position: both marks are taken now
+        q.G1 = G1;
+        q.g0 = l0;
+        q.g1 = l1;
+        q.seen = pl;
     }
 
     /// @notice Account value at `price`: idle + positions the account still owns (principal at sqrt(price) plus
@@ -224,8 +263,9 @@ library SABook {
     ///         PoolManager state before the action: idle falls by the principal PoolManager charges at the current
     ///         sqrt price (rounded up, as PoolManager does) and rises by the uncollected fees the modify pays out.
     ///         H-3 add check at the anchor `ref` (the principal is worth at most got / (1 - slippage)); returns the
-    ///         turnover charge principal x slippage / (band + slippage).
-    function lpAdd(SALib.Venue storage v, V4PositionMath.Position memory p, uint128 liq, uint256 ref, uint256 slip, uint256 band)
+    ///         turnover charge: SA-5 M-2, the whole principal (an add next to a pushed pool is a limit order at that
+    ///         price: it costs the window what a swap of the same principal costs).
+    function lpAdd(SALib.Venue storage v, V4PositionMath.Position memory p, uint128 liq, uint256 ref, uint256 slip)
         external
         view
         returns (int256 dAsset, int256 dBase, uint256 charge)
@@ -234,7 +274,7 @@ library SABook {
         uint256 paid = pa + Math.mulDiv(pb, ref, WAD, Math.Rounding.Ceil);
         uint256 got = V4PositionMath.liquidityValue(p.tickLower, p.tickUpper, liq, ref, v.baseIsCurrency0);
         if (got * BPS < paid * (BPS - slip)) revert SALib.AddValue(got, paid);
-        charge = Math.mulDiv(paid, slip, slip + band, Math.Rounding.Ceil);
+        charge = paid;
         (, uint256 fa, uint256 fb) = _feesAB(v, p);
         // forge-lint: disable-next-line(unsafe-typecast)
         dAsset = int256(fa) - int256(pa);

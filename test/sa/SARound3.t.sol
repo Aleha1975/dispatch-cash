@@ -97,6 +97,7 @@ contract SARound3Test is SATestBase {
         uint256 fees = _valueAt(usdc.balanceOf(a) - u0, a.balance - h0, ref);
         assertGt(fees, 1e6, "fees collected");
         assertApproxEqAbs(_pending(a), 0, 2, "fees are not a client flow");
+        vm.prank(keeper);
         module.sync(a);
         assertApproxEqAbs(_acct(a).contributed, c0, 2, "nothing booked as a deposit");
         assertApproxEqAbs(_profit(a), p0, 2, "the fees stay profit");
@@ -116,6 +117,7 @@ contract SARound3Test is SATestBase {
         _clientRemove(ALICE_PK, a, id, false, 0, eoa);
         uint256 fees = _valueAt(usdc.balanceOf(eoa) - u0, eoa.balance - h0, ref);
         int256 p0 = _profit(a);
+        vm.prank(keeper);
         module.sync(a);
         // SA-4 H-1 (idle-surplus cap): fees that did not reach the account are not credited as yield; they leave the
         // profit (our fee lower) instead of being booked as a withdrawal of profit
@@ -126,6 +128,7 @@ contract SARound3Test is SATestBase {
 
         vm.revertToState(snap);
         _clientRemove(ALICE_PK, a, id, true, 0, a);
+        vm.prank(keeper);
         module.sync(a);
         assertEq(module.positionsOf(a).length, 0, "burned position dropped");
         // the burned principal is booked at the anchor (the pool is within 3 bps of it): fees stay as profit
@@ -175,8 +178,16 @@ contract SARound3Test is SATestBase {
             _step(module.lastPrice());
         }
         _moveTo(module.lastPrice() * 1001 / 1000); // the fee also needs the anchor not above the pool
+        // SA-5 M-3: a day at the level is not enough when the level is more than poolBandBps above the
+        // guardian-confirmed one
         vm.prank(keeper);
-        assertGt(module.chargeFee(a), 0, "after a day at the level the gain is chargeable");
+        vm.expectRevert(LPManagerModule.StalePrice.selector);
+        module.chargeFee(a);
+        _confirm();
+        _stable();
+        _moveTo(module.lastPrice() * 1001 / 1000);
+        vm.prank(keeper);
+        assertGt(module.chargeFee(a), 0, "after a day at the level and the guardian's confirmation the gain is chargeable");
     }
 
     /// Sibling: an anchor above the pool (even inside the booking band) carries no fee.
@@ -199,7 +210,7 @@ contract SARound3Test is SATestBase {
         address a = _withHype(ALICE_PK, 30_000e6);
         vm.warp(vm.getBlockTimestamp() + 7 days);
         uint256 ref = module.lastPrice();
-        _step(ref * 101 / 100);
+        _step(ref * 1005 / 1000); // SA-5 M-3: within poolBandBps of the confirmed level (the first report)
         vm.warp(vm.getBlockTimestamp() + 25 hours);
         _step(module.lastPrice());
         uint256 snap = vm.snapshotState();
@@ -218,7 +229,7 @@ contract SARound3Test is SATestBase {
         address a = _withHype(ALICE_PK, 30_000e6);
         vm.warp(vm.getBlockTimestamp() + 7 days);
         uint256 ref = module.lastPrice();
-        _step(ref * 101 / 100);
+        _step(ref * 1005 / 1000); // SA-5 M-3: within poolBandBps of the confirmed level (the first report)
         vm.warp(vm.getBlockTimestamp() + 25 hours);
         _step(module.lastPrice());
         uint256 snap = vm.snapshotState();
@@ -241,6 +252,7 @@ contract SARound3Test is SATestBase {
         int256 c0 = _acct(a).contributed;
         _give(a, 1_000e6);
         _moveTo(ref * 1008 / 1000);
+        vm.prank(keeper);
         vm.expectRevert(LPManagerModule.StalePrice.selector);
         module.sync(a);
         vm.prank(keeper);
@@ -249,6 +261,7 @@ contract SARound3Test is SATestBase {
         assertEq(_pending(a), 1_000e6, "still pending, exact");
         _moveTo(ref);
         _stable();
+        vm.prank(keeper);
         module.sync(a);
         assertEq(_acct(a).contributed, c0 + 1_000e6, "booked at the anchor");
     }
@@ -269,13 +282,16 @@ contract SARound3Test is SATestBase {
     }
 
     /// PoC (1226 M-2 / 1227 M-5): the booking moment was the keeper's choice (any action syncs; swaps synced on a
-    /// fresh-but-moving anchor). Now swaps / adds need a trusted anchor and anyone can book a pending flow with
-    /// `sync(a)` at the first trusted moment.
+    /// fresh-but-moving anchor). Now swaps / adds need a trusted anchor and the client can book a pending flow with
+    /// `sync(a)` at the first trusted moment (SA-5 L-3: the keeper, the account or its owner; no third party).
     function test_M5_PoC_AnyoneBooksAtTrustedAnchor() public {
         address a = _withHype(ALICE_PK, 30_000e6);
         int256 c0 = _acct(a).contributed;
         _give(a, 2_000e6);
         vm.prank(makeAddr("stranger"));
+        vm.expectRevert(LPManagerModule.NotOwnAccount.selector);
+        module.sync(a);
+        vm.prank(vm.addr(ALICE_PK)); // the client's owner EOA
         module.sync(a);
         assertEq(_acct(a).contributed, c0 + 2_000e6);
     }

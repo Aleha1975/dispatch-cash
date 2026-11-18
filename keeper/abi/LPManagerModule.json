@@ -389,6 +389,11 @@
       "name": "pricedFlowTime",
       "type": "uint256",
       "internalType": "uint256"
+     },
+     {
+      "name": "bookPrice",
+      "type": "uint256",
+      "internalType": "uint256"
      }
     ]
    }
@@ -1390,6 +1395,11 @@
     "internalType": "uint256"
    },
    {
+    "name": "base",
+    "type": "uint256",
+    "internalType": "uint256"
+   },
+   {
     "name": "range",
     "type": "tuple",
     "internalType": "struct SARange.R",
@@ -1675,6 +1685,11 @@
   "outputs": [
    {
     "name": "liq",
+    "type": "uint128",
+    "internalType": "uint128"
+   },
+   {
+    "name": "seen",
     "type": "uint128",
     "internalType": "uint128"
    },

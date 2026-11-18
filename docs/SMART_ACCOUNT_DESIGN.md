@@ -321,10 +321,10 @@ Consequence for the keeper: hedge margin is limited by the account's **idle** US
   `live − snapshot` is exactly what the client did, inside or outside a module bracket, and `sync` books exactly that as a client flow,
   valued with the same function and the same price as `value` (the anchor), then moves the snapshot. SA-3: LP fees PoolManager paid
   out of a tracked position since its checkpoint (`snapPos(id)` = booked liquidity + feeGrowthInside marks) are added to the snapshot
-  first, so fees the client collects itself stay profit. A flow is booked only while the anchor is **trusted** (fresh, within the band
+  first, so fees the client collects itself stay profit (SA-5 M-1: only while PoolManager's liquidity was the books' at the last look too and idle is at or above the snapshot in both tokens). A flow is booked only while the anchor is **trusted** (fresh, within the band
   of the keeper's last report, the anchor value unchanged for `minPriceStable` (default 300 s), re-confirmed by a report within the last
   `minPriceStable` (a report after a longer gap counts as a move), and the pool within `BOOK_BAND_BPS` = 50 bps of it); otherwise it
-  stays pending, exact. Swaps, mints and increases need the same trusted anchor (their sync books first); anyone may call `sync(a)`. A client flow therefore moves `value` and
+  stays pending, exact. Swaps, mints and increases need the same trusted anchor (their sync books first); the keeper, the account or its owner may call `sync(a)` (SA-5 L-3). SA-5 M-4: a priced flow booked at another anchor than the account's previous priced booking raises the HWM by its largest possible gain between the two. A client flow therefore moves `value` and
   `contributed` by the same amount and cannot change profit. `deposit` / `onboard` book USDC at face value at once; registration books
   nothing. Liquidity the client changed directly stays pending on both sides (position and idle). Positions the account no longer owns
   are dropped at a trusted sync. Positions with a subscriber are refused. A client may add or take funds directly at any time.
@@ -336,11 +336,11 @@ Consequence for the keeper: hedge margin is limited by the account's **idle** US
   R4 (`sa-r4-riskoff`): a sell of base while the account holds no tracked position is charged to a separate exit window
   (`exitTurnoverBps`, ≤ 1x, 0 = off) so a risk-off exit to USDC fits one day (docs/ARCHITECTURE.md). Anchor (SA-3,
   `SARange`): the keeper alone moves it at most `refDriftBps` from every value it held in the trailing 24 h; an oscillation that comes
-  back costs nothing; a guardian range applies one report the budget would clip and resets the window. Guardian price ranges and hedge approvals are one-shot, TTL ≤ 1 day, cleared by a pause
+  back costs nothing; SA-5 M-2: it never leaves `refDriftBps` around the guardian-confirmed level (`priceBudget.base`: the first report, then every report that consumes a guardian range; ranges ≤ 10% wide), however many days it walks; a guardian range applies one report the budget would clip and resets the window. SA-5 M-2: an LP add is charged to the turnover window at its whole principal. Guardian price ranges and hedge approvals are one-shot, TTL ≤ 1 day, cleared by a pause
   / guardian change; a hedge approval binds (account, epoch, stored value, value, guardian era) and every margin move bumps the epoch (M-3).
 - **HWM fee**: `fee = feeBps × (profit − hwm)` capped at 20% of idle USDC; a capped fee advances the mark only by the gain it charged
   (L-11). SA-3: `profit = value at the anchor − contributed`, after a sync that booked every pending flow at that anchor (a parked
-  flow is neutral), and only while the anchor is not above the pool and within `poolBandBps` of its trailing 24 h low
+  flow is neutral), and only while the anchor is not above the pool and within `poolBandBps` of the lower of its trailing 24 h low and (SA-5 M-3) the guardian-confirmed level
   (`SALib.feeGate`: a walked-up anchor carries a fee only after a day in public view). Needs a trusted anchor, a recent unclipped
   hedge report (L-12), `feeInterval` since the last fee, not paused. The keeper holds the anchor value while a positive fee waits for
   the stable window, only while the pool stays inside the booking band.

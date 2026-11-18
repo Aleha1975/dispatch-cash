@@ -116,6 +116,7 @@ class Model:
     active_liquidity: int = 0  # other LPs' in-range liquidity now (0 = no dilution modelled)
     our_usd: float = 0.0  # all clients' capital in this pool (our liquidity dilutes the fee share)
     pool_lp_frac: float | None = None  # share of `our_usd` in the LP (default lp_frac)
+    add_share: float = 1.0  # SA-5 M-2: SABook.lpAdd charges the whole principal to the turnover window
 
     @property
     def sqrt_p_raw(self) -> float:
@@ -134,8 +135,7 @@ class Model:
         fc = base_frac(t, tl, tu)
         swap_frac = max(abs(base_frac(lo, tl, tu) - fc), abs(base_frac(hi, tl, tu) - fc))
         il = (il_at(t, lo, tl, tu) + il_at(t, hi, tl, tu)) / 2
-        add_share = self.slippage_bps / (self.slippage_bps + self.band_bps)
-        charge = self.lp_frac * (swap_frac + add_share)  # turnover per re-range, fraction of the account
+        charge = self.lp_frac * (swap_frac + self.add_share)  # turnover per re-range, fraction of the account
         r_max = (self.turnover_bps / 10_000) / charge if charge > 0 else float("inf")
         in_range = min(1.0, self.budget_safety * r_max / r) if r > 0 else 1.0
         r_eff = min(r, self.budget_safety * r_max)

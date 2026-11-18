@@ -68,6 +68,7 @@ contract SARound4Test is SATestBase {
         _volume(20_000, 5);
         _moveTo(ref);
         _stable();
+        vm.prank(keeper);
         module.sync(a);
         assertEq(_pending(a), 0);
     }
@@ -130,6 +131,7 @@ contract SARound4Test is SATestBase {
         uint128 liq = _snapLiq(id);
         _clientEmptyRefill(ALICE_PK, a, id, liq);
         assertEq(POSM.getPositionLiquidity(id), liq, "refilled to the books' liquidity");
+        vm.prank(keeper);
         module.sync(a);
         int256 c1 = _acct(a).contributed;
         assertGe(c1, c0 - 2, "no phantom yield: contributed not driven negative");
@@ -156,6 +158,7 @@ contract SARound4Test is SATestBase {
         _clientIncrease(ALICE_PK, a, id, liq);
         assertEq(POSM.getPositionLiquidity(id), liq, "refilled");
         _feeReady();
+        vm.prank(keeper);
         module.sync(a);
         assertGe(_acct(a).contributed, c0 - 2, "no phantom yield");
         assertLe(_profit(a), p0 + 2, "profit not raised by the client's empty / refill");
@@ -184,6 +187,7 @@ contract SARound4Test is SATestBase {
         _clientIncrease(ALICE_PK, a, id, liq / 2); // pays those fees into the account
         assertEq(POSM.getPositionLiquidity(id), liq, "back to the books' liquidity");
         _stable();
+        vm.prank(keeper);
         module.sync(a);
         // the old rule credited (growth) x liq, twice what PoolManager paid; now the credit is at most what reached
         // the account above the snapshot (idle-surplus cap), i.e. the fees the half that stayed really earned
@@ -219,6 +223,7 @@ contract SARound4Test is SATestBase {
         module.chargeFee(a); // nothing in the way without a flow (a zero fee is fine)
         vm.revertToState(snap);
         _clientExec1(ALICE_PK, a, vm.addr(ALICE_PK), a.balance / 2, "");
+        vm.prank(keeper);
         module.sync(a);
         vm.prank(keeper);
         vm.expectRevert(abi.encodeWithSelector(LPManagerModule.FeeTooEarly.selector, block.timestamp + 1 days));
@@ -238,6 +243,7 @@ contract SARound4Test is SATestBase {
         vm.warp(vm.getBlockTimestamp() + 7 days);
         _feeReady();
         _clientExec1(ALICE_PK, a, address(usdc), 0, abi.encodeCall(IERC20.transfer, (vm.addr(ALICE_PK), 1_000e6)));
+        vm.prank(keeper);
         module.sync(a);
         vm.prank(keeper);
         module.chargeFee(a); // no FeeTooEarly
@@ -311,6 +317,7 @@ contract SARound4Test is SATestBase {
         assertEq(module.positionsOf(a).length, 1, "kept until a priced sync books the rest");
         assertEq(_snapLiq(id), liq / 2, "the client's part");
         _stable();
+        vm.prank(keeper);
         module.sync(a);
         assertEq(module.positionsOf(a).length, 0);
         assertApproxEqAbs(_pending(a), 0, 2);

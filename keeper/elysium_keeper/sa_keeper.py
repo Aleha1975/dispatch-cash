@@ -104,9 +104,9 @@ def rerange_reason(tick: int, positions: list, target_hw: float, mode: str, edge
 def rerange_charge(value_lp: int, tick: int, cur: tuple[int, int], new: tuple[int, int], slip_bps: int,
                    band_bps: int) -> int:
     """Turnover a re-range is expected to use: the re-centring swap (change of the HYPE share) + the LP add charge
-    (SABook.lpAdd: paid x slip / (slip + band))."""
+    (SA-5 M-2, SABook.lpAdd: the whole principal; `slip_bps` / `band_bps` no longer enter it)."""
     swap = abs(R.base_frac(tick, *cur) - R.base_frac(tick, *new))
-    return int(value_lp * (swap + slip_bps / (slip_bps + band_bps)))
+    return int(value_lp * (swap + 1.0))
 
 
 def enforcer_hedge_room(idle_usdc: int, used_wad: int = 0) -> int:
@@ -354,8 +354,12 @@ class SAKeeper:
                 # although its last move was stable is held by the 24 h budget (a guardian matter)
                 stable = now >= before.last_price_moved + g.params["minPriceStable"]
                 if g.last_price == before.last_price and stable:
+                    # SA-5 M-2: the anchor is bound to refDriftBps of the guardian-confirmed level as well
+                    why = " (refDriftBps from the confirmed level)" if g.at_drift_limit() else ""
+                    lo, hi = price * 995 // 1000, price * 1005 // 1000
                     self.alert("warn", "anchor_budget", f"anchor clipped at {g.last_price / 1e6:.4f} (wanted "
-                                                        f"{price / 1e6:.4f}); guardian: approvePrice(lo, hi, deadline)")
+                                                        f"{price / 1e6:.4f}){why}; guardian: approvePrice({lo}, "
+                                                        f"{hi}, now + 1 h) after checking the market (<= 10% wide)")
                 else:
                     self.log("anchor_stepping", anchor=g.last_price, wanted=price)
         return price, g
@@ -400,16 +404,24 @@ class SAKeeper:
         if not self.r.global_snap().trusted(self.now()):
             self.log("riskoff_sell_waits_trusted", account=a)
             return s
-        room = max(0, s.nav * int(g.params.get("exitTurnoverBps", 0)) // BPS - int(s.windows.get("exitUsed", 0)))
-        # SA-4 L-6: an exit sale beyond the exit window falls back to the turnover window
-        room += max(0, s.nav * g.params["swapTurnoverBps"] // BPS - s.windows["turnoverUsed"])
-        amt = min(s.native - self.gas_reserve(s), int(room * 98 // 100) * E18 // price)
-        if amt <= min_amt:
-            self.log("riskoff_sell_no_room", account=a, room=room / 1e6, hype=s.native / E18)
-            return s
-        sold = self.swap(a, True, amt, price)
-        self.log("riskoff_sold", account=a, hype=sold / E18, left=(s.native - sold) / E18)
-        return self.r.account(a)
+        # SA-4 L-6: an exit sale beyond the exit window falls back to the turnover window; SA-5 I-2: the module does
+        # not split one sale between the windows, so sell into the exit room first and into the turnover room second
+        exit_room = max(0, s.nav * int(g.params.get("exitTurnoverBps", 0)) // BPS - int(s.windows.get("exitUsed", 0)))
+        turn_room = max(0, s.nav * g.params["swapTurnoverBps"] // BPS - s.windows["turnoverUsed"])
+        sold_any = False
+        for room in (exit_room, turn_room):
+            amt = min(s.native - self.gas_reserve(s), int(room * 98 // 100) * E18 // price)
+            if amt <= min_amt:
+                continue
+            sold = self.swap(a, True, amt, price)
+            sold_any = True
+            self.log("riskoff_sold", account=a, hype=sold / E18, left=(s.native - sold) / E18)
+            s = self.r.account(a)
+            if s.native - self.gas_reserve(s) <= min_amt:
+                break
+        if not sold_any:
+            self.log("riskoff_sell_no_room", account=a, room=(exit_room + turn_room) / 1e6, hype=s.native / E18)
+        return s
 
     def gas_reserve(self, s: AccountSnap) -> int:
         """SA-4 L-7 (1241): a 7702 account pays its own gas in native HYPE (revoke, withdrawals): never sell or
@@ -587,7 +599,7 @@ class SAKeeper:
             return
         # sliding 24 h window (SAWindow): capacity returns 24-27 h after use, no decay
         room = max(0, s.nav * g.params["swapTurnoverBps"] // BPS - s.windows["turnoverUsed"])
-        charge = S.add_charge(val, g.params["poolBandBps"], g.params["maxSlippageBps"])
+        charge = val  # SA-5 M-2: SABook.lpAdd charges an add at its whole principal
         if charge > room * 0.98:
             k = room * 0.98 / charge if charge else 0.0
             if val * k < self.sa.min_deploy_usd * 1e6:
@@ -634,9 +646,15 @@ class SAKeeper:
         if fee <= 0:
             return
         if not g.fee_gate():
-            # SA-3 M-3: the anchor must not be above the pool nor more than poolBandBps above its trailing 24 h low
+            # SA-3 M-3: the anchor must not be above the pool nor more than poolBandBps above its trailing 24 h low;
+            # SA-5 M-3: nor above the guardian-confirmed level by more than poolBandBps (only the guardian lifts it)
             self._hold_until = max(self._hold_until, now + 2 * g.params["minPriceStable"] + self.sa.report_every_s)
-            self.log("fee_waits_gate", account=a, anchor=g.last_price, pool=g.pool_price, low=g.trailing_low)
+            self.log("fee_waits_gate", account=a, anchor=g.last_price, pool=g.pool_price, low=g.trailing_low,
+                     base=g.price_base)
+            if not g.base_gate():
+                self.alert("info", "fee_needs_confirm", f"fee due for {a} but the anchor {g.last_price / 1e6:.4f} is "
+                                                        f"above the confirmed level {g.price_base / 1e6:.4f} by more "
+                                                        f"than poolBandBps; guardian: approvePrice around the market")
             return
         need = int(fee * 5 * self.sa.fee_idle_margin) + 1
         if s.usdc < need and s.positions:
